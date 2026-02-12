@@ -376,10 +376,21 @@ class CommonAttentionMetadata:
         return self._num_computed_tokens_cpu
 
     def compute_num_computed_tokens(self) -> torch.Tensor:
-        """Compute num_computed_tokens on device (seq_lens - query_lens)."""
+        """Compute num_computed_tokens on device.
+
+        Uses the scheduler-provided _num_computed_tokens_cpu when available
+        (required for PCP where seq_lens is global but query_start_loc is
+        local, making seq_lens - query_lens incorrect). Falls back to
+        deriving from seq_lens - query_lens otherwise.
+        """
         if self._num_computed_tokens_cache is None:
-            query_lens = self.query_start_loc[1:] - self.query_start_loc[:-1]
-            self._num_computed_tokens_cache = self.seq_lens - query_lens
+            if self._num_computed_tokens_cpu is not None:
+                self._num_computed_tokens_cache = self._num_computed_tokens_cpu.to(
+                    self.seq_lens.device
+                )
+            else:
+                query_lens = self.query_start_loc[1:] - self.query_start_loc[:-1]
+                self._num_computed_tokens_cache = self.seq_lens - query_lens
         return self._num_computed_tokens_cache
 
     # TODO(lucas): remove once we have FULL-CG spec-decode support

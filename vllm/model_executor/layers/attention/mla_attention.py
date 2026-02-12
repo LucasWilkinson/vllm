@@ -1569,10 +1569,6 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
         seq_lens = common_attn_metadata.seq_lens
         dcp_local_seq_lens = common_attn_metadata.dcp_local_seq_lens
 
-        query_seq_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
-
-        num_computed_tokens_cpu = common_attn_metadata.seq_lens_cpu - query_seq_lens_cpu
-
         num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
             split_decodes_and_prefills(
                 common_attn_metadata,

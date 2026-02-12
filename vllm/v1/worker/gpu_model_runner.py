@@ -564,11 +564,19 @@ class GPUModelRunner(
         self._encoder_timing_lock = threading.Lock()
 
         if self.pcp_world_size > 1:
-            # NOTE For PCP, we will pad the tokens of each request
-            # to a multiple of 2 * pcp_size that is possible greater
-            # than the max_num_batched_tokens.
-            max_padded_num_tokens = (
-                self.max_num_tokens + self.max_num_reqs * 2 * self.pcp_world_size
+            # PCP partition_inputs has two padding modes:
+            # 1) "Decode" requests (tokens <= reorder_batch_threshold):
+            #    replicated across all PCP ranks, padded = tokens * ws.
+            # 2) "Prefill" requests: split via DualChunkSwap,
+            #    padded = ceil(tokens / (2*ws)) * (2*ws), adding at most
+            #    (2*ws - 1) extra tokens per request.
+            # The worst-case padded total is when all tokens are "decode",
+            # giving total_tokens * ws. We also add per-request prefill
+            # padding headroom.
+            ws = self.pcp_world_size
+            max_padded_num_tokens = max(
+                self.max_num_tokens * ws,
+                self.max_num_tokens + self.max_num_reqs * 2 * ws,
             )
         else:
             max_padded_num_tokens = self.max_num_tokens

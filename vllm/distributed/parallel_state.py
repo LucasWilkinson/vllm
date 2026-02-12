@@ -1431,13 +1431,16 @@ def initialize_model_parallel(
     assert _EP is None, "expert parallel group is already initialized"
     # Don't create EP group for dense models.
     if config is None or config.model_config is None or config.model_config.is_moe:
+        # EP groups span DP and TP but NOT PCP. PCP ranks should have
+        # independent EP groups since they process different token chunks
+        # and run MoE all2all independently.
+        # Layout after transposes: (DCP_remain, PP, PCP, DP, TP)
         group_ranks = (
             all_ranks.transpose(1, 2)
+            .transpose(2, 3)
             .reshape(
                 -1,
-                data_parallel_size
-                * prefill_context_model_parallel_size
-                * tensor_model_parallel_size,
+                data_parallel_size * tensor_model_parallel_size,
             )
             .unbind(0)
         )
