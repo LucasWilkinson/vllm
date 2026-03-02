@@ -5,6 +5,7 @@ import torch
 from vllm.distributed.parallel_state import (
     GroupCoordinator,
     get_dcp_group,
+    get_pcp_group,
     get_tp_group,
 )
 from vllm.triton_utils import tl, triton
@@ -194,7 +195,7 @@ def _cp_lse_common(
     cp_attn_lse: [ B, H ]
     """
     if cp_group.world_size == 1:
-        return cp_attn_out
+        return cp_attn_out, cp_attn_lse
 
     if ctx is None:
         ctx = CPTritonContext()
@@ -284,15 +285,42 @@ def dcp_reduce_output(
     heads (after the TP all-gather in ``dcp_prepare_query``).  This function
     combines the partial results using the LSE correction and distributes
     the final output so each rank ends up with only its TP-local heads.
+
+    When PCP > 1, uses all-reduce + slice path instead of reduce-scatter.
     """
-    return cp_lse_ag_out_rs(
-        attn_output,
-        attn_lse,
-        get_dcp_group(),
-        ctx=ctx,
-        return_lse=return_lse,
-        is_lse_base_on_e=True,
-    )
+    dcp_group = get_dcp_group()
+    tp_group = get_tp_group()
+
+    # Check if PCP is enabled (PCP > 1 means we need all-reduce + slice)
+    try:
+        pcp_world_size = get_pcp_group().world_size
+    except AssertionError:
+        pcp_world_size = 1
+
+    if pcp_world_size > 1:
+        # All-reduce + slice path for PCP > 1
+        out, lse = _cp_lse_common(
+            attn_output, attn_lse, dcp_group, ctx=ctx, is_lse_base_on_e=True
+        )
+        out = dcp_group.all_reduce(out)
+        # Slice to local TP heads
+        tp_rank = tp_group.rank_in_group
+        tp_num_heads = out.shape[1] // tp_group.world_size
+        out = out[:, tp_num_heads * tp_rank : tp_num_heads * (tp_rank + 1), :]
+        if return_lse:
+            lse = lse[:, tp_num_heads * tp_rank : tp_num_heads * (tp_rank + 1)]
+            return out, lse
+        return out
+    else:
+        # Standard reduce-scatter path
+        return cp_lse_ag_out_rs(
+            attn_output,
+            attn_lse,
+            dcp_group,
+            ctx=ctx,
+            return_lse=return_lse,
+            is_lse_base_on_e=True,
+        )
 
 
 @triton.jit
