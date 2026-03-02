@@ -23,9 +23,10 @@ from vllm.v1.attention.backends.fa_utils import (
     is_flash_attn_varlen_func_available,
 )
 from vllm.v1.attention.ops.common import (
+    cp_lse_ag_out_rs,
     dcp_prepare_query,
-    dcp_reduce_output,
 )
+from vllm.v1.attention.ops.dcp_alltoall import dcp_a2a_lse_reduce
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 
 if is_flash_attn_varlen_func_available():
@@ -42,7 +43,7 @@ from vllm.model_executor.layers.batch_invariant import (
     vllm_is_batch_invariant,
 )
 from vllm.platforms.interface import DeviceCapability
-from vllm.utils.math_utils import cdiv
+from vllm.utils.math_utils import cdiv, round_up
 from vllm.v1.attention.backend import (
     AttentionCGSupport,
     AttentionMetadataBuilder,
@@ -96,6 +97,11 @@ class FlashAttentionBackend(AttentionBackend):
             AttentionType.ENCODER_ONLY,
             AttentionType.ENCODER_DECODER,
         )
+
+    @classmethod
+    def supports_per_head_quant_scales(cls) -> bool:
+        fa_version = get_flash_attn_version()
+        return fa_version is not None and fa_version >= 3
 
     @staticmethod
     def get_impl_cls() -> type["FlashAttentionImpl"]:
@@ -312,15 +318,19 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             self.compilation_config.cudagraph_mode.has_full_cudagraphs()
         )
         self.max_cudagraph_size = self.compilation_config.max_cudagraph_capture_size
-        max_num_seqs = vllm_config.scheduler_config.max_num_seqs
 
         if self.use_full_cuda_graph and self.aot_schedule:
-            # Times 4 due to:
-            #  https://github.com/vllm-project/flash-attention/blob/3223650ccabe622a0fcae65eec706a50186a89f7/hopper/flash_api.cpp#L650-L653
-            # For some tests max_cudagraph_size > max_num_seqs,
-            #   so we need to use the larger one.
+            # FA3 scheduler_metadata size: 1 + round_up(batch_size, 4) * 4
+            # The +1 is for the tile_count_semaphore (synchronization).
+            # The 4 slots per batch element (num_prepare_batch_vectors) are:
+            #   prepare_varlen + dynamic_split + sort_batches + head_swizzle
+            # See: https://github.com/vllm-project/flash-attention/blob/5824e6e/hopper/flash_api.cpp#L664-L671  # noqa: E501
+            max_batch_size = max(
+                vllm_config.scheduler_config.max_num_seqs,
+                self.max_cudagraph_size or 0,
+            )
             self.scheduler_metadata = torch.zeros(
-                max(self.max_cudagraph_size or 0, max_num_seqs) * 4 + 1,
+                1 + round_up(max_batch_size, 4) * 4,
                 dtype=torch.int32,
                 device=self.device,
             )
@@ -575,7 +585,15 @@ class FlashAttentionImpl(AttentionImpl):
         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
 
         self.attn_type = attn_type
-        self.vllm_flash_attn_version = get_flash_attn_version()
+        self.vllm_flash_attn_version = get_flash_attn_version(
+            requires_alibi=alibi_slopes is not None,
+            head_size=head_size,
+        )
+        logger.info_once(
+            "Using FlashAttention version %s",
+            self.vllm_flash_attn_version,
+            scope="local",
+        )
         # Cache the batch invariant result for use in forward passes
         self.batch_invariant_enabled = vllm_is_batch_invariant()
 
@@ -595,11 +613,13 @@ class FlashAttentionImpl(AttentionImpl):
             )
 
         self.supports_quant_query_input = True
-        self.supports_per_head_quant_scales = (
-            self.vllm_flash_attn_version >= 3
-            if self.vllm_flash_attn_version is not None
-            else False
+
+        parallel_config = get_current_vllm_config().parallel_config
+        dcp_a2a = (
+            parallel_config.decode_context_parallel_size > 1
+            and parallel_config.dcp_comm_backend == "a2a"
         )
+        self.dcp_combine = dcp_a2a_lse_reduce if dcp_a2a else cp_lse_ag_out_rs
 
     def forward(
         self,
@@ -780,16 +800,6 @@ class FlashAttentionImpl(AttentionImpl):
             # we use direct Q, K, V tensors without caching
             return
 
-        # key and value may be None in the case of cross attention. They are
-        # calculated once based on the output from the encoder and then cached
-        # in KV cache.
-        if (
-            self.kv_sharing_target_layer_name is not None
-            or key is None
-            or value is None
-        ):
-            return
-
         key_cache, value_cache = kv_cache.unbind(0)
 
         # Reshape the input keys and values and store them in the cache.
@@ -857,9 +867,10 @@ class FlashAttentionImpl(AttentionImpl):
             q_descale=q_descale,
             k_descale=k_descale,
             v_descale=v_descale,
+            num_splits=attn_metadata.max_num_splits,
         )
-        # FA returns LSE in shape [ H, B ] but dcp_reduce_output wants [ B, H ]
-        context_attn_out_cor, context_lse_cor = dcp_reduce_output(
+        # FA returns LSE in shape [ H, B ] but DCP combine wants [ B, H ]
+        context_attn_out_cor, context_lse_cor = self.dcp_combine(
             context_attn_out,
             context_lse.transpose(0, 1),
             return_lse=True,
@@ -885,6 +896,7 @@ class FlashAttentionImpl(AttentionImpl):
             q_descale=q_descale,
             k_descale=k_descale,
             v_descale=v_descale,
+            num_splits=attn_metadata.max_num_splits,
         )
         assert context_attn_out_cor.shape == query_attn_out.shape
         assert context_lse_cor.shape == query_lse.shape

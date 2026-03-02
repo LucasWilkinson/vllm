@@ -3,15 +3,15 @@
 import torch
 
 from vllm.distributed.parallel_state import (
+    GroupCoordinator,
     get_dcp_group,
-    get_pcp_group,
     get_tp_group,
 )
 from vllm.triton_utils import tl, triton
 
 
 @triton.jit
-def _correct_dcp_attn_out_kernel(
+def _correct_attn_cp_out_kernel(
     outputs_ptr,
     new_output_ptr,
     lses_ptr,
@@ -98,8 +98,8 @@ def _correct_dcp_attn_out_kernel(
     tl.store(new_output_ptr + output_offsets, output)
 
 
-class DCPTritonContext:
-    """Avoids recompilation of the DCP Triton JIT kernel."""
+class CPTritonContext:
+    """The CPTritonContext is used to avoid recompilation of the Triton JIT."""
 
     def __init__(self):
         self.inner_kernel = None
@@ -111,11 +111,11 @@ class DCPTritonContext:
             self.inner_kernel[grid](*regular_args)
 
 
-def _dcp_correct_attn_out(
+def correct_attn_out(
     out: torch.Tensor,
     lses: torch.Tensor,
-    dcp_rank: int,
-    ctx: DCPTritonContext,
+    cp_rank: int,
+    ctx: CPTritonContext,
     is_lse_base_on_e: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Correct the attention output using the all-gathered lses.
@@ -123,14 +123,14 @@ def _dcp_correct_attn_out(
     Args:
         out: Tensor of shape [ B, H, D ]
         lses: Tensor of shape [ N, B, H ]
-        dcp_rank: Current rank in the DCP group
+        cp_rank: Current rank in the context-parallel group
         ctx: Triton context to avoid recompilation
 
     Returns:
         Tuple of (out, lse) with corrected attention and final log-sum-exp.
     """
     if ctx is None:
-        ctx = DCPTritonContext()
+        ctx = CPTritonContext()
 
     # --- Normalize to 3D views ---
     if out.ndim == 4 and out.shape[1] == 1:
@@ -175,11 +175,93 @@ def _dcp_correct_attn_out(
         l_sN,
         l_sB,
         l_sH,
-        dcp_rank,
+        cp_rank,
     )
     const_args = {"HEAD_DIM": D, "N_ROUNDED": N, "IS_BASE_E": is_lse_base_on_e}
-    ctx.call_kernel(_correct_dcp_attn_out_kernel, grid, *regular_args, **const_args)
+    ctx.call_kernel(_correct_attn_cp_out_kernel, grid, *regular_args, **const_args)
     return out, lse
+
+
+def _cp_lse_common(
+    cp_attn_out: torch.Tensor,
+    cp_attn_lse: torch.Tensor,
+    cp_group: GroupCoordinator,
+    ctx: CPTritonContext | None = None,
+    is_lse_base_on_e=True,
+):
+    """
+    cp_attn_out: [ B, H, D ]
+    cp_attn_lse: [ B, H ]
+    """
+    if cp_group.world_size == 1:
+        return cp_attn_out
+
+    if ctx is None:
+        ctx = CPTritonContext()
+
+    cp_attn_lse = cp_attn_lse.contiguous()
+    lses = cp_group.all_gather(cp_attn_lse, dim=0).reshape(
+        (cp_group.world_size,) + cp_attn_lse.shape
+    )
+    out, lse = correct_attn_out(
+        cp_attn_out,
+        lses,
+        cp_group.rank_in_group,
+        ctx,
+        is_lse_base_on_e=is_lse_base_on_e,
+    )
+    return out, lse
+
+
+def cp_lse_ag_out_rs(
+    cp_attn_out: torch.Tensor,
+    cp_attn_lse: torch.Tensor,
+    cp_group: GroupCoordinator,
+    ctx: CPTritonContext | None = None,
+    return_lse: bool = False,
+    is_lse_base_on_e=True,
+):
+    """
+    cp_attn_out: [ B, H, D ]
+    cp_attn_lse: [ B, H ]
+    """
+    out, lse = _cp_lse_common(
+        cp_attn_out, cp_attn_lse, cp_group, ctx=ctx, is_lse_base_on_e=is_lse_base_on_e
+    )
+    out = cp_group.reduce_scatter(out, dim=1)
+
+    if return_lse:
+        cp_num_heads = lse.shape[1] // cp_group.world_size
+        cp_rank = cp_group.rank_in_group
+        lse = lse[:, cp_num_heads * cp_rank : cp_num_heads * (cp_rank + 1)]
+        return out, lse
+    return out
+
+
+def cp_lse_ag_out_ar(
+    cp_attn_out: torch.Tensor,
+    cp_attn_lse: torch.Tensor,
+    cp_group: GroupCoordinator,
+    ctx: CPTritonContext | None = None,
+    return_lse: bool = False,
+    is_lse_base_on_e=True,
+):
+    """
+    cp_attn_out: [ B, H, D ]
+    cp_attn_lse: [ B, H ]
+    """
+    out, lse = _cp_lse_common(
+        cp_attn_out, cp_attn_lse, cp_group, ctx=ctx, is_lse_base_on_e=is_lse_base_on_e
+    )
+    out = cp_group.all_reduce(out)
+
+    if return_lse:
+        return out, lse
+    return out
+
+
+# Backward compatibility aliases for DCP
+DCPTritonContext = CPTritonContext
 
 
 def dcp_prepare_query(query: torch.Tensor) -> torch.Tensor:
@@ -192,7 +274,7 @@ def dcp_prepare_query(query: torch.Tensor) -> torch.Tensor:
 def dcp_reduce_output(
     attn_output: torch.Tensor,
     attn_lse: torch.Tensor,
-    ctx: DCPTritonContext | None = None,
+    ctx: CPTritonContext | None = None,
     return_lse: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Reduce DCP partial attention outputs across the DCP group and
@@ -203,41 +285,14 @@ def dcp_reduce_output(
     combines the partial results using the LSE correction and distributes
     the final output so each rank ends up with only its TP-local heads.
     """
-    tp_group = get_tp_group()
-    dcp_group = get_dcp_group()
-    if ctx is None:
-        ctx = DCPTritonContext()
-
-    # All-gather LSEs and apply correction to the local output.
-    lse = attn_lse.contiguous()
-    lses = dcp_group.all_gather(lse, dim=0).reshape(
-        (dcp_group.world_size,) + attn_lse.shape
+    return cp_lse_ag_out_rs(
+        attn_output,
+        attn_lse,
+        get_dcp_group(),
+        ctx=ctx,
+        return_lse=return_lse,
+        is_lse_base_on_e=True,
     )
-    attn_output, lse = _dcp_correct_attn_out(
-        attn_output, lses, dcp_group.rank_in_group, ctx
-    )
-
-    # Reduce across DCP ranks and scatter to TP-local heads.
-    # reduce_scatter only works when DCP group == TP group (same ranks),
-    # which requires PCP=1 AND DCP==TP. Otherwise DCP peers may share
-    # TP head assignments (e.g., PCP>1 spans PCP before TP, or DCP<TP).
-    pcp_group = get_pcp_group()
-    dcp_equals_tp = (
-        pcp_group.world_size == 1 and dcp_group.world_size == tp_group.world_size
-    )
-    if dcp_equals_tp:
-        attn_output = dcp_group.reduce_scatter(attn_output, dim=1)
-    else:
-        attn_output = dcp_group.all_reduce(attn_output)
-        h = attn_output.shape[1] // tp_group.world_size
-        r = tp_group.rank_in_group
-        attn_output = attn_output[:, h * r : h * (r + 1)].contiguous()
-
-    if return_lse:
-        h = lse.shape[1] // tp_group.world_size
-        r = tp_group.rank_in_group
-        return attn_output, lse[:, h * r : h * (r + 1)]
-    return attn_output
 
 
 @triton.jit

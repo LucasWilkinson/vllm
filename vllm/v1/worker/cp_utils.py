@@ -6,7 +6,7 @@ import numpy as np
 import torch
 
 from vllm.config import VllmConfig, get_layers_from_vllm_config
-from vllm.distributed import get_pcp_group
+from vllm.distributed import get_dcp_group, get_pcp_group
 from vllm.v1.utils import CpuGpuBuffer
 
 if TYPE_CHECKING:
@@ -249,6 +249,21 @@ class PCPManager:
         )
         out[mask] = slot_mapping
         return out
+
+
+def get_total_cp_world_size() -> int:
+    """Get the total context parallel world size (PCP * DCP)."""
+    try:
+        pcp_world_size = get_pcp_group().world_size
+    except AssertionError:
+        # PCP might not be initialized in testing
+        pcp_world_size = 1
+    try:
+        dcp_world_size = get_dcp_group().world_size
+    except AssertionError:
+        # DCP might not be initialized in testing
+        dcp_world_size = 1
+    return dcp_world_size * pcp_world_size
 
 
 def check_attention_cp_compatibility(vllm_config: VllmConfig) -> None:
