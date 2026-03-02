@@ -1472,20 +1472,15 @@ class FlashInferImpl(AttentionImpl):
                 assert decode_wrapper._sm_scale == self.scale
 
                 if use_dcp:
-                    decode_query_all_heads = dcp_prepare_query(
-                        decode_query.contiguous()
-                    )
-                    output_tmp = torch.empty_like(decode_query_all_heads)
+                    decode_query = dcp_prepare_query(decode_query.contiguous())
+                    output_tmp = torch.empty_like(decode_query)
                     lse = torch.empty(
-                        (
-                            decode_query_all_heads.size(0),
-                            decode_query_all_heads.size(1),
-                        ),
+                        (decode_query.size(0), decode_query.size(1)),
                         dtype=torch.float32,
-                        device=decode_query_all_heads.device,
+                        device=decode_query.device,
                     )
                     decode_wrapper.run(
-                        decode_query_all_heads,
+                        decode_query,
                         kv_cache_permute,
                         k_scale=layer._k_scale_float,
                         v_scale=layer._v_scale_float,

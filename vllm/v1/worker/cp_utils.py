@@ -44,6 +44,9 @@ class PCPManager:
         self.pcp_padded_slot_mapping = torch.empty(
             max_padded_num_tokens, dtype=torch.int64, device=device
         )
+        self.global_num_scheduled_tokens = CpuGpuBuffer(
+            max_num_reqs, dtype=torch.int32, device=device, pin_memory=pin_memory
+        )
         # Cached values from partition_inputs
         self.local_num_scheduled: np.ndarray = np.array([], dtype=np.int32)
         self.local_total: int = 0
@@ -57,7 +60,7 @@ class PCPManager:
         num_computed_tokens: np.ndarray,
         arange_np: np.ndarray,
         reorder_batch_threshold: int | None,
-    ) -> tuple[int, np.ndarray, np.ndarray]:
+    ) -> tuple[int, np.ndarray, np.ndarray, np.ndarray]:
         """
         Partition inputs for this PCP rank using DualChunkSwap splitting.
 
@@ -85,7 +88,14 @@ class PCPManager:
             reorder_batch_threshold: Threshold distinguishing decode vs prefill
 
         Returns:
-            (local_total, positions_np[:local_total], req_indices[:local_total])
+            (local_total, positions_np[:local_total], req_indices[:local_total],
+             gathered_positions[:local_total])
+
+        Note:
+            positions_np contains position values for RoPE encoding (DualChunkSwap).
+            gathered_positions contains positions gathered from the global array,
+            with padding positions clamped to the request start. These are used
+            for computing token_indices for input token gathering.
         """
         assert reorder_batch_threshold is not None
         num_reqs = len(num_scheduled_tokens)
@@ -157,6 +167,7 @@ class PCPManager:
         self.pcp_allgather_restore_idx.copy_to_gpu(len(all_pos))
 
         # Convert position values to indices into original batch
+        # (for input token gathering)
         cu_orig = np.cumsum(num_scheduled_tokens)
         orig_start = np.concatenate([[0], cu_orig[:-1]])
         pcp_total = int(pcp_tokens.sum())
@@ -170,14 +181,36 @@ class PCPManager:
             orig_starts + positions[:pcp_total],
         ).astype(np.int64)
 
-        # Gather local values
-        positions_np[:pcp_total] = positions_np[local_indices]
+        # Gather positions for token indices (clamped for padding, same as old behavior)
+        gathered_positions = positions_np[local_indices].copy()
+
+        # Compute actual position values for RoPE encoding.
+        # For padding positions, clamp to 0 (relative) so RoPE matches the
+        # clamped token content. This ensures padding K/V have consistent
+        # RoPE with the token they were cloned from.
+        is_padding = positions[:pcp_total] >= orig_lens
+        clamped_positions = np.where(is_padding, 0, positions[:pcp_total])
+        req_computed_tokens = np.repeat(num_computed_tokens, pcp_tokens)
+        positions_np[:pcp_total] = req_computed_tokens[:pcp_total] + clamped_positions
+
+        # Gather req_indices using local_indices (needed for input token gathering)
         req_indices[:pcp_total] = req_indices[local_indices]
 
         self.local_num_scheduled = pcp_tokens[:num_reqs]
         self.local_total = pcp_total
         self.padded_total = int(padded_total)
-        return pcp_total, positions_np[:pcp_total], req_indices[:pcp_total]
+
+        gns = self.global_num_scheduled_tokens
+        gns.np[:num_reqs] = num_scheduled_tokens
+        gns.np[num_reqs:].fill(0)
+        gns.copy_to_gpu()
+
+        return (
+            pcp_total,
+            positions_np[:pcp_total],
+            req_indices[:pcp_total],
+            gathered_positions,
+        )
 
     def restore_hidden_states(
         self, hidden_states: torch.Tensor, num_tokens: int

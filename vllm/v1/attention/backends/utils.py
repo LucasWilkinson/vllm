@@ -510,18 +510,48 @@ def split_decodes_and_prefills(
         num_decode_tokens: The number of tokens in the decode requests.
         num_prefill_tokens: The number of tokens in the prefill requests.
     """
-    max_query_len = common_attn_metadata.max_query_len
     num_reqs = common_attn_metadata.num_reqs
     num_tokens = common_attn_metadata.num_actual_tokens
     query_start_loc = common_attn_metadata.query_start_loc_cpu
 
-    if max_query_len <= decode_threshold and (
-        not require_uniform or decode_threshold <= 1
-    ):
-        return num_reqs, 0, num_tokens, 0
+    # For PCP, use global_num_scheduled_tokens for classification since
+    # query_start_loc contains local (partitioned) counts
+    global_scheduled = common_attn_metadata.global_num_scheduled_tokens
+    if global_scheduled is not None:
+        global_query_lens = global_scheduled[:num_reqs].cpu()
+        max_query_len = int(global_query_lens.max().item())
+        # Also get num_computed_tokens to distinguish decode from new prefill
+        num_computed = common_attn_metadata.compute_num_computed_tokens()[
+            :num_reqs
+        ].cpu()
+    else:
+        max_query_len = common_attn_metadata.max_query_len
+        global_query_lens = None
+        num_computed = None
 
-    query_lens = query_start_loc[1:] - query_start_loc[:-1]
-    if query_lens[0].item() > decode_threshold:
+    # For the "all decode" fast path, also need to check num_computed_tokens
+    # (new prefills have num_computed_tokens=0 and should not be classified as decode)
+    all_decode = max_query_len <= decode_threshold and (
+        not require_uniform or decode_threshold <= 1
+    )
+    if all_decode:
+        # With PCP, check if any request is a new prefill (num_computed_tokens=0)
+        if num_computed is not None and torch.any(num_computed == 0):
+            all_decode = False
+        if all_decode:
+            return num_reqs, 0, num_tokens, 0
+
+    # Use global lens if available (PCP), otherwise compute from local query_start_loc
+    if global_query_lens is not None:
+        query_lens = global_query_lens
+    else:
+        query_lens = query_start_loc[1:] - query_start_loc[:-1]
+    # Check if first request is prefill (cannot be decode if query_lens > threshold
+    # OR if it's a new prefill with num_computed_tokens == 0)
+    first_is_prefill = query_lens[0].item() > decode_threshold
+    if num_computed is not None and num_computed[0].item() == 0:
+        first_is_prefill = True
+    if first_is_prefill:
         # first request is not decode, so no decode requests
         return 0, num_reqs, 0, num_tokens
 
@@ -529,17 +559,25 @@ def split_decodes_and_prefills(
         # check if we are in a padded uniform batch; this is used for full-CGs, some
         # requests may have a query length of 0 but since they are padding its fine
         # to treat them as decodes (ensures num_decodes matches the captured size)
+        # Note: skip the total tokens check for PCP since num_tokens is local
         if torch.all((query_lens == query_lens[0]) | (query_lens == 0)):
-            assert num_reqs * query_lens[0] == num_tokens, "tokens not padded correctly"
+            if global_query_lens is None:
+                assert num_reqs * query_lens[0] == num_tokens, (
+                    "tokens not padded correctly"
+                )
             return num_reqs, 0, num_tokens, 0  # all decodes
         is_prefill = query_lens != query_lens[0]
     else:
+        # Prefill = query_lens > threshold OR num_computed_tokens == 0 (new prefill)
         is_prefill = query_lens > decode_threshold
+        if num_computed is not None:
+            is_prefill = is_prefill | (num_computed == 0)
 
     if not torch.any(is_prefill):
         return num_reqs, 0, num_tokens, 0
 
     first_prefill = is_prefill.int().argmax(dim=-1).item()
+    # Classification is based on query_lens (global for PCP), but assertion should match
     assert torch.all(query_lens[:first_prefill] <= decode_threshold)
     num_decodes = first_prefill
     num_prefills = num_reqs - num_decodes
@@ -854,10 +892,12 @@ def pcp_kv_allgather_and_restore(
     value_across_cp = pcp_group.all_gather(
         value[:num_actual_tokens].contiguous(), dim=0
     )
+
     # Reorder kv after pcp allgather.
     # Note that there are duplicate decoding tokens after allgather.
     key = torch.index_select(key_across_cp, 0, pcp_allgather_restore_idx)
     value = torch.index_select(value_across_cp, 0, pcp_allgather_restore_idx)
+
     return key, value
 
 

@@ -218,14 +218,16 @@ def dcp_reduce_output(
     )
 
     # Reduce across DCP ranks and scatter to TP-local heads.
-    if get_pcp_group().world_size == 1:
-        # PCP=1 ⇒ DCP group == TP group: reduce-scatter combines the
-        # cross-rank sum and TP head scatter in a single collective.
+    # reduce_scatter only works when DCP group == TP group (same ranks),
+    # which requires PCP=1 AND DCP==TP. Otherwise DCP peers may share
+    # TP head assignments (e.g., PCP>1 spans PCP before TP, or DCP<TP).
+    pcp_group = get_pcp_group()
+    dcp_equals_tp = (
+        pcp_group.world_size == 1 and dcp_group.world_size == tp_group.world_size
+    )
+    if dcp_equals_tp:
         attn_output = dcp_group.reduce_scatter(attn_output, dim=1)
     else:
-        # PCP>1 ⇒ DCP ⊂ TP: DCP peers share TP head assignments so
-        # reduce-scatter would mis-distribute heads.  All-reduce first,
-        # then slice to this rank's TP-local heads.
         attn_output = dcp_group.all_reduce(attn_output)
         h = attn_output.shape[1] // tp_group.world_size
         r = tp_group.rank_in_group

@@ -329,6 +329,11 @@ class CommonAttentionMetadata:
     pcp_allgather_restore_idx: torch.Tensor | None = None
     """Indices to restore the original order of KV in prefill context parallelism"""
 
+    global_num_scheduled_tokens: torch.Tensor | None = None
+    """(batch_size,), GLOBAL (pre-PCP-partition) scheduled token counts per request.
+    Used by PCP to correctly compute num_computed_tokens, since with PCP
+    query_start_loc is local but seq_lens is global."""
+
     # WARNING: Deprecated fields. Will be removed in a future release (v0.15.0)
     _seq_lens_cpu: torch.Tensor | None = None
     _num_computed_tokens_cpu: torch.Tensor | None = None
@@ -378,15 +383,16 @@ class CommonAttentionMetadata:
     def compute_num_computed_tokens(self) -> torch.Tensor:
         """Compute num_computed_tokens on device.
 
-        Uses the scheduler-provided _num_computed_tokens_cpu when available
-        (required for PCP where seq_lens is global but query_start_loc is
-        local, making seq_lens - query_lens incorrect). Falls back to
-        deriving from seq_lens - query_lens otherwise.
+        With PCP, query_start_loc is local (partitioned) but seq_lens is
+        global, so ``seq_lens - query_lens`` gives the wrong result. When
+        global_num_scheduled_tokens is available we use
+        ``seq_lens - global_num_scheduled_tokens`` instead, which is always
+        correct since seq_lens = num_computed + num_scheduled (both global).
         """
         if self._num_computed_tokens_cache is None:
-            if self._num_computed_tokens_cpu is not None:
-                self._num_computed_tokens_cache = self._num_computed_tokens_cpu.to(
-                    self.seq_lens.device
+            if self.global_num_scheduled_tokens is not None:
+                self._num_computed_tokens_cache = (
+                    self.seq_lens - self.global_num_scheduled_tokens
                 )
             else:
                 query_lens = self.query_start_loc[1:] - self.query_start_loc[:-1]
@@ -408,6 +414,9 @@ class CommonAttentionMetadata:
             _num_computed_tokens_cpu=self._num_computed_tokens_cpu[:num_actual_reqs]
             if self._num_computed_tokens_cpu is not None
             else None,
+            global_num_scheduled_tokens=maybe_slice_reqs(
+                self.global_num_scheduled_tokens
+            ),
             num_reqs=num_actual_reqs,
             num_actual_tokens=num_actual_tokens,
             max_query_len=self.max_query_len,

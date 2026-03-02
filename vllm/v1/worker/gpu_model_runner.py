@@ -1528,9 +1528,10 @@ class GPUModelRunner(
             self.device, non_blocking=True
         )
 
-        # For PCP: partition to local tokens for this rank
+        # For PCP: save global num_scheduled_tokens, then partition to local
+        local_token_indices = None
         if self.pcp_world_size > 1:
-            total_num_tokens, positions_np, req_indices = (
+            total_num_tokens, positions_np, req_indices, local_token_indices = (
                 self.pcp_manager.partition_inputs(
                     positions_np,
                     req_indices,
@@ -1557,9 +1558,18 @@ class GPUModelRunner(
         # E.g., [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
         # -> [0, 1, M, M + 1, M + 2, M + 3, M + 4, 2 * M, 2 * M + 1, 2 * M + 2]
         # where M is the max_model_len.
-        token_indices = (
-            positions_np + req_indices * self.input_batch.token_ids_cpu.shape[1]
-        )
+        # For PCP, use gathered_positions which handles padding positions correctly
+        # (positions_np has DualChunkSwap positions for RoPE, not for token gathering)
+        if local_token_indices is not None:
+            # local_token_indices are gathered positions (clamped for padding)
+            token_indices = (
+                local_token_indices
+                + req_indices * self.input_batch.token_ids_cpu.shape[1]
+            )
+        else:
+            token_indices = (
+                positions_np + req_indices * self.input_batch.token_ids_cpu.shape[1]
+            )
         token_indices_tensor = torch.from_numpy(token_indices)
 
         # NOTE(woosuk): We use torch.index_select instead of np.take here
@@ -1826,12 +1836,13 @@ class GPUModelRunner(
             ]
 
         if self.pcp_world_size > 1:
-            # pcp_allgather_restore_idx was built for padded_total elements
-            cm_base.pcp_allgather_restore_idx = (
-                self.pcp_manager.pcp_allgather_restore_idx.gpu[
-                    : self.pcp_manager.padded_total
-                ]
-            )
+            pm = self.pcp_manager
+            cm_base.pcp_allgather_restore_idx = pm.pcp_allgather_restore_idx.gpu[
+                : pm.padded_total
+            ]
+            cm_base.global_num_scheduled_tokens = pm.global_num_scheduled_tokens.gpu[
+                :num_reqs_padded
+            ]
 
         if logits_indices is not None and self.cache_config.kv_sharing_fast_prefill:
             cm_base.num_logits_indices = logits_indices.size(0)
@@ -3651,6 +3662,15 @@ class GPUModelRunner(
                     hidden_states,
                     local_total_num_tokens,
                 )
+                import os
+
+                if os.environ.get("DEBUG_PCP", "0") == "1":
+                    print(
+                        f"[PCP DEBUG after restore_hidden_states] "
+                        f"hidden_states.shape={hidden_states.shape} "
+                        f"logits_indices={logits_indices.cpu().tolist()} "
+                        f"num_tokens_unpadded={num_tokens_unpadded}"
+                    )
             if not self.broadcast_pp_output:
                 # Common case.
                 if not get_pp_group().is_last_rank:
