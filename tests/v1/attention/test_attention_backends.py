@@ -498,13 +498,25 @@ def _test_backend_correctness(
                 stride_order = backend_cls.get_kv_cache_stride_order()
             except (AttributeError, NotImplementedError):
                 stride_order = tuple(range(kv_cache.ndim))
+            if len(stride_order) == 5:
+                # Most backends pack K/V in the content dimension, but
+                # FlashAttention keeps a distinct K/V dimension. Convert the
+                # test's canonical packed cache to the backend's logical shape
+                # before applying its physical stride order.
+                key_cache, value_cache = kv_cache.split(head_size, dim=-1)
+                kv_cache_for_backend = torch.stack(
+                    (key_cache.transpose(1, 2), value_cache.transpose(1, 2)),
+                    dim=1,
+                )
             if stride_order != tuple(range(kv_cache.ndim)):
                 # Apply stride order like runtime does in
                 # _reshape_kv_cache (attn_utils.py:182-210): permute to physical
                 # layout, make contiguous, then permute to logical layout.
                 inv_order = [stride_order.index(i) for i in range(len(stride_order))]
                 kv_cache_for_backend = (
-                    kv_cache.permute(*stride_order).contiguous().permute(*inv_order)
+                    kv_cache_for_backend.permute(*stride_order)
+                    .contiguous()
+                    .permute(*inv_order)
                 )
 
         try:
