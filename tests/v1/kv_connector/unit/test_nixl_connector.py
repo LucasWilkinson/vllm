@@ -569,6 +569,45 @@ class TestNixlHandshake:
         "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
         FakeNixlWrapper,
     )
+    def test_pcp_producer_publishes_one_kv_replica(
+        self, default_vllm_config, dist_init
+    ):
+        vllm_config = create_vllm_config(kv_role="kv_producer")
+        connector = NixlConnector(
+            vllm_config,
+            KVConnectorRole.WORKER,
+            make_kv_cache_config(block_size=16),
+        )
+        payload = MagicMock(spec=NixlHandshakePayload)
+        worker = connector.connector_worker
+        assert worker is not None
+        worker.xfer_handshake_metadata = payload
+
+        worker.pcp_rank = 0
+        assert connector.get_handshake_metadata() is payload
+
+        worker.pcp_rank = 1
+        assert connector.get_handshake_metadata() is None
+
+    def test_pcp_producer_waits_only_for_published_replicas(
+        self, default_vllm_config, dist_init
+    ):
+        vllm_config = create_vllm_config(kv_role="kv_producer")
+        vllm_config.parallel_config.tensor_parallel_size = 2
+        vllm_config.parallel_config.prefill_context_parallel_size = 2
+        vllm_config.parallel_config.pipeline_parallel_size = 2
+        connector = NixlConnector(
+            vllm_config,
+            KVConnectorRole.SCHEDULER,
+            make_kv_cache_config(block_size=16),
+        )
+
+        assert connector.get_finished_count() == 4
+
+    @patch(
+        "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
+        FakeNixlWrapper,
+    )
     def test_multi_xfer_one_engine(
         self,
         default_vllm_config,

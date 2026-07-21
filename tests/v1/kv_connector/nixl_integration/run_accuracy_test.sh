@@ -75,6 +75,7 @@ fi
 NUM_PREFILL_INSTANCES=${NUM_PREFILL_INSTANCES:-1} # Default to 1
 NUM_DECODE_INSTANCES=${NUM_DECODE_INSTANCES:-1}   # Default to 1
 PREFILLER_TP_SIZE=${PREFILLER_TP_SIZE:-1}
+PREFILLER_PCP_SIZE=${PREFILLER_PCP_SIZE:-1}
 PREFILLER_PP_SIZE=${PREFILLER_PP_SIZE:-1} # >1 requires NixlPushConnector
 DECODER_TP_SIZE=${DECODER_TP_SIZE:-1}
 GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.2}
@@ -148,8 +149,8 @@ run_tests_for_model() {
     GPU_START=$((i % $(get_num_gpus)))
     GPU_ID=$GPU_START
     NEXT_GPU=$GPU_START
-    # Reserve TP*PP GPUs for the prefiller (TP shards across PP stages).
-    PREFILLER_WORLD_SIZE=$((PREFILLER_TP_SIZE * PREFILLER_PP_SIZE))
+    # Reserve TP*PCP*PP GPUs for the prefiller.
+    PREFILLER_WORLD_SIZE=$((PREFILLER_TP_SIZE * PREFILLER_PCP_SIZE * PREFILLER_PP_SIZE))
     for (( j=1; j < PREFILLER_WORLD_SIZE; j++ )); do
       NEXT_GPU=$(((GPU_START + j) % $(get_num_gpus)))
       GPU_ID="${GPU_ID},${NEXT_GPU}"
@@ -174,6 +175,7 @@ run_tests_for_model() {
     --block-size ${PREFILL_BLOCK_SIZE} \
     --gpu-memory-utilization $GPU_MEMORY_UTILIZATION \
     --tensor-parallel-size $PREFILLER_TP_SIZE \
+    --prefill-context-parallel-size $PREFILLER_PCP_SIZE \
     --pipeline-parallel-size $PREFILLER_PP_SIZE \
     --kv-transfer-config '$KV_CONFIG_P'"
     if [[ "$ENFORCE_EAGER" == "1" ]]; then
