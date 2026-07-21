@@ -214,6 +214,9 @@ class VllmSerializableFunction(SerializableCallable):  # type: ignore[misc]
             self.shape_env = sym_input.node.shape_env
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        from vllm.compilation.side_stream import register_side_stream
+
+        register_side_stream()
         return self.optimized_call(*args, **kwargs)
 
     @classmethod
@@ -260,11 +263,25 @@ class VllmSerializableFunction(SerializableCallable):  # type: ignore[misc]
         for node in state["graph_module"].graph.nodes:
             node.meta.pop("source_fn_stack", None)
             node.meta.pop("nn_module_stack", None)
+            if (
+                getattr(node.target, "__module__", None)
+                == "torch._dynamo.graph_bytecode_inputs"
+                and getattr(node.target, "__name__", None)
+                == "get_external_object_by_index"
+            ):
+                node.meta.pop("example_value", None)
         for name, submod in state["graph_module"].named_children():
             if hasattr(submod, "graph"):
                 for node in submod.graph.nodes:
                     node.meta.pop("source_fn_stack", None)
                     node.meta.pop("nn_module_stack", None)
+                    if (
+                        getattr(node.target, "__module__", None)
+                        == "torch._dynamo.graph_bytecode_inputs"
+                        and getattr(node.target, "__name__", None)
+                        == "get_external_object_by_index"
+                    ):
+                        node.meta.pop("example_value", None)
 
         if state.get("sym_tensor_indices"):
             # put tensor inputs on meta device since their data
@@ -290,10 +307,12 @@ class VllmSerializableFunction(SerializableCallable):  # type: ignore[misc]
                 standalone_compile_artifacts,
                 sym_shape_indices_map,
                 returns_tuple_map,
+                uses_stream_ops_map,
             ) = compiled_fn.vllm_backend.collect_standalone_compile_artifacts()
             state["standalone_compile_artifacts"] = standalone_compile_artifacts
             state["sym_shape_indices_map"] = sym_shape_indices_map
             state["returns_tuple_map"] = returns_tuple_map
+            state["uses_stream_ops_map"] = uses_stream_ops_map
         return pickle.dumps(state)
 
     @classmethod
@@ -309,6 +328,7 @@ class VllmSerializableFunction(SerializableCallable):  # type: ignore[misc]
         standalone_compile_artifacts = state.pop("standalone_compile_artifacts", None)
         sym_shape_indices_map = state.pop("sym_shape_indices_map", {})
         returns_tuple_map = state.pop("returns_tuple_map", {})
+        uses_stream_ops_map = state.pop("uses_stream_ops_map", {})
 
         saved_aot_autograd_config = state["aot_autograd_config"]
         if saved_aot_autograd_config is not None:
@@ -329,6 +349,7 @@ class VllmSerializableFunction(SerializableCallable):  # type: ignore[misc]
                     vllm_config=get_current_vllm_config(),
                     sym_shape_indices_map=sym_shape_indices_map,
                     returns_tuple_map=returns_tuple_map,
+                    uses_stream_ops_map=uses_stream_ops_map,
                     fake_mode=fake_mode,
                 )
 
@@ -414,6 +435,7 @@ def reconstruct_serializable_fn_from_mega_artifact(
     vllm_config: VllmConfig,
     sym_shape_indices_map: dict[str, list[int]],
     returns_tuple_map: dict[str, bool],
+    uses_stream_ops_map: dict[str, bool],
     fake_mode: FakeTensorMode,
 ) -> "VllmSerializableFunction":
     """Construct a VllmSerializableFunction from cached inductor artifacts.
@@ -444,6 +466,7 @@ def reconstruct_serializable_fn_from_mega_artifact(
         vllm_config: The vLLM configuration.
         sym_shape_indices_map: Mapping from submod_name to sym_shape_indices.
         returns_tuple_map: Mapping from submod_name to returns_tuple.
+        uses_stream_ops_map: Mapping from submod_name to whether it uses stream ops.
 
     Returns:
         A VllmSerializableFunction that can be called directly.
@@ -516,6 +539,7 @@ def reconstruct_serializable_fn_from_mega_artifact(
             compilation_config,
             is_first,
             is_last,
+            uses_stream_ops_map.get(submod_name, False),
         )
 
         submod_callables[submod_name] = wrapped_backend

@@ -56,6 +56,13 @@ from .passes.pass_manager import PostGradPassManager
 logger = init_logger(__name__)
 
 
+def graph_uses_stream_ops(graph: torch.fx.GraphModule) -> bool:
+    return any(
+        node.op == "call_function" and str(node.target).startswith("streams.")
+        for node in graph.graph.nodes
+    )
+
+
 def make_copy_and_call(
     sym_tensor_indices: list[int],
     input_buffers: list[torch.Tensor | None],
@@ -631,6 +638,7 @@ def wrap_with_cudagraph_if_needed(
     compilation_config: CompilationConfig,
     is_first_graph: bool,
     is_last_graph: bool,
+    uses_stream_ops: bool = False,
 ) -> Any:
     """
     Wrap a piecewise backend with CUDA graph wrapper if needed.
@@ -643,6 +651,7 @@ def wrap_with_cudagraph_if_needed(
         compilation_config: The compilation configuration
         is_first_graph: Whether this is the first graph in the sequence
         is_last_graph: Whether this is the last graph in the sequence
+        uses_stream_ops: Whether the graph switches between CUDA streams
 
     Returns:
         The wrapped backend if CUDA graphs are enabled, otherwise the original backend
@@ -650,6 +659,7 @@ def wrap_with_cudagraph_if_needed(
     if (
         not compilation_config.cudagraph_mode.has_piecewise_cudagraphs()
         or compilation_config.use_inductor_graph_partition
+        or uses_stream_ops
     ):
         return piecewise_backend
 
@@ -764,6 +774,7 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):  # type: ignore[misc]
                 self.compilation_config,
                 piecewise_backend.is_first_graph,
                 piecewise_backend.is_last_graph,
+                graph_uses_stream_ops(submod),
             )
 
             compilation_counter.num_piecewise_capturable_graphs_seen += 1
@@ -866,22 +877,29 @@ class VllmBackend:
 
     def collect_standalone_compile_artifacts(
         self,
-    ) -> tuple[Any, dict[str, list[int]] | None, dict[str, bool] | None]:
+    ) -> tuple[
+        Any,
+        dict[str, list[int]] | None,
+        dict[str, bool] | None,
+        dict[str, bool] | None,
+    ]:
         """Collect inductor cache artifacts from all piecewise backends.
 
         Returns:
             tuple: (standalone_compile_artifacts, sym_shape_indices_map,
-                    returns_tuple_map)
+                    returns_tuple_map, uses_stream_ops_map)
                 - standalone_compile_artifacts: StandaloneCompiledArtifacts
                   with compiled artifacts
                 - sym_shape_indices_map: dict mapping submod_name to
                   sym_shape_indices
                 - returns_tuple_map: dict mapping submod_name to
                   returns_tuple
+                - uses_stream_ops_map: dict mapping submod_name to whether
+                  the graph contains native stream operations
         """
 
         if not envs.VLLM_USE_MEGA_AOT_ARTIFACT:
-            return None, None, None
+            return None, None, None, None
 
         from .caching import StandaloneCompiledArtifacts
         from .piecewise_backend import PiecewiseBackend
@@ -889,6 +907,7 @@ class VllmBackend:
         standalone_compile_artifacts = StandaloneCompiledArtifacts()
         sym_shape_indices_map = {}
         returns_tuple_map = {}
+        uses_stream_ops_map = {}
 
         for name, _ in self.split_gm.named_children():
             # get the actual attribute (shadowed by PiecewiseBackend in __dict__)
@@ -902,6 +921,8 @@ class VllmBackend:
             submod_name = name
             sym_shape_indices_map[submod_name] = piecewise_backend.sym_shape_indices
             returns_tuple_map[submod_name] = piecewise_backend.returns_tuple
+            original_submod = self.split_gm._modules[name]
+            uses_stream_ops_map[submod_name] = graph_uses_stream_ops(original_submod)
 
             for shape_str, bytes_data in piecewise_backend.to_bytes().items():
                 standalone_compile_artifacts.insert(submod_name, shape_str, bytes_data)
@@ -924,7 +945,12 @@ class VllmBackend:
             list(standalone_compile_artifacts.submodule_bytes.keys()),
         )
 
-        return standalone_compile_artifacts, sym_shape_indices_map, returns_tuple_map
+        return (
+            standalone_compile_artifacts,
+            sym_shape_indices_map,
+            returns_tuple_map,
+            uses_stream_ops_map,
+        )
 
     def configure_post_pass(self) -> None:
         # TODO proper PassManager?
