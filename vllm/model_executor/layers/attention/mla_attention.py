@@ -227,7 +227,7 @@ from vllm.model_executor.layers.attention.kv_transfer_utils import (
 )
 from vllm.model_executor.layers.attention.pcp import (
     cp_reconcile_heads,
-    maybe_all_gather_split_q_for_dcp,
+    maybe_all_gather_q_for_dcp,
     maybe_gather_mla_latent_cache_inputs,
     resolve_dcp_combine_fn,
 )
@@ -870,7 +870,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 if not self.use_pcp and isinstance(mqa_q, tuple):
                     # concatenate mqa_ql_nope and mqa_q_pe -> (B, N, L + P)
                     mqa_q = torch.cat(mqa_q, dim=-1)
-                mqa_q = maybe_all_gather_split_q_for_dcp(
+                mqa_q = maybe_all_gather_q_for_dcp(
                     mqa_q,
                     self.impl.dcp_world_size,
                     self.impl.pcp_world_size,

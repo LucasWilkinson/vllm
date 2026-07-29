@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, NamedTuple, TypeVar
 
 import torch
 
@@ -15,6 +15,10 @@ from vllm.v1.attention.ops.dcp_alltoall import dcp_a2a_lse_reduce
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+
+# Query as handed to the DCP context attention: a tensor, or MLA's split
+# (nope, pe) pair which is only concatenated if a gather happens.
+_QueryT = TypeVar("_QueryT", torch.Tensor, tuple[torch.Tensor, ...])
 
 
 def _gather_prefill_cache_inputs(
@@ -249,15 +253,17 @@ def dcp_q_gather_size(dcp_world_size: int, pcp_world_size: int) -> int:
 
 
 def maybe_all_gather_q_for_dcp(
-    q: torch.Tensor,
+    q: _QueryT,
     dcp_world_size: int,
     pcp_world_size: int,
     already_replicated: bool = False,
-) -> torch.Tensor:
+) -> _QueryT | torch.Tensor:
     """All-gather query heads for attention against the DCP-sharded cache.
 
     Returns ``q`` untouched when this rank already holds every head the kernel
-    needs. ``already_replicated`` lets a caller declare that up front.
+    needs; ``already_replicated`` lets a caller declare that up front. A split
+    ``q`` -- MLA's ``(nope, pe)`` pair -- is concatenated only when a gather
+    actually happens, so callers that can consume the split form keep it.
 
     Pairs with ``resolve_dcp_combine_fn``: changing one without the other breaks
     the head layout the combine expects.
@@ -267,27 +273,8 @@ def maybe_all_gather_q_for_dcp(
     group = _dcp_q_gather_group(dcp_world_size, pcp_world_size)
     if group is None:
         return q
-    return group.all_gather(q, dim=1)
-
-
-def maybe_all_gather_split_q_for_dcp(
-    q: torch.Tensor | tuple[torch.Tensor, ...],
-    dcp_world_size: int,
-    pcp_world_size: int,
-    already_replicated: bool = False,
-) -> torch.Tensor | tuple[torch.Tensor, ...]:
-    """``maybe_all_gather_q_for_dcp`` for MLA's split (nope, pe) query.
-
-    The halves are concatenated only when a gather actually happens, so callers
-    that can consume the split form keep it.
-    """
-    if already_replicated:
-        return q
-    if _dcp_q_gather_group(dcp_world_size, pcp_world_size) is None:
-        return q
-    if isinstance(q, tuple):
-        q = torch.cat(q, dim=-1)
-    return maybe_all_gather_q_for_dcp(q, dcp_world_size, pcp_world_size)
+    gathered = torch.cat(q, dim=-1) if isinstance(q, tuple) else q
+    return group.all_gather(gathered, dim=1)
 
 
 def resolve_dcp_combine_fn(vllm_config: "VllmConfig | None"):
