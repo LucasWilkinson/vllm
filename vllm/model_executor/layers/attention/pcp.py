@@ -5,9 +5,13 @@ from typing import NamedTuple
 import torch
 
 from vllm.distributed.parallel_state import (
+    GroupCoordinator,
+    get_dcp_group,
     get_pcp_group,
     get_tp_group,
 )
+from vllm.v1.attention.ops.common import cp_lse_ag_out_ar, cp_lse_ag_out_rs
+from vllm.v1.attention.ops.dcp_alltoall import dcp_a2a_lse_reduce
 
 
 def _gather_prefill_cache_inputs(
@@ -208,7 +212,97 @@ def build_mixed_decode_subset(
     )
 
 
-def finalize_mla_pcp_decode(
+def _dcp_q_gather_group(
+    dcp_world_size: int,
+    pcp_world_size: int,
+) -> GroupCoordinator | None:
+    """Group holding the query-head shards this rank must gather, or None.
+
+    DCP groups span the PCP axis before TP (see ``init_model_parallel_groups``),
+    so how far the group reaches decides which ranks hold distinct query heads:
+
+    - ``pcp == 1``: the DCP group is a TP subgroup that splits Q heads, so
+      gather over the DCP group.
+    - ``dcp > pcp``: the group spans TP x PCP. Q is head-sharded across TP and
+      replicated across PCP, so gather over the TP group -- gathering over the
+      DCP group here would duplicate the PCP-replicated heads.
+    - otherwise: the DCP group is the PCP group and already holds every head.
+    """
+    if pcp_world_size == 1:
+        return get_dcp_group() if dcp_world_size > 1 else None
+    if dcp_world_size > pcp_world_size:
+        return get_tp_group()
+    return None
+
+
+def dcp_q_gather_size(dcp_world_size: int, pcp_world_size: int) -> int:
+    """Head-shard count ``maybe_all_gather_q_for_dcp`` will produce.
+
+    For sizing work that has to be planned before the gather happens, such as
+    FlashAttention's AOT scheduler metadata. 1 means no gather.
+    """
+    group = _dcp_q_gather_group(dcp_world_size, pcp_world_size)
+    return 1 if group is None else group.world_size
+
+
+def maybe_all_gather_q_for_dcp(
+    q: torch.Tensor,
+    dcp_world_size: int,
+    pcp_world_size: int,
+    already_replicated: bool = False,
+) -> torch.Tensor:
+    """All-gather query heads for attention against the DCP-sharded cache.
+
+    Returns ``q`` untouched when this rank already holds every head the kernel
+    needs. ``already_replicated`` lets a caller declare that up front.
+
+    Pairs with ``cp_context_combine_fn``: changing one without the other breaks
+    the head layout the combine expects.
+    """
+    if already_replicated:
+        return q
+    group = _dcp_q_gather_group(dcp_world_size, pcp_world_size)
+    if group is None:
+        return q
+    return group.all_gather(q, dim=1)
+
+
+def maybe_all_gather_split_q_for_dcp(
+    q: torch.Tensor | tuple[torch.Tensor, ...],
+    dcp_world_size: int,
+    pcp_world_size: int,
+    already_replicated: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, ...]:
+    """``maybe_all_gather_q_for_dcp`` for MLA's split (nope, pe) query.
+
+    The halves are concatenated only when a gather actually happens, so callers
+    that can consume the split form keep it.
+    """
+    if already_replicated:
+        return q
+    if _dcp_q_gather_group(dcp_world_size, pcp_world_size) is None:
+        return q
+    if isinstance(q, tuple):
+        q = torch.cat(q, dim=-1)
+    return maybe_all_gather_q_for_dcp(q, dcp_world_size, pcp_world_size)
+
+
+def cp_context_combine_fn(pcp_world_size: int, dcp_a2a: bool):
+    """LSE-combine to fold per-rank partial attentions over the DCP group.
+
+    Under PCP the partials cover the full head set on every rank, so they
+    all-reduce and each rank takes its own heads back out with
+    ``cp_reconcile_heads``. Without PCP the DCP group is a TP subgroup, so the
+    reduce-scatter lands each rank's heads directly.
+    """
+    if dcp_a2a:
+        return dcp_a2a_lse_reduce
+    if pcp_world_size > 1:
+        return cp_lse_ag_out_ar
+    return cp_lse_ag_out_rs
+
+
+def cp_reconcile_heads(
     output: torch.Tensor,
     num_heads: int,
 ) -> torch.Tensor:
