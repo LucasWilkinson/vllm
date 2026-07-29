@@ -12,10 +12,10 @@ import torch
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention.pcp import (
     build_mixed_decode_subset,
-    cp_context_combine_fn,
     dcp_q_gather_size,
     gather_prefill_qkv_global,
     maybe_all_gather_q_for_dcp,
+    resolve_dcp_combine_fn,
     slice_prefill_output_local,
 )
 from vllm.platforms import current_platform
@@ -899,16 +899,11 @@ class FlashAttentionImpl(AttentionImpl):
         self.supports_quant_query_input = flash_attn_supports_quant_query_input()
 
         vllm_config = get_current_vllm_config_or_none()
-        dcp_a2a = (
-            vllm_config is not None
-            and vllm_config.parallel_config.decode_context_parallel_size > 1
-            and vllm_config.parallel_config.dcp_comm_backend == "a2a"
-        )
         # self.pcp_world_size is auto-populated by AttentionImplBase.__new__.
         self.use_pcp = self.pcp_world_size > 1
         # How Q and the partials move across the DCP group is decided by the
         # PCP/DCP topology alone; both backends share the rule (see pcp.py).
-        self.dcp_combine = cp_context_combine_fn(self.pcp_world_size, dcp_a2a)
+        self.dcp_combine = resolve_dcp_combine_fn(vllm_config)
 
         self._dcp_dtype: torch.dtype | None = None
         self._dcp_max_num_tokens: int = 0

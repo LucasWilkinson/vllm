@@ -226,10 +226,10 @@ from vllm.model_executor.layers.attention.kv_transfer_utils import (
     maybe_transfer_kv_layer,
 )
 from vllm.model_executor.layers.attention.pcp import (
-    cp_context_combine_fn,
     cp_reconcile_heads,
     maybe_all_gather_split_q_for_dcp,
     maybe_gather_mla_latent_cache_inputs,
+    resolve_dcp_combine_fn,
 )
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.linear import (
@@ -542,12 +542,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
 
         self.use_sparse = use_sparse
 
-        _vllm_config = get_current_vllm_config_or_none()
-        self.dcp_a2a = (
-            _vllm_config is not None
-            and _vllm_config.parallel_config.decode_context_parallel_size > 1
-            and _vllm_config.parallel_config.dcp_comm_backend == "a2a"
-        )
+        self.dcp_combine = resolve_dcp_combine_fn(get_current_vllm_config_or_none())
 
         # Initialize q/k/v range constants.
         self.q_range = torch.tensor(envs.Q_SCALE_CONSTANT, dtype=torch.float32)
@@ -890,8 +885,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             # correct dcp attn_out with lse.
             if self.impl.dcp_world_size > 1:
                 assert lse is not None
-                combine = cp_context_combine_fn(self.impl.pcp_world_size, self.dcp_a2a)
-                attn_out = combine(
+                attn_out = self.dcp_combine(
                     attn_out,
                     lse,
                     get_dcp_group(),

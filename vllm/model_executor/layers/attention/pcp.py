@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 
@@ -12,6 +12,9 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.v1.attention.ops.common import cp_lse_ag_out_ar, cp_lse_ag_out_rs
 from vllm.v1.attention.ops.dcp_alltoall import dcp_a2a_lse_reduce
+
+if TYPE_CHECKING:
+    from vllm.config import VllmConfig
 
 
 def _gather_prefill_cache_inputs(
@@ -256,7 +259,7 @@ def maybe_all_gather_q_for_dcp(
     Returns ``q`` untouched when this rank already holds every head the kernel
     needs. ``already_replicated`` lets a caller declare that up front.
 
-    Pairs with ``cp_context_combine_fn``: changing one without the other breaks
+    Pairs with ``resolve_dcp_combine_fn``: changing one without the other breaks
     the head layout the combine expects.
     """
     if already_replicated:
@@ -287,17 +290,26 @@ def maybe_all_gather_split_q_for_dcp(
     return maybe_all_gather_q_for_dcp(q, dcp_world_size, pcp_world_size)
 
 
-def cp_context_combine_fn(pcp_world_size: int, dcp_a2a: bool):
+def resolve_dcp_combine_fn(vllm_config: "VllmConfig | None"):
     """LSE-combine to fold per-rank partial attentions over the DCP group.
 
     Under PCP the partials cover the full head set on every rank, so they
     all-reduce and each rank takes its own heads back out with
     ``cp_reconcile_heads``. Without PCP the DCP group is a TP subgroup, so the
     reduce-scatter lands each rank's heads directly.
+
+    Pairs with ``maybe_all_gather_q_for_dcp``. ``vllm_config`` may be None when
+    there is no config in scope (unit tests), which implies no CP.
     """
-    if dcp_a2a:
+    if vllm_config is None:
+        return cp_lse_ag_out_rs
+    parallel_config = vllm_config.parallel_config
+    if (
+        parallel_config.decode_context_parallel_size > 1
+        and parallel_config.dcp_comm_backend == "a2a"
+    ):
         return dcp_a2a_lse_reduce
-    if pcp_world_size > 1:
+    if parallel_config.prefill_context_parallel_size > 1:
         return cp_lse_ag_out_ar
     return cp_lse_ag_out_rs
 
