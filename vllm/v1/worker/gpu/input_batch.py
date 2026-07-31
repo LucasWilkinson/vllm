@@ -104,10 +104,8 @@ class InputBatch:
     # [num_reqs] per-request prompt length, only populated for R-SWA.
     prompt_lens: torch.Tensor | None
 
-    # MRv2 PCP: rank-invariant "global batch has prefill" (gates the cache-write
-    # all-gather) and the per-step row plan for the sharded PCP+DCP path.
-    # Both are None/False unless PCP partitioned this step.
-    pcp_has_prefill: bool = False
+    # MRv2 PCP: per-step row plan for the sharded PCP+DCP path.
+    # None unless PCP partitioned a prefill step this step.
     pcp_row_plan: "PCPRowPlan | None" = None
 
     @classmethod

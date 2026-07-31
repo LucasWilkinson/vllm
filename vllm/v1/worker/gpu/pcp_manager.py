@@ -110,10 +110,9 @@ class PCPManager:
         self._padded_gather_idx: torch.Tensor | None = None
         self._gathered_kv_write_mask: torch.Tensor | None = None
         # GLOBAL batch composition (rank-invariant: every PCP rank sees the same
-        # global batch, so this is identical across ranks). Gates the
-        # cache-write all-gather and the row-plan build -- per-rank
-        # is_prefilling can differ (DualChunkSwap leaves some ranks with zero
-        # prefill chunks), which would desync NCCL collectives.
+        # global batch, so this is identical across ranks). Gates the row-plan
+        # build -- per-rank is_prefilling can differ (DualChunkSwap leaves some
+        # ranks with zero prefill chunks), which would desync NCCL collectives.
         self._global_has_prefill: bool = False
         self._pad_slot_id = torch.tensor(PAD_SLOT_ID, dtype=torch.int64, device=device)
 
@@ -621,7 +620,6 @@ class PCPManager:
             cu_num_logits=cu_num_logits,
             cu_num_logits_np=cu_num_logits_np,
             prompt_lens=None,
-            pcp_has_prefill=self._global_has_prefill,
             pcp_row_plan=self.build_cp_row_plan(),
         )
 

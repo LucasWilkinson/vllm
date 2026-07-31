@@ -56,10 +56,6 @@ from vllm.config import (
 )
 from vllm.config.cache import CacheDType
 from vllm.distributed.parallel_state import get_dcp_group, get_pcp_group
-from vllm.forward_context import (
-    get_forward_context,
-    is_forward_context_available,
-)
 from vllm.logger import init_logger
 from vllm.platforms.interface import DeviceCapability
 from vllm.utils.math_utils import cdiv, round_up
@@ -314,11 +310,8 @@ class FlashAttentionMetadata:
     rswa_window: int | None = None
     rswa_window_tensor: torch.Tensor | None = None
 
-    # MRv2 PCP, built by PCPManager. ``pcp_has_prefill`` is the rank-invariant
-    # "global batch has prefill" that gates the cache-write all-gather;
-    # ``pcp_row_plan`` is the sharded PCP+DCP attention plan (None unless this
-    # step needs it).
-    pcp_has_prefill: bool = False
+    # MRv2 PCP: the sharded PCP+DCP attention plan, built by PCPManager.
+    # None unless this step needs it.
     pcp_row_plan: "PCPRowPlan | None" = None
 
 
@@ -782,7 +775,6 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             max_num_splits=max_num_splits,
             causal=causal,
             sliding_window=effective_sliding_window,
-            pcp_has_prefill=common_attn_metadata.pcp_has_prefill,
             pcp_row_plan=common_attn_metadata.pcp_row_plan,
         )
 
@@ -1053,6 +1045,9 @@ class FlashAttentionImpl(AttentionImpl):
                 # DualChunkSwap partitions the queries and the manager builds
                 # a row plan -- goes to _forward_pcp_dcp.
                 plan = attn_metadata.pcp_row_plan if self.use_pcp else None
+                # Release the stash every step, not just on row-plan steps, so
+                # a gathered K/V never outlives the step that produced it.
+                gathered_kv, self._pcp_gathered_kv = self._pcp_gathered_kv, None
                 if plan is not None:
                     # MRv2 PCP+DCP prefill (dcp == pcp): every row is a
                     # (cached prefix, new-token span) pair -- the suffix
@@ -1068,6 +1063,7 @@ class FlashAttentionImpl(AttentionImpl):
                         attn_metadata,
                         layer,
                         plan,
+                        gathered_kv,
                         q_descale=q_descale,
                         k_descale=k_descale,
                         v_descale=v_descale,
@@ -1225,24 +1221,6 @@ class FlashAttentionImpl(AttentionImpl):
         )
         return output
 
-    def _get_attn_metadata_for_layer(
-        self, layer: torch.nn.Module
-    ) -> FlashAttentionMetadata | None:
-        """Fetch this layer's FlashAttentionMetadata from the forward context.
-
-        ``do_kv_cache_update`` does not receive ``attn_metadata``, so under PCP
-        we look it up by ``layer_name`` (the same key the runner uses to store
-        per-layer metadata in ``forward_context.attn_metadata``).
-        """
-        if self.pcp_world_size <= 1 or not is_forward_context_available():
-            return None
-        attn_metadata_map = get_forward_context().attn_metadata
-        layer_name = getattr(layer, "layer_name", None)
-        if not isinstance(attn_metadata_map, dict) or layer_name is None:
-            return None
-        meta = attn_metadata_map.get(layer_name)
-        return meta if isinstance(meta, FlashAttentionMetadata) else None
-
     def do_kv_cache_update(
         self,
         layer: torch.nn.Module,
@@ -1257,34 +1235,25 @@ class FlashAttentionImpl(AttentionImpl):
             return
 
         if self.use_pcp:
-            # All-gather the prefill K/V across PCP ranks (decode writes stay
-            # local) so every rank's cache gets the full prefill KV. K/V are
+            # All-gather K/V across PCP ranks so every rank's cache gets the
+            # full contents. The slot mapping the manager hands us is already
+            # the gathered one, with every entry this rank must not write
+            # masked to PAD_SLOT_ID, so gathering unconditionally is correct:
+            # the replicated decode rows are unmasked on rank 0 only. K/V are
             # gathered separately to stay contiguous (cache kernel head-stride).
-            attn_metadata = self._get_attn_metadata_for_layer(layer)
-            num_decode_tokens = (
-                attn_metadata.num_decode_tokens if attn_metadata is not None else 0
-            )
-            # Rank-invariant gather decision: per-rank num_decode_tokens can differ
-            # under DualChunkSwap and desync the all-gather, so if the global batch
-            # has any prefill every rank gathers the whole batch.
-            if attn_metadata is not None and attn_metadata.pcp_has_prefill:
-                num_decode_tokens = 0
             key_cache, value_cache = kv_cache.transpose(1, 2).split(
                 self.head_size, dim=-1
             )
             (cache_key, cache_value), cache_slot_mapping = maybe_gather_cache_inputs(
                 (key, value),
                 slot_mapping,
-                num_decode_tokens,
+                0,
                 self.use_pcp,
             )
-            # Stash the write-gathered K/V for the suffix attention of the
-            # sharded PCP+DCP path (a gather only happens on prefill steps).
+            # Hand the gathered K/V to the sharded PCP+DCP suffix attention.
             # forward() consumes and clears it, so a layer whose cache update
             # is skipped (kv sharing) cannot pick up stale tensors.
-            self._pcp_gathered_kv = (
-                (cache_key, cache_value) if num_decode_tokens == 0 else None
-            )
+            self._pcp_gathered_kv = (cache_key, cache_value)
             reshape_and_cache_flash(
                 cache_key,
                 cache_value,
@@ -1349,6 +1318,7 @@ class FlashAttentionImpl(AttentionImpl):
         attn_metadata: FlashAttentionMetadata,
         layer: torch.nn.Module,
         plan: "PCPRowPlan",
+        gathered_kv: tuple[torch.Tensor, torch.Tensor] | None,
         q_descale: torch.Tensor | None = None,
         k_descale: torch.Tensor | None = None,
         v_descale: torch.Tensor | None = None,
@@ -1381,7 +1351,6 @@ class FlashAttentionImpl(AttentionImpl):
         if n > 0:
             # Suffix: local rows vs the write-gathered new K/V. The gather is
             # the one do_kv_cache_update already did for the cache write.
-            gathered_kv, self._pcp_gathered_kv = self._pcp_gathered_kv, None
             assert gathered_kv is not None, (
                 "PCP+DCP prefill step without write-gathered K/V: "
                 "do_kv_cache_update did not run for this layer (kv sharing?)."

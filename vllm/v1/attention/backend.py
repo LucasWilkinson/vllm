@@ -462,10 +462,6 @@ class CommonAttentionMetadata:
     (num_computed_tokens < num_prompt_tokens). Used by some backends to
     distinguish actual decodes from short extends."""
 
-    pcp_has_prefill: bool = False
-    """MRv2 PCP: rank-invariant "the global batch contains prefill". Gates the
-    cache-write all-gather; per-rank prefill-ness differs under DualChunkSwap."""
-
     pcp_row_plan: "PCPRowPlan | None" = None
     """MRv2 PCP: per-step plan for the sharded PCP+DCP attention path. None
     unless PCP partitioned a prefill step onto a DCP-sharded cache."""
