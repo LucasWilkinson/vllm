@@ -314,6 +314,13 @@ class FlashAttentionMetadata:
     rswa_window: int | None = None
     rswa_window_tensor: torch.Tensor | None = None
 
+    # MRv2 PCP, built by PCPManager. ``pcp_has_prefill`` is the rank-invariant
+    # "global batch has prefill" that gates the cache-write all-gather;
+    # ``pcp_row_plan`` is the sharded PCP+DCP attention plan (None unless this
+    # step needs it).
+    pcp_has_prefill: bool = False
+    pcp_row_plan: "PCPRowPlan | None" = None
+
 
 def _get_sliding_window_configs(
     vllm_config: VllmConfig,
@@ -770,6 +777,8 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             max_num_splits=max_num_splits,
             causal=causal,
             sliding_window=effective_sliding_window,
+            pcp_has_prefill=common_attn_metadata.pcp_has_prefill,
+            pcp_row_plan=common_attn_metadata.pcp_row_plan,
         )
 
         # Compute mm_prefix range tensor if the batch contains
@@ -1035,11 +1044,7 @@ class FlashAttentionImpl(AttentionImpl):
                 # all-reduce); only a PCP+DCP prefill/mixed step -- where
                 # DualChunkSwap partitions the queries and the manager builds
                 # a row plan -- goes to _forward_pcp_dcp.
-                plan = (
-                    get_forward_context().additional_kwargs.get("pcp_row_plan")
-                    if self.use_pcp
-                    else None
-                )
+                plan = attn_metadata.pcp_row_plan if self.use_pcp else None
                 if plan is not None:
                     # MRv2 PCP+DCP prefill (dcp == pcp): every row is a
                     # (cached prefix, new-token span) pair -- the suffix
@@ -1254,7 +1259,7 @@ class FlashAttentionImpl(AttentionImpl):
             # Rank-invariant gather decision: per-rank num_decode_tokens can differ
             # under DualChunkSwap and desync the all-gather, so if the global batch
             # has any prefill every rank gathers the whole batch.
-            if get_forward_context().additional_kwargs.get("pcp_has_prefill"):
+            if attn_metadata is not None and attn_metadata.pcp_has_prefill:
                 num_decode_tokens = 0
             key_cache, value_cache = kv_cache.transpose(1, 2).split(
                 self.head_size, dim=-1
