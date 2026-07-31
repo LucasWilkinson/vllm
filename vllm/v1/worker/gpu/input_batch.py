@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
@@ -32,10 +31,6 @@ class InputBuffers:
         self.dcp_local_seq_lens = torch.zeros(
             max_num_reqs, dtype=torch.int32, device=device
         )
-
-
-if TYPE_CHECKING:
-    from vllm.v1.worker.gpu.pcp_manager import PCPRowPlan
 
 
 @dataclass
@@ -103,10 +98,6 @@ class InputBatch:
 
     # [num_reqs] per-request prompt length, only populated for R-SWA.
     prompt_lens: torch.Tensor | None
-
-    # MRv2 PCP: per-step row plan for the sharded PCP+DCP path.
-    # None unless PCP partitioned a prefill step this step.
-    pcp_row_plan: "PCPRowPlan | None" = None
 
     @classmethod
     def make_dummy(

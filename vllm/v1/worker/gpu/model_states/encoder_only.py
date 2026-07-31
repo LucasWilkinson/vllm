@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 import torch.nn as nn
@@ -23,6 +23,9 @@ from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 from vllm.v1.worker.utils import AttentionGroup
+
+if TYPE_CHECKING:
+    from vllm.v1.worker.gpu.pcp_manager import PCPRowPlan
 
 
 class EncoderOnlyModelState(DefaultModelState):
@@ -120,6 +123,7 @@ class EncoderOnlyModelState(DefaultModelState):
         attn_groups: list[list[AttentionGroup]],
         kv_cache_config: KVCacheConfig,
         for_capture: bool = False,
+        pcp_row_plan: "PCPRowPlan | None" = None,
     ) -> dict[str, Any]:
         attn_metadata = super().prepare_attn(
             input_batch,
@@ -129,6 +133,7 @@ class EncoderOnlyModelState(DefaultModelState):
             attn_groups,
             kv_cache_config,
             for_capture,
+            pcp_row_plan,
         )
         attn_metadata.update(
             self._build_encoder_attn_metadata(input_batch, cudagraph_mode, for_capture)

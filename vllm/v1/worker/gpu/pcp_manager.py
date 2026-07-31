@@ -620,7 +620,6 @@ class PCPManager:
             cu_num_logits=cu_num_logits,
             cu_num_logits_np=cu_num_logits_np,
             prompt_lens=None,
-            pcp_row_plan=self.build_cp_row_plan(),
         )
 
     def prepare_attn(
