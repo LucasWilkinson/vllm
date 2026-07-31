@@ -25,7 +25,7 @@ from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 from vllm.v1.worker.utils import AttentionGroup
 
 if TYPE_CHECKING:
-    from vllm.v1.worker.gpu.pcp_manager import PCPRowPlan
+    from vllm.v1.attention.backend import CommonAttentionMetadata
 
 
 class EncoderOnlyModelState(DefaultModelState):
@@ -123,7 +123,7 @@ class EncoderOnlyModelState(DefaultModelState):
         attn_groups: list[list[AttentionGroup]],
         kv_cache_config: KVCacheConfig,
         for_capture: bool = False,
-        pcp_row_plan: "PCPRowPlan | None" = None,
+        pcp_gathered: "CommonAttentionMetadata | None" = None,
     ) -> dict[str, Any]:
         attn_metadata = super().prepare_attn(
             input_batch,
@@ -133,7 +133,7 @@ class EncoderOnlyModelState(DefaultModelState):
             attn_groups,
             kv_cache_config,
             for_capture,
-            pcp_row_plan,
+            pcp_gathered,
         )
         attn_metadata.update(
             self._build_encoder_attn_metadata(input_batch, cudagraph_mode, for_capture)

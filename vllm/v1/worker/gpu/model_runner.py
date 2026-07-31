@@ -1296,7 +1296,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 for_capture=dummy_run and batch_desc.cg_mode == CUDAGraphMode.FULL,
                 # Derived from the partition this step, so it is only valid for
                 # a real batch; a dummy run has no DualChunkSwap partition.
-                pcp_row_plan=self.pcp_manager.build_cp_row_plan()
+                pcp_gathered=self.pcp_manager.build_gathered_attn_metadata()
                 if self.pcp_manager is not None and not dummy_run
                 else None,
             )

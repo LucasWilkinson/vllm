@@ -39,7 +39,7 @@ from vllm.v1.worker.utils import (
 )
 
 if TYPE_CHECKING:
-    from vllm.v1.worker.gpu.pcp_manager import PCPRowPlan
+    from vllm.v1.attention.backend import CommonAttentionMetadata
 
 
 logger = init_logger(__name__)
@@ -524,7 +524,7 @@ def build_attn_metadata(
     for_cudagraph_capture: bool = False,
     causal: bool | torch.Tensor | Mapping[int, bool] = True,
     rswa_prefix_lens: torch.Tensor | None = None,
-    pcp_row_plan: "PCPRowPlan | None" = None,
+    pcp_gathered: "CommonAttentionMetadata | None" = None,
 ) -> dict[str, Any]:
     seq_lens = seq_lens[:num_reqs]
     if dcp_local_seq_lens is not None:
@@ -569,7 +569,7 @@ def build_attn_metadata(
             is_prefilling=group_is_prefilling,
             mm_req_doc_ranges=mm_req_doc_ranges,
             rswa_prefix_lens=rswa_prefix_lens,
-            pcp_row_plan=pcp_row_plan,
+            pcp_gathered=pcp_gathered,
             **common_attn_metadata_extra_kwargs,
         )
 

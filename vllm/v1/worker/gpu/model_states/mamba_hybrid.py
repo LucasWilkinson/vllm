@@ -31,7 +31,7 @@ from vllm.v1.worker.mamba_utils import (
 from vllm.v1.worker.utils import AttentionGroup
 
 if TYPE_CHECKING:
-    from vllm.v1.worker.gpu.pcp_manager import PCPRowPlan
+    from vllm.v1.attention.backend import CommonAttentionMetadata
 
 
 @dataclass
@@ -225,7 +225,7 @@ class MambaHybridModelState(DefaultModelState):
         attn_groups: list[list[AttentionGroup]],
         kv_cache_config: KVCacheConfig,
         for_capture: bool = False,
-        pcp_row_plan: "PCPRowPlan | None" = None,
+        pcp_gathered: "CommonAttentionMetadata | None" = None,
     ) -> dict[str, Any]:
         if cudagraph_mode == CUDAGraphMode.FULL:
             num_reqs = input_batch.num_reqs_after_padding

@@ -22,7 +22,7 @@ from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.utils import AttentionGroup
 
 if TYPE_CHECKING:
-    from vllm.v1.worker.gpu.pcp_manager import PCPRowPlan
+    from vllm.v1.attention.backend import CommonAttentionMetadata
 
 
 class DefaultModelState(ModelState):
@@ -141,7 +141,7 @@ class DefaultModelState(ModelState):
         attn_groups: list[list[AttentionGroup]],
         kv_cache_config: KVCacheConfig,
         for_capture: bool = False,
-        pcp_row_plan: "PCPRowPlan | None" = None,
+        pcp_gathered: "CommonAttentionMetadata | None" = None,
     ) -> dict[str, Any]:
         if cudagraph_mode == CUDAGraphMode.FULL:
             # Use padded sizes - padding is handled by model_runner.prepare_attn.
@@ -192,6 +192,6 @@ class DefaultModelState(ModelState):
             mm_req_doc_ranges=req_doc_ranges,
             for_cudagraph_capture=for_capture,
             rswa_prefix_lens=input_batch.prompt_lens,
-            pcp_row_plan=pcp_row_plan,
+            pcp_gathered=pcp_gathered,
         )
         return attn_metadata
