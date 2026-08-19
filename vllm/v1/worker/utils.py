@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import math
 from collections import defaultdict
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from itertools import product as iprod
 from typing import Any
@@ -399,6 +399,7 @@ def allocate_kv_cache(
     device: torch.device,
     layout: KVCacheLayout,
     kernel_block_sizes: list[int] | None = None,
+    buffer_allocator: Callable[[int, torch.device], torch.Tensor] | None = None,
 ) -> dict[str, torch.Tensor]:
     """Allocate the KV cache and view it as ``[B, H, N, C]`` per layer.
 
@@ -424,9 +425,16 @@ def allocate_kv_cache(
         # storage.nbytes() matching the logical KV size (see #53974).
         page_size = 4096
         buf_size = ((raw_size + page_size - 1) // page_size) * page_size
+    elif buffer_allocator is not None:
+        page_size = 4096
+        buf_size = ((raw_size + page_size - 1) // page_size) * page_size
     else:
         buf_size = raw_size
-    buf = torch.zeros(buf_size, dtype=torch.int8, device=device)
+    buf = (
+        torch.zeros(buf_size, dtype=torch.int8, device=device)
+        if buffer_allocator is None
+        else buffer_allocator(buf_size, device)
+    )
 
     kv_caches: dict[str, torch.Tensor] = {}
     for tensor in kv_cache_config.kv_cache_tensors:
