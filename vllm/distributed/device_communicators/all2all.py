@@ -1077,6 +1077,17 @@ class DeepEPV2All2AllManager(All2AllManagerBase):
             self._check_gin_support(buffer_kwargs["group"])
             self._gin_checked = True
         logger.debug("DeepEP v2 all2all args %s", buffer_kwargs)
+        if envs.VLLM_DEBUG_WORKSPACE:
+            logger.info_once(
+                "[DEEPEPV2 DEBUG] ElasticBuffer init: "
+                "num_max_tokens_per_rank=%d hidden=%d num_topk=%d "
+                "use_fp8_dispatch=%s num_experts=%d",
+                buffer_kwargs["num_max_tokens_per_rank"],
+                buffer_kwargs["hidden"],
+                buffer_kwargs["num_topk"],
+                buffer_kwargs["use_fp8_dispatch"],
+                num_experts,
+            )
         handle: deep_ep.ElasticBuffer = self.handle_cache.get_or_create(
             buffer_kwargs, deep_ep.ElasticBuffer
         )

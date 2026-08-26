@@ -5,8 +5,10 @@ from collections.abc import Callable
 import deep_ep
 import torch
 
+import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceContiguous,
@@ -18,6 +20,8 @@ from vllm.utils.math_utils import round_up
 from vllm.v1.worker.ubatching import (
     dbo_current_ubatch_id,
 )
+
+logger = init_logger(__name__)
 
 
 class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
@@ -153,6 +157,20 @@ class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
             else:
                 n = tokens.shape[0]
             num_max_tokens_per_rank = 1 << max(n - 1, 0).bit_length()
+
+        if envs.VLLM_DEBUG_WORKSPACE:
+            logger.info_once(
+                "[DEEPEPV2 DEBUG] first dispatch: tokens=%s dtype=%s "
+                "scales=%s scale_dtype=%s topk=%s "
+                "num_max_tokens_per_rank=%s do_expand=%s",
+                tuple(tokens.shape),
+                tokens.dtype,
+                None if token_scales is None else tuple(token_scales.shape),
+                None if token_scales is None else token_scales.dtype,
+                tuple(rank_topk_ids.shape),
+                num_max_tokens_per_rank,
+                do_expand,
+            )
 
         (
             recv_x,
