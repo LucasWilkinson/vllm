@@ -211,6 +211,62 @@ def test_model_runner_delegates_to_cudagraph_utils(monkeypatch):
     assert runner.profile_cudagraph_memory() == 42
 
 
+def test_prepare_inputs_to_capture_uses_custom_dummy_slot_mappings(monkeypatch):
+    input_batch = SimpleNamespace(
+        seq_lens=None,
+        dcp_local_seq_lens=None,
+    )
+    monkeypatch.setattr(
+        cgu.InputBatch,
+        "make_dummy",
+        classmethod(lambda cls, *args, **kwargs: input_batch),
+    )
+
+    block_tables = SimpleNamespace(
+        cp_size=1,
+        get_dummy_block_tables=lambda num_reqs: ("block_tables", num_reqs),
+        get_dummy_slot_mappings=lambda num_tokens: (_ for _ in ()).throw(
+            AssertionError("generic slot mappings must not be used")
+        ),
+    )
+    custom_slot_mappings = object()
+    callback_calls: list[int] = []
+
+    def get_dummy_slot_mappings(num_tokens: int):
+        callback_calls.append(num_tokens)
+        return custom_slot_mappings
+
+    slot_mappings_by_layer = object()
+    monkeypatch.setattr(
+        cgu,
+        "build_slot_mappings_by_layer",
+        lambda slot_mappings, kv_cache_config: (
+            slot_mappings_by_layer if slot_mappings is custom_slot_mappings else None
+        ),
+    )
+    prepare_attn_calls: list[tuple[Any, ...]] = []
+    model_state = SimpleNamespace(
+        prepare_attn=lambda *args, **kwargs: prepare_attn_calls.append(args) or {}
+    )
+
+    result = cgu.prepare_inputs_to_capture(
+        num_reqs=2,
+        num_tokens=8,
+        model_state=model_state,
+        input_buffers=object(),
+        block_tables=block_tables,
+        attn_groups=[],
+        kv_cache_config=object(),
+        get_dummy_slot_mappings=get_dummy_slot_mappings,
+        full_cudagraph=False,
+    )
+
+    assert callback_calls == [8]
+    assert len(prepare_attn_calls) == 1
+    assert prepare_attn_calls[0][3] is custom_slot_mappings
+    assert result.slot_mappings is slot_mappings_by_layer
+
+
 def test_extrapolate_full_graph_memory():
     mib = 1 << 20
     # No samples (e.g. no FULL graphs): nothing to add.

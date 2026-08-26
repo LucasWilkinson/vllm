@@ -491,6 +491,7 @@ class ModelCudaGraphManager(CudaGraphManager):
         block_tables: BlockTables,
         attn_groups: list[list[AttentionGroup]],
         kv_cache_config: KVCacheConfig,
+        get_dummy_slot_mappings: Callable[[int], torch.Tensor] | None = None,
         has_lora: bool = False,
         use_aux_hidden_state_outputs: bool = False,
         lora_capture_hook: Callable[[int, int, int], None] | None = None,
@@ -538,6 +539,7 @@ class ModelCudaGraphManager(CudaGraphManager):
                 block_tables,
                 attn_groups,
                 kv_cache_config,
+                get_dummy_slot_mappings=get_dummy_slot_mappings,
                 full_cudagraph=desc.cg_mode == CUDAGraphMode.FULL,
                 max_query_len=desc.max_query_len,
             )
@@ -631,13 +633,18 @@ def prepare_inputs_to_capture(
     attn_groups: list[list[AttentionGroup]],
     kv_cache_config: KVCacheConfig,
     full_cudagraph: bool,
+    get_dummy_slot_mappings: Callable[[int], torch.Tensor] | None = None,
     max_query_len: int | None = None,
 ) -> AttentionState:
     input_batch = InputBatch.make_dummy(
         num_reqs, num_tokens, input_buffers, max_query_len=max_query_len
     )
     input_block_tables = block_tables.get_dummy_block_tables(num_reqs)
-    slot_mappings = block_tables.get_dummy_slot_mappings(num_tokens)
+    if get_dummy_slot_mappings is None:
+        slot_mappings = block_tables.get_dummy_slot_mappings(num_tokens)
+    else:
+        # PCP cache insertion consumes the gathered mapping for all PCP ranks.
+        slot_mappings = get_dummy_slot_mappings(num_tokens)
     slot_mappings_by_layer = build_slot_mappings_by_layer(
         slot_mappings, kv_cache_config
     )
