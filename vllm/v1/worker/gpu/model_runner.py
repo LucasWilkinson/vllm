@@ -845,9 +845,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 )
 
         profile_num_tokens = self.max_num_tokens
-        if self.pcp_manager is not None:
-            profile_num_tokens = self.pcp_manager.get_num_tokens_for_profile(
-                profile_num_tokens, self.max_num_reqs
+        pcp_size = self.parallel_config.prefill_context_parallel_size
+        if pcp_size > 1:
+            profile_num_tokens = pcp.get_max_num_tokens_for_profile(
+                profile_num_tokens, self.max_num_reqs, pcp_size
             )
         hidden_states, sample_hidden_states = self._dummy_run(
             profile_num_tokens, skip_attn=True, is_profile=True

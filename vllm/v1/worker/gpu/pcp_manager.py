@@ -41,6 +41,26 @@ class RankSegment:
         return self.global_batch_slice.stop - self.global_batch_slice.start
 
 
+def get_max_num_tokens_for_profile(
+    num_tokens: int, num_reqs: int, pcp_world_size: int
+) -> int:
+    """Return the largest rank-local size of an all-prefill profiling batch."""
+    num_reqs = min(num_tokens, num_reqs)
+    tokens_per_req = np.full(num_reqs, num_tokens // num_reqs, dtype=np.int32)
+    tokens_per_req[num_reqs - num_tokens % num_reqs :] += 1
+    num_chunks = 2 * pcp_world_size
+    tokens_per_rank = [0] * pcp_world_size
+    for query_len in tokens_per_req:
+        chunk_size = (int(query_len) + num_chunks - 1) // num_chunks
+        for rank in range(pcp_world_size):
+            for chunk_idx in (rank, num_chunks - 1 - rank):
+                chunk_offset = chunk_idx * chunk_size
+                tokens_per_rank[rank] += max(
+                    0, min(chunk_size, int(query_len) - chunk_offset)
+                )
+    return max(tokens_per_rank)
+
+
 class PCPManager:
     """MRV2 PC batch manager.
 
@@ -245,19 +265,6 @@ class PCPManager:
                 if chunk_len <= 0:
                     continue
                 yield global_batch_req_idx, chunk_offset, chunk_len
-
-    def get_num_tokens_for_profile(self, num_tokens: int, num_reqs: int) -> int:
-        """Return the rank-local size of the all-prefill profiling batch."""
-        num_reqs = min(num_tokens, num_reqs)
-        tokens_per_req = np.full(num_reqs, num_tokens // num_reqs, dtype=np.int32)
-        tokens_per_req[num_reqs - num_tokens % num_reqs :] += 1
-        is_prefilling = np.ones(num_reqs, dtype=np.bool_)
-        return sum(
-            chunk_len
-            for _, _, chunk_len in self._iter_rank_chunks(
-                self.pcp_rank, tokens_per_req, is_prefilling
-            )
-        )
 
     def _get_rank_segments(
         self,

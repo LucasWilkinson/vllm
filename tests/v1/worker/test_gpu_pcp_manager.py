@@ -94,24 +94,22 @@ def test_num_tokens_for_dispatch_uses_largest_pcp_rank(
 
 
 @pytest.mark.parametrize(
-    ("pcp_world_size", "pcp_rank", "num_tokens", "num_reqs", "expected"),
+    ("pcp_world_size", "num_tokens", "num_reqs", "expected"),
     [
-        (4, 0, 32768, 256, 8192),
-        (4, 3, 32768, 256, 8192),
-        (4, 0, 8192, 256, 2048),
-        (4, 0, 9, 1, 2),
+        (4, 32768, 256, 8192),
+        (4, 8192, 256, 2048),
+        (4, 9, 1, 3),
     ],
 )
-def test_num_tokens_for_profile_is_rank_local(
-    pcp_world_size, pcp_rank, num_tokens, num_reqs, expected
+def test_max_num_tokens_for_profile_is_rank_local(
+    pcp_world_size, num_tokens, num_reqs, expected
 ):
-    manager = PCPManager(
-        pcp_world_size=pcp_world_size,
-        pcp_rank=pcp_rank,
-        device=torch.device("cpu"),
+    assert (
+        pcp_manager_module.get_max_num_tokens_for_profile(
+            num_tokens, num_reqs, pcp_world_size
+        )
+        == expected
     )
-
-    assert manager.get_num_tokens_for_profile(num_tokens, num_reqs) == expected
 
 
 def test_graph_padding_cannot_be_smaller_than_largest_pcp_rank(monkeypatch):
