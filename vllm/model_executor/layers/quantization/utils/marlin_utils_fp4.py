@@ -49,9 +49,11 @@ def _nvfp4_compute_scale_factor(
         return 1.0
 
     ws_float = marlin_scales.float() * (2**7)
-    nonzero_mask = ws_float > 0
-    if nonzero_mask.any():
-        max_val = ws_float[nonzero_mask].max()
+    # Scales are non-negative, so zeros do not affect the maximum. Avoid
+    # boolean indexing here: for large MoE tensors it materializes another
+    # full-size copy at the point of peak model-loading memory.
+    max_val = ws_float.max()
+    if max_val > 0:
         if max_val < 448 * (2**7):
             sf = (448 * (2**7) / max_val).log2().floor().exp2()
             return sf.item()
