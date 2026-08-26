@@ -131,7 +131,9 @@ class WorkspaceManager:
         # Calculate cumulative offsets using itertools.accumulate
         offsets = list(accumulate([0] + aligned_bytes[:-1]))
 
-        current_workspace = self._ensure_workspace_size(total_bytes)
+        current_workspace = self._ensure_workspace_size(
+            total_bytes, request_specs=shapes_and_dtypes
+        )
 
         return [
             current_workspace[offsets[i] : offsets[i] + actual_bytes[i]]
@@ -140,11 +142,17 @@ class WorkspaceManager:
             for i in range(len(shapes_and_dtypes))
         ]
 
-    def _ensure_workspace_size(self, required_bytes: int) -> torch.Tensor:
+    def _ensure_workspace_size(
+        self,
+        required_bytes: int,
+        request_specs: tuple[tuple[tuple[int, ...], torch.dtype], ...] | None = None,
+    ) -> torch.Tensor:
         """Ensure workspace is allocated and large enough, return current workspace.
 
         Args:
             required_bytes: The number of bytes required.
+            request_specs: Shapes and dtypes whose simultaneous allocation
+                produced ``required_bytes``. Used only for debug logging.
 
         Returns:
             The current workspace tensor.
@@ -212,12 +220,13 @@ class WorkspaceManager:
             if envs.VLLM_DEBUG_WORKSPACE:
                 logger.info(
                     "[WORKSPACE DEBUG] Resized workspace from '%s': %.2f MB -> "
-                    "%.2f MB (ubatch %d, lane %d)",
+                    "%.2f MB (ubatch %d, lane %d, requests=%s)",
                     get_caller_info(),
                     current_size / _MB,
                     required_bytes / _MB,
                     ubatch_id,
                     lane,
+                    request_specs,
                 )
 
         return current_workspace
