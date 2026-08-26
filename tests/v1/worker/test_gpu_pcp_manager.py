@@ -166,13 +166,13 @@ def test_sparse_mla_pcp_accepts_piecewise_cudagraphs():
         ("LMCacheConnectorV1", "kv_producer", False),
     ],
 )
-def test_direct_pcp_kv_allows_nixl_producer_only(
-    monkeypatch, connector, role, allowed
-):
+def test_direct_pcp_kv_allows_nixl_producer_only(monkeypatch, connector, role, allowed):
     monkeypatch.setattr(pcp_manager_module.current_platform, "is_cuda", lambda: True)
     config = SimpleNamespace(
         parallel_config=SimpleNamespace(
-            decode_context_parallel_size=1,
+            tensor_parallel_size=1,
+            prefill_context_parallel_size=8,
+            decode_context_parallel_size=8,
             data_parallel_size=1,
             use_ubatching=False,
         ),
@@ -182,9 +182,7 @@ def test_direct_pcp_kv_allows_nixl_producer_only(
         ),
         compilation_config=SimpleNamespace(static_forward_context={}),
         scheduler_config=SimpleNamespace(async_scheduling=False),
-        cache_config=SimpleNamespace(
-            cache_dtype="fp8", enable_prefix_caching=False
-        ),
+        cache_config=SimpleNamespace(cache_dtype="fp8", enable_prefix_caching=False),
         kv_transfer_config=SimpleNamespace(kv_connector=connector, kv_role=role),
     )
 
