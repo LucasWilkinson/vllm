@@ -969,9 +969,14 @@ def _validate_pcp_direct_kv_config(vllm_config: VllmConfig) -> None:
         )
     kv_transfer_config = vllm_config.kv_transfer_config
     if kv_transfer_config is not None and kv_transfer_config.kv_connector is not None:
-        raise NotImplementedError(
-            "Direct PCP KV does not support KV connectors or offloading."
-        )
+        if not (
+            kv_transfer_config.kv_connector == "NixlConnector"
+            and kv_transfer_config.kv_role == "kv_producer"
+        ):
+            raise NotImplementedError(
+                "Direct PCP KV supports only the NixlConnector kv_producer "
+                "path; consumers, other connectors, and offloading are unsupported."
+            )
     if getattr(model_config, "enable_sleep_mode", False):
         raise NotImplementedError("Direct PCP KV does not support sleep mode.")
 
