@@ -844,8 +844,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     dummy_mm_inputs, mm_budget
                 )
 
+        profile_num_tokens = self.max_num_tokens
+        if self.pcp_manager is not None:
+            profile_num_tokens = self.pcp_manager.get_num_tokens_for_profile(
+                profile_num_tokens, self.max_num_reqs
+            )
         hidden_states, sample_hidden_states = self._dummy_run(
-            self.max_num_tokens, skip_attn=True, is_profile=True
+            profile_num_tokens, skip_attn=True, is_profile=True
         )
 
         # Only run sampler/pooler on last PP rank (non-last ranks return None).

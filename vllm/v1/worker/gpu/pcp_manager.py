@@ -246,6 +246,19 @@ class PCPManager:
                     continue
                 yield global_batch_req_idx, chunk_offset, chunk_len
 
+    def get_num_tokens_for_profile(self, num_tokens: int, num_reqs: int) -> int:
+        """Return the rank-local size of the all-prefill profiling batch."""
+        num_reqs = min(num_tokens, num_reqs)
+        tokens_per_req = np.full(num_reqs, num_tokens // num_reqs, dtype=np.int32)
+        tokens_per_req[num_reqs - num_tokens % num_reqs :] += 1
+        is_prefilling = np.ones(num_reqs, dtype=np.bool_)
+        return sum(
+            chunk_len
+            for _, _, chunk_len in self._iter_rank_chunks(
+                self.pcp_rank, tokens_per_req, is_prefilling
+            )
+        )
+
     def _get_rank_segments(
         self,
         rank: int,
