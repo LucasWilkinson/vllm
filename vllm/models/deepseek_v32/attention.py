@@ -328,7 +328,6 @@ class DeepseekV32Attention(MLAAttention):
         prefill_metadata = getattr(attn_metadata, "prefill", None)
         use_dense_prefill = (
             attn_metadata is not None
-            and attn_metadata.num_decode_tokens == 0
             and bool(getattr(prefill_metadata, "use_dense_mha", False))
             and self.pcp_spans_dcp
         )
@@ -442,16 +441,19 @@ class DeepseekV32Attention(MLAAttention):
             indexer_n_head_scale,
             has_indexer=has_indexer,
             index_rope_interleave=self._index_rope_interleave,
-            quantize_mqa=self._fp8_query,
+            # Dense MHA needs the RoPE'd q_pe tensor so it can reconstruct
+            # the unabsorbed query below. The packed FP8 MQA query contains
+            # absorbed ql_nope and cannot be passed to the dense backend.
+            quantize_mqa=self._fp8_query and not use_dense_prefill,
         )
 
         if use_dense_prefill:
             # The sparse MQA DCP top-k merge assumes matching query rows on all
-            # ranks, but PCP partitions those rows.  Pure PCP+DCP prefills use
+            # ranks, but PCP partitions those rows. PCP+DCP prefills use
             # the generic MLA FlashAttention path, whose chunked-context code
-            # gathers DCP KV shards instead.  Run the indexer op first so its K
-            # cache is still populated (it returns before scoring when the
-            # dense-MHA metadata flag above is set).
+            # gathers DCP KV shards instead. In mixed batches, the indexer
+            # still scores the replicated decode rows but skips the partitioned
+            # prefill rows that dense MHA does not consume.
             if self.indexer is not None and not self.skip_topk:
                 assert index_q_fp8 is not None
                 assert index_weights_out is not None
@@ -474,9 +476,7 @@ class DeepseekV32Attention(MLAAttention):
                     self.topk_indices_buffer,
                     skip_k_cache_insert=not collect_pcp,
                     use_pcp=collect_pcp,
-                    dense_mha_metadata_layer_name=(
-                        self._dense_mha_metadata_layer_name
-                    ),
+                    dense_mha_metadata_layer_name=(self._dense_mha_metadata_layer_name),
                     dcp_rank=(
                         self.dcp_manager.group.rank_in_group
                         if self.dcp_manager is not None
@@ -491,8 +491,9 @@ class DeepseekV32Attention(MLAAttention):
                     skip_topk_buffer_clear=True,
                 )
             assert kv_c_out is not None and k_pe_out is not None
+            dense_q = torch.cat((q_nope, mqa_q), dim=-1)
             dense_output = super().forward(
-                q,
+                dense_q,
                 kv_c_out,
                 k_pe_out.unsqueeze(1),
                 output_shape=output.shape,
@@ -642,9 +643,7 @@ class DeepseekV32Attention(MLAAttention):
                         : attn_metadata.num_decodes
                     ]
                 )
-                query_start_loc = attn_metadata.query_start_loc[
-                    : seq_lens.shape[0] + 1
-                ]
+                query_start_loc = attn_metadata.query_start_loc[: seq_lens.shape[0] + 1]
             attn_out = self.dcp_manager.combine(
                 attn_out,
                 lse,
