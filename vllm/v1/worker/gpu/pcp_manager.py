@@ -189,7 +189,16 @@ class PCPManager:
         is_sparse_mla = hasattr(model_config.hf_text_config, "index_topk")
         if speculative_config is not None:
             if speculative_config.use_dspark():
-                if not envs.VLLM_USE_PCP_DIRECT_KV:
+                # With TP1 and DCP spanning the complete PCP group, each PCP
+                # rank already owns the matching DCP KV shard.  Publishing
+                # every shard to every PCP peer is unnecessary (and would
+                # overwrite peer-local DCP slots).  Other PCP layouts still
+                # need the direct-KV replication path for DSpark.
+                dcp_spans_pcp = (
+                    parallel_config.tensor_parallel_size == 1
+                    and parallel_config.decode_context_parallel_size == pcp_size
+                )
+                if not envs.VLLM_USE_PCP_DIRECT_KV and not dcp_spans_pcp:
                     raise NotImplementedError(
                         "DSpark with PCP requires VLLM_USE_PCP_DIRECT_KV=1 so "
                         "sharded prefill context KV can be published to every "
@@ -471,9 +480,7 @@ class PCPManager:
         self._replicated_verification_num_tokens_padded = None
 
         if input_batch.num_draft_tokens > 0 and not input_batch.has_prefill:
-            return self._prepare_replicated_verification(
-                input_batch, padded_num_tokens
-            )
+            return self._prepare_replicated_verification(input_batch, padded_num_tokens)
 
         num_scheduled_tokens = global_batch.num_scheduled_tokens
         num_computed_tokens = global_batch.num_computed_tokens_np
@@ -955,8 +962,13 @@ def _validate_pcp_direct_kv_config(vllm_config: VllmConfig) -> None:
         raise NotImplementedError(
             "Direct PCP KV requires the specialized NVIDIA deepseek_v32 attention path."
         )
-    if parallel_config.decode_context_parallel_size != 1:
-        raise NotImplementedError("Direct PCP KV currently requires DCP=1.")
+    dcp_size = parallel_config.decode_context_parallel_size
+    pcp_size = parallel_config.prefill_context_parallel_size
+    tp_size = parallel_config.tensor_parallel_size
+    if dcp_size != 1 and not (tp_size == 1 and dcp_size == pcp_size):
+        raise NotImplementedError(
+            "Direct PCP KV with DCP requires TP1 and DCP spanning the full PCP group."
+        )
     if parallel_config.data_parallel_size != 1:
         raise NotImplementedError("Direct PCP KV currently requires DP=1.")
     if parallel_config.use_ubatching:
@@ -976,15 +988,18 @@ def _validate_pcp_direct_kv_config(vllm_config: VllmConfig) -> None:
             "Set --no-enable-prefix-caching."
         )
     kv_transfer_config = vllm_config.kv_transfer_config
-    if kv_transfer_config is not None and kv_transfer_config.kv_connector is not None:
-        if not (
+    if (
+        kv_transfer_config is not None
+        and kv_transfer_config.kv_connector is not None
+        and not (
             kv_transfer_config.kv_connector == "NixlConnector"
             and kv_transfer_config.kv_role == "kv_producer"
-        ):
-            raise NotImplementedError(
-                "Direct PCP KV supports only the NixlConnector kv_producer "
-                "path; consumers, other connectors, and offloading are unsupported."
-            )
+        )
+    ):
+        raise NotImplementedError(
+            "Direct PCP KV supports only the NixlConnector kv_producer "
+            "path; consumers, other connectors, and offloading are unsupported."
+        )
     if getattr(model_config, "enable_sleep_mode", False):
         raise NotImplementedError("Direct PCP KV does not support sleep mode.")
 
