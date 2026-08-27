@@ -1849,9 +1849,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             return ModelRunnerOutput.with_ec_conn_output(output, ec_connector_output)
 
         # Pure prefill retains PCP-local target auxiliary states and slot mappings.
-        # Project only this rank's shard, then publish those physical draft-cache
-        # rows to every PCP peer. Mixed/decode batches use the restored full-context
-        # fallback because rejected speculative suffixes must be filtered first.
+        # Project only this rank's shard. Replicated PCP copies those physical
+        # draft-cache rows to every peer; PCP-spanning DCP leaves them sharded.
+        # Mixed/decode batches use the restored full-context fallback because
+        # rejected speculative suffixes must be filtered first.
         if (
             self.pcp_manager is not None
             and self.speculator is not None
