@@ -548,12 +548,18 @@ class DeepseekV32Attention(MLAAttention):
         mqa_q: torch.Tensor,
         output: torch.Tensor,
     ) -> None:
+        rank = get_pcp_group().rank_in_group
+        _pcp_dcp_log(
+            f"layer rank={rank} name={self.layer_name} enter "
+            f"indexer={self.indexer is not None and not self.skip_topk}"
+        )
         if self.indexer is not None and not self.skip_topk:
             assert index_q_fp8 is not None
             assert index_weights_out is not None
             collect_pcp = self.use_pcp and not pcp_direct_kv_active()
             if collect_pcp:
                 assert index_k is not None
+            _pcp_dcp_log(f"layer rank={rank} name={self.layer_name} indexer_begin")
             sparse_attn_indexer(
                 q_c,
                 self.indexer.k_cache.prefix,
@@ -585,6 +591,7 @@ class DeepseekV32Attention(MLAAttention):
                 ),
                 skip_topk_buffer_clear=True,
             )
+            _pcp_dcp_log(f"layer rank={rank} name={self.layer_name} indexer_done")
 
         attn_metadata, _, kv_cache, layer_slot_mapping = get_attention_context(
             self.layer_name
@@ -596,6 +603,7 @@ class DeepseekV32Attention(MLAAttention):
 
         if self.use_pcp and not pcp_direct_kv_active():
             assert kv_c is not None and k_pe is not None
+            _pcp_dcp_log(f"layer rank={rank} name={self.layer_name} kv_gather_begin")
             kv_for_cache, kpe_for_cache, cache_slot_mapping = (
                 maybe_gather_mla_latent_cache_inputs(
                     kv_c,
@@ -605,6 +613,7 @@ class DeepseekV32Attention(MLAAttention):
                     True,
                 )
             )
+            _pcp_dcp_log(f"layer rank={rank} name={self.layer_name} kv_gather_done")
             self.impl.do_kv_cache_update(  # type: ignore[attr-defined]
                 kv_for_cache,
                 kpe_for_cache,
@@ -613,6 +622,7 @@ class DeepseekV32Attention(MLAAttention):
                 self.kv_cache_dtype,
                 self._k_scale,
             )
+            _pcp_dcp_log(f"layer rank={rank} name={self.layer_name} cache_update_done")
 
         num_actual = attn_metadata.num_actual_tokens  # type: ignore[attr-defined]
         # DCP spanning the PCP group: every rank must join the token-gather
@@ -648,6 +658,7 @@ class DeepseekV32Attention(MLAAttention):
                 ]
             else:
                 mqa_q_full = (ql_nope[:num_padded], mqa_q[:num_padded])
+            _pcp_dcp_log(f"layer rank={rank} name={self.layer_name} attn_begin")
             attn_out = self.impl.forward_mqa_token_sharded(  # type: ignore[attr-defined]
                 mqa_q_full,
                 kv_cache,
@@ -656,6 +667,7 @@ class DeepseekV32Attention(MLAAttention):
                 num_padded,
                 w_uv=self.W_UV,
             )
+            _pcp_dcp_log(f"layer rank={rank} name={self.layer_name} attn_done")
             # Already projected through W_UV (before the cross-rank merge).
             if num_actual > 0:
                 output[:num_actual].view(
