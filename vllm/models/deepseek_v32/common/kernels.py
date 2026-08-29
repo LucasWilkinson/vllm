@@ -984,6 +984,7 @@ def fused_q(
         return index_q_fp8, index_weights_out, mqa_q
 
     use_pdl = current_platform.is_arch_support_pdl()
+    use_pdl = use_pdl and not envs.VLLM_DISABLE_FUSED_Q_PDL
     _fused_q_kernel[(num_tokens, 3, grid_heads)](
         positions,
         q_pe,
