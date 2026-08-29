@@ -9,7 +9,7 @@ import numpy as np
 import torch
 
 import vllm.envs as envs
-from vllm.config import VllmConfig
+from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed.parallel_state import (
     get_dcp_group,
     get_pcp_group,
