@@ -38,7 +38,11 @@ from vllm.v1.attention.backends.utils import (
     reshape_query_for_spec_decode,
     split_prefill_chunks,
 )
-from vllm.v1.attention.ops.dcp import CPTritonContext, correct_attn_out
+from vllm.v1.attention.ops.dcp import (
+    CPTritonContext,
+    correct_attn_out,
+    dcp_a2a_lse_reduce_token_sharded,
+)
 from vllm.v1.attention.ops.flashmla import (
     FlashMLASchedMeta,
     flash_mla_sparse_fwd,
@@ -327,11 +331,18 @@ class FlashMLASparseMetadataBuilder(
             # The DCP merge needs an LSE for every token, which only the mixed-batch
             # fp8 path returns; force it under DCP regardless of the head count.
             self.fp8_use_mixed_batch = True
-            if parallel_config.dcp_comm_backend != "ag_rs":
+            pcp_world_size = parallel_config.prefill_context_parallel_size
+            token_sharded_a2a = (
+                parallel_config.dcp_comm_backend == "a2a"
+                and pcp_world_size > 1
+                and parallel_config.decode_context_parallel_size == pcp_world_size
+            )
+            if parallel_config.dcp_comm_backend != "ag_rs" and not token_sharded_a2a:
                 raise NotImplementedError(
-                    "DCP for FlashMLA sparse is only validated with the "
-                    "default 'ag_rs' DCP comm backend; got "
-                    f"'{parallel_config.dcp_comm_backend}'"
+                    "FlashMLA sparse supports the 'a2a' DCP comm backend only "
+                    "for token-sharded PCP x DCP (pcp == dcp > 1); got "
+                    f"pcp={pcp_world_size}, "
+                    f"dcp={parallel_config.decode_context_parallel_size}"
                 )
             if not self.fp8_use_mixed_batch:
                 raise NotImplementedError(
@@ -609,6 +620,7 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
         self.fp8_decode_padded_heads = self._compute_fp8_decode_padded_heads(num_heads)
 
         vllm_config = get_current_vllm_config()
+        self.dcp_comm_backend = vllm_config.parallel_config.dcp_comm_backend
         max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
         q_concat_shape = (max_tokens, num_heads, head_size)
         if is_quantized_kv_cache(kv_cache_dtype):
@@ -988,16 +1000,17 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
         """Sparse MQA attention when DCP spans the PCP group (dcp == pcp, tp == 1).
 
         If `w_uv` ([H, kv_lora_rank, v_head_dim]) is given, the per-rank partial
-        outputs are projected through it *before* the LSE merge and the
-        reduce-scatter (both are linear in the output), which shrinks the
-        reduce-scatter 4x; the returned tensor is then [num_actual, H, v_head_dim].
+        outputs are projected through it *before* the LSE merge and token scatter
+        (both are linear in the output), which shrinks communication 4x; the
+        returned tensor is then [num_actual, H, v_head_dim].
 
         Queries are token-partitioned across the group while the KV cache is
         block-sharded, so no rank can attend to its own queries alone. In row
         chunks: gather the queries, top-k indices and request ids along tokens,
         run the fp8 sparse kernel over the local KV shard for every gathered
-        token, LSE-merge the partial results across ranks and reduce-scatter
-        them back to the owners.
+        token, LSE-merge the partial results across ranks and scatter them back
+        to the owners. The ``a2a`` backend packs output and LSE into one
+        collective; ``ag_rs`` retains the original two-collective path.
 
         `num_padded_tokens` is the uniform per-rank row count (the PCP manager pads
         every rank's slice to the same length); rows past
@@ -1135,22 +1148,37 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
             out = out.contiguous()
             if simulate:
                 lses = lse.unsqueeze(0).expand(world_size, -1, -1).contiguous()
+                out, _ = correct_attn_out(
+                    out,
+                    lses,
+                    rank,
+                    self._token_sharded_cp_ctx,
+                    is_lse_base_on_e=self.lse_base_on_e,
+                )
+                out_chunks.append(out[:n].contiguous())
+            elif self.dcp_comm_backend == "a2a":
+                out_chunks.append(
+                    dcp_a2a_lse_reduce_token_sharded(
+                        out,
+                        lse,
+                        cp_group,
+                        is_lse_base_on_e=self.lse_base_on_e,
+                    )
+                )
             else:
+                assert self.dcp_comm_backend == "ag_rs"
                 lses = cp_group.all_gather(lse, dim=0).view(
                     world_size, num_all, num_heads
                 )
-            out, _ = correct_attn_out(
-                out,
-                lses,
-                rank,
-                self._token_sharded_cp_ctx,
-                is_lse_base_on_e=self.lse_base_on_e,
-            )
-            # Rows are ordered by rank, so a token-dim reduce-scatter hands every
-            # rank the merged output of exactly its own slice of this chunk.
-            if simulate:
-                out_chunks.append(out[:n].contiguous())
-            else:
+                out, _ = correct_attn_out(
+                    out,
+                    lses,
+                    rank,
+                    self._token_sharded_cp_ctx,
+                    is_lse_base_on_e=self.lse_base_on_e,
+                )
+                # Rows are ordered by rank, so a token-dim reduce-scatter hands
+                # every rank the merged output of exactly its own chunk slice.
                 out_chunks.append(cp_group.reduce_scatter(out, dim=0))
         out_local = out_chunks[0] if len(out_chunks) == 1 else torch.cat(out_chunks)
         _pcp_dcp_log(f"attn rank={rank} done chunks={len(out_chunks)}")
