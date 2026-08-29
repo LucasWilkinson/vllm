@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from typing import TYPE_CHECKING, cast
 
 import torch
@@ -11,6 +12,7 @@ from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.distributed.parallel_state import get_pcp_group, get_tp_group
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import MLAAttention
 from vllm.model_executor.layers.attention.attention import get_attention_context
 from vllm.model_executor.layers.attention.pcp_direct_kv import (
@@ -47,6 +49,15 @@ from vllm.v1.attention.ops.pcp import (
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.attention.mla_attention import MLACommonMetadata
+
+
+logger = init_logger(__name__)
+_PCP_DCP_DEBUG = os.environ.get("VLLM_PCP_DCP_DEBUG", "0") == "1"
+
+
+def _pcp_dcp_log(msg: str) -> None:
+    if _PCP_DCP_DEBUG:
+        logger.info("[pcp-dcp] %s", msg)
 
 
 class DeepseekV32Indexer(nn.Module):
@@ -428,6 +439,12 @@ class DeepseekV32Attention(MLAAttention):
         else:
             index_q = None
 
+        if _PCP_DCP_DEBUG:
+            _pcp_dcp_log(
+                f"fused_q rank={get_pcp_group().rank_in_group} begin "
+                f"tokens={positions.shape[0]} q_pe={tuple(q_pe.shape)} "
+                f"index_q={None if index_q is None else tuple(index_q.shape)}"
+            )
         index_q_fp8, index_weights_out, mqa_q = fused_q(
             positions,
             q_pe,
@@ -446,6 +463,11 @@ class DeepseekV32Attention(MLAAttention):
             # absorbed ql_nope and cannot be passed to the dense backend.
             quantize_mqa=self._fp8_query and not use_dense_prefill,
         )
+        if _PCP_DCP_DEBUG:
+            _pcp_dcp_log(
+                f"fused_q rank={get_pcp_group().rank_in_group} done "
+                f"mqa={tuple(mqa_q.shape)}"
+            )
 
         if use_dense_prefill:
             # The sparse MQA DCP top-k merge assumes matching query rows on all
