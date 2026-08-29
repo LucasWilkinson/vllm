@@ -30,7 +30,7 @@ def _runtime_max_tokens_per_rank(
     local_num_tokens: int, local_sizes: list[int] | None
 ) -> int:
     """Return a dispatch bound that also covers rank-local PCP padding."""
-    return max(local_num_tokens, max(local_sizes, default=0))
+    return max(local_num_tokens, max(local_sizes or [], default=0))
 
 
 class FlashInferNVLinkOneSidedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
