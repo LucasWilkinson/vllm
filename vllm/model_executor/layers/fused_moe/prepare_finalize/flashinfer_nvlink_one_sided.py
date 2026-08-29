@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
+
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
@@ -8,9 +10,13 @@ from vllm.distributed.device_communicators.base_device_communicator import (
     All2AllManagerBase,
 )
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
 from vllm.utils.flashinfer import nvfp4_block_scale_interleave
+
+logger = init_logger(__name__)
+_PCP_DCP_DEBUG = os.environ.get("VLLM_PCP_DCP_DEBUG", "0") == "1"
 
 
 def get_local_sizes() -> list[int] | None:
@@ -18,6 +24,13 @@ def get_local_sizes() -> list[int] | None:
     if dp_metadata is None:
         return None
     return dp_metadata.get_chunk_sizes_across_dp_rank()
+
+
+def _runtime_max_tokens_per_rank(
+    local_num_tokens: int, local_sizes: list[int] | None
+) -> int:
+    """Return a dispatch bound that also covers rank-local PCP padding."""
+    return max(local_num_tokens, max(local_sizes, default=0))
 
 
 class FlashInferNVLinkOneSidedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
@@ -91,11 +104,17 @@ class FlashInferNVLinkOneSidedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeMo
             a1.mul_(topk_weights.to(a1.dtype))
 
         global_num_tokens_cpu = get_local_sizes()
-        self.runtime_max_tokens_per_rank = (
-            max(global_num_tokens_cpu)
-            if global_num_tokens_cpu is not None
-            else a1.shape[0]
+        self.runtime_max_tokens_per_rank = _runtime_max_tokens_per_rank(
+            a1.shape[0], global_num_tokens_cpu
         )
+        if _PCP_DCP_DEBUG:
+            logger.info(
+                "[pcp-dcp] moe rank=%d begin tokens=%d sizes=%s runtime_max=%d",
+                get_ep_group().rank_in_group,
+                a1.shape[0],
+                global_num_tokens_cpu,
+                self.runtime_max_tokens_per_rank,
+            )
 
         if defer_input_quant:
             dispatch_x, dispatch_x_sf = a1, None
@@ -125,6 +144,11 @@ class FlashInferNVLinkOneSidedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeMo
             invalid_token_expert_id=-1,  # Follow TRTLLM Pattern
             expert_id_payload_index=topk_ids_payload_index,
         )
+        if _PCP_DCP_DEBUG:
+            logger.info(
+                "[pcp-dcp] moe rank=%d dispatch_done",
+                get_ep_group().rank_in_group,
+            )
         if dispatch_x_sf is not None:
             recv_x, recv_x_sf, topk_ids_recv, topk_weights_recv = recv_payloads
             x_sf_width = recv_x_sf.shape[-1]
