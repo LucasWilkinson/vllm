@@ -197,6 +197,7 @@ if TYPE_CHECKING:
     VLLM_MOE_USE_DEEP_GEMM: bool = True
     VLLM_USE_DEEP_GEMM_E8M0: bool = True
     VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES: bool = True
+    VLLM_DISABLE_FUSED_Q_CUTEDSL: bool = False
     VLLM_DISABLE_FUSED_Q_PDL: bool = False
     VLLM_DCP_Q_REPLICATE: bool = False
     VLLM_USE_DIRECT_DCP_A2A: bool | None = None
@@ -762,6 +763,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # PDL is enabled by default on supported architectures.
     "VLLM_DISABLE_FUSED_Q_PDL": lambda: (
         os.environ.get("VLLM_DISABLE_FUSED_Q_PDL", "0") == "1"
+    ),
+    # Force the DeepSeek V3.2/GLM fused-query path to use its Triton fallback.
+    "VLLM_DISABLE_FUSED_Q_CUTEDSL": lambda: (
+        os.environ.get("VLLM_DISABLE_FUSED_Q_CUTEDSL", "0") == "1"
     ),
     # Debug pattern matching inside custom passes.
     # Should be set to the fx.Node name (e.g. 'getitem_34' or 'scaled_mm_3').

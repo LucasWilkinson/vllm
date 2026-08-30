@@ -34,6 +34,8 @@ def is_fused_q_cutedsl_supported(
     has_indexer: bool,
     quantize_mqa: bool,
 ) -> bool:
+    if envs.VLLM_DISABLE_FUSED_Q_CUTEDSL:
+        return False
     if not (
         current_platform.has_device_capability(100)
         and quantize_mqa
