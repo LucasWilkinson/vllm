@@ -459,8 +459,9 @@ class DeepseekV32Attention(MLAAttention):
             index_q = None
 
         if _PCP_DCP_DEBUG:
+            torch.cuda.synchronize()
             _pcp_dcp_log(
-                f"fused_q rank={get_pcp_group().rank_in_group} begin "
+                f"fused_q rank={get_pcp_group().rank_in_group} pre_sync_done "
                 f"tokens={positions.shape[0]} q_pe={tuple(q_pe.shape)} "
                 f"index_q={None if index_q is None else tuple(index_q.shape)}"
             )
@@ -484,7 +485,12 @@ class DeepseekV32Attention(MLAAttention):
         )
         if _PCP_DCP_DEBUG:
             _pcp_dcp_log(
-                f"fused_q rank={get_pcp_group().rank_in_group} done "
+                f"fused_q rank={get_pcp_group().rank_in_group} launched "
+                f"mqa={tuple(mqa_q.shape)}"
+            )
+            torch.cuda.synchronize()
+            _pcp_dcp_log(
+                f"fused_q rank={get_pcp_group().rank_in_group} post_sync_done "
                 f"mqa={tuple(mqa_q.shape)}"
             )
 
