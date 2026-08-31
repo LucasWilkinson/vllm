@@ -1680,6 +1680,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             uniform_tok_count,
             self.dp_size,
             self.dp_rank,
+            pcp_size=self.parallel_config.prefill_context_parallel_size,
+            enable_expert_parallel=self.parallel_config.enable_expert_parallel,
             max_query_len=max_query_len,
             need_eager=is_profile or skip_compiled,
             num_active_loras=num_active_loras,
@@ -1905,6 +1907,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 cudagraph_runtime_mode=batch_desc.cg_mode,
                 num_tokens_across_dp=(
                     dp_sync.num_tokens_across_dp if dp_sync is not None else None
+                ),
+                num_tokens_across_dp_pcp=(
+                    dp_sync.num_tokens_across_dp_pcp if dp_sync is not None else None
                 ),
                 batch_descriptor=batch_descriptor,
                 ubatch_slices=ubatch_slices,
