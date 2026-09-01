@@ -304,13 +304,21 @@ class FlashInferMLASparseTRTLLMMetadataBuilder(FlashInferMLASparseMetadataBuilde
 _fi_sparse_workspace: torch.Tensor | None = None
 
 
-def _get_workspace_buffer(device: torch.device) -> torch.Tensor:
+def _trtllm_sparse_workspace_size(
+    max_num_tokens: int, num_heads: int, topk_tokens: int
+) -> int:
+    # One byte per sparse score plus one float32 reduction value per row.
+    return max_num_tokens * num_heads * (topk_tokens + torch.float32.itemsize)
+
+
+def _get_workspace_buffer(device: torch.device, required_size: int = 0) -> torch.Tensor:
     global _fi_sparse_workspace
-    if _fi_sparse_workspace is None:
+    buffer_size = max(envs.VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE, required_size)
+    if _fi_sparse_workspace is None or _fi_sparse_workspace.numel() < buffer_size:
         # FlashInfer's CuteDSL MLA-decode tactic requires an int8 workspace;
         # the trtllm-gen path views it as uint8, so int8 is safe for all backends.
         _fi_sparse_workspace = torch.zeros(
-            envs.VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE,
+            buffer_size,
             dtype=torch.int8,
             device=device,
         )
@@ -376,6 +384,11 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
         )
 
         self._workspace_buffer: torch.Tensor | None = None
+        assert self.topk_indices_buffer is not None
+        max_num_tokens, topk_tokens = self.topk_indices_buffer.shape
+        self._workspace_size = _trtllm_sparse_workspace_size(
+            max_num_tokens, num_heads, topk_tokens
+        )
         self.bmm1_scale: float | None = None
         self.bmm2_scale: float | None = None
 
@@ -438,7 +451,9 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
                 seq_lens = valid_counts
 
         if self._workspace_buffer is None:
-            self._workspace_buffer = _get_workspace_buffer(q.device)
+            self._workspace_buffer = _get_workspace_buffer(
+                q.device, self._workspace_size
+            )
 
         if self.bmm1_scale is None:
             self.bmm1_scale = self.scale

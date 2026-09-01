@@ -42,6 +42,7 @@ if not current_platform.is_cuda():
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
     FlashInferMLASparseTRTLLMBackend,
+    _trtllm_sparse_workspace_size,
 )
 from vllm.v1.attention.backends.mla.flashmla_sparse import (
     FlashMLASparseBackend,
@@ -76,6 +77,10 @@ SPARSE_BACKEND_BATCH_SPECS["large_q_pure_prefill"] = BatchSpec(
 )
 
 DEVICE_TYPE = current_platform.device_type
+
+
+def test_trtllm_sparse_workspace_scales_with_batch_geometry():
+    assert _trtllm_sparse_workspace_size(4096, 64, 2048) == 537_919_488
 
 
 def _float_to_e8m0_truncate(f: float) -> float:
