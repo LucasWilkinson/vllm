@@ -328,7 +328,10 @@ class FlashMLASparseMetadataBuilder(
         )
 
         if dcp_world_size > 1:
-            if parallel_config.dcp_comm_backend != "ag_rs":
+            # Ordinary DCP is only validated with ag_rs. PCP-spanning DCP does
+            # not gather query heads, so its combine is a pure LSE-weighted
+            # reduce that MLADCPManager supports on any comm backend.
+            if parallel_config.dcp_comm_backend != "ag_rs" and not pcp_spans_dcp:
                 raise NotImplementedError(
                     "DCP for FlashMLA sparse is only validated with the "
                     "default 'ag_rs' DCP comm backend; got "
