@@ -1627,6 +1627,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.input_buffers,
                 max_query_len=batch_desc.max_query_len,
             )
+            if self.use_dcp:
+                # Dummy batches skip prepare_inputs, so they carry no DCP-local
+                # sequence lengths. Backends that classify a dummy batch as
+                # decode index them unconditionally.
+                prepare_dcp_local_seq_lens(
+                    self.input_buffers.dcp_local_seq_lens,
+                    self.input_buffers.seq_lens,
+                    input_batch.num_reqs,
+                    self.dcp_size,
+                    self.dcp_rank,
+                    self.cp_interleave,
+                )
+                input_batch.dcp_local_seq_lens = self.input_buffers.dcp_local_seq_lens[
+                    : input_batch.num_reqs_after_padding
+                ]
             if not skip_attn_for_dummy_run:
                 block_tables, slot_mappings = self.prepare_dummy_attn(input_batch)
                 if context_len:
