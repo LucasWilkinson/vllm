@@ -52,7 +52,7 @@ def test_partition_reuses_gpu_cursor_for_replicated_spec_decode():
     assert local_batch.num_computed_tokens_np.tolist() == [20]
 
 
-def test_replicated_verification_skips_pcp_restore(monkeypatch):
+def test_replicated_batch_skips_pcp_restore(monkeypatch):
     device = torch.device("cpu")
     global_buffers = InputBuffers(max_num_reqs=1, max_num_tokens=8, device=device)
     global_batch = InputBatch.make_dummy(
@@ -78,7 +78,7 @@ def test_replicated_verification_skips_pcp_restore(monkeypatch):
     )
     local_batch = manager.partition_batch(global_batch, padded_num_tokens=8)
 
-    assert manager._replicated_verification
+    assert manager._replicated_batch
     assert local_batch.num_draft_tokens == 3
     assert local_batch.num_tokens_after_padding == 8
     torch.testing.assert_close(
@@ -166,8 +166,7 @@ def test_dcp_shards_prefill_across_pcp_ranks(monkeypatch):
     assert per_rank_num_tokens == [1, 1, 1, 1]
 
     request_indices = [
-        [segment.global_batch_req_idx for segment in rank]
-        for rank in segments_by_rank
+        [segment.global_batch_req_idx for segment in rank] for rank in segments_by_rank
     ]
     assert request_indices == [[0], [0], [0], [0]]
 
@@ -183,6 +182,53 @@ def test_dcp_shards_prefill_across_pcp_ranks(monkeypatch):
 
     # Hidden-state restore gathers each rank's shard back into global order.
     assert manager._hidden_restore_idx.tolist() == [0, 4, 8, 12]
+
+
+def test_dcp_keeps_mtp_target_batch_replicated(monkeypatch):
+    # MTP drafts autoregressively from the full context on every PCP rank, so
+    # under DCP its target batch stays replicated in global token order rather
+    # than taking the token-sharded path the other PCP-spanning DCP modes use.
+    device = torch.device("cpu")
+    global_buffers = InputBuffers(max_num_reqs=1, max_num_tokens=8, device=device)
+    global_batch = InputBatch.make_dummy(
+        num_reqs=1,
+        num_tokens=4,
+        input_buffers=global_buffers,
+    )
+    global_batch.seq_lens.fill_(12)
+
+    def prepare_dcp_local_seq_lens(out, seq_lens, *_args):
+        out.copy_(seq_lens // 4)
+
+    monkeypatch.setattr(
+        pcp_manager_module,
+        "prepare_dcp_local_seq_lens",
+        prepare_dcp_local_seq_lens,
+    )
+
+    manager = PCPManager(
+        pcp_world_size=4,
+        pcp_rank=0,
+        dcp_world_size=4,
+        dcp_rank=0,
+        device=device,
+        req_states=SimpleNamespace(),
+        max_num_reqs=1,
+        max_num_tokens=8,
+        use_mtp=True,
+    )
+    local_batch = manager.partition_batch(global_batch)
+
+    assert manager._replicated_batch
+    assert local_batch.num_tokens == global_batch.num_tokens
+    assert local_batch.query_start_loc.tolist() == [0, 4]
+    assert local_batch.dcp_local_seq_lens.tolist() == [3]
+    assert (
+        manager.get_num_tokens_for_dispatch(
+            np.array([4], dtype=np.int32), np.ones(1, dtype=np.bool_)
+        )
+        == 4
+    )
 
 
 def test_mixed_replicated_cache_inputs_skip_pcp_gather(monkeypatch):
@@ -282,9 +328,7 @@ def test_mixed_spec_partition_preserves_materialized_draft_inputs(monkeypatch):
     # Its [last-sampled, draft] rows must survive partitioning unchanged.
     torch.testing.assert_close(
         local_batch.input_ids[:2],
-        torch.tensor(
-            [101, 102], device=device, dtype=local_batch.input_ids.dtype
-        ),
+        torch.tensor([101, 102], device=device, dtype=local_batch.input_ids.dtype),
     )
 
 
