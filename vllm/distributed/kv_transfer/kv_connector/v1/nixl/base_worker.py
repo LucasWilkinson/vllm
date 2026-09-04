@@ -2408,14 +2408,20 @@ class NixlBaseConnectorWorker:
                         f"must equal local {local_len} // splits {num_splits}."
                     )
                 elif tp_ratio > 0:
+                    expected_remote_len = (
+                        local_len * tp_ratio // block_size_ratio
+                        if self.use_mla and has_region_policy
+                        else (local_len * remote_heads // local_heads)
+                        // block_size_ratio
+                    )
                     assert (
-                        remote_len
-                        == (local_len * remote_heads // local_heads) // block_size_ratio
+                        remote_len == expected_remote_len
                     ), (
                         f"SPLIT region {i}: remote P KV block_len {remote_len} "
-                        f"must equal local {local_len} * remote_heads "
-                        f"{remote_heads} // local_heads {local_heads} "
-                        f"// block_size_ratio {block_size_ratio}."
+                        f"must equal {expected_remote_len} for local block_len "
+                        f"{local_len}, tp_ratio {tp_ratio}, remote_heads "
+                        f"{remote_heads}, local_heads {local_heads}, and "
+                        f"block_size_ratio {block_size_ratio}."
                     )
                 else:
                     assert block_size_ratio == 1, (

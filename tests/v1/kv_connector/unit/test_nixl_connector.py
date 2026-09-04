@@ -1226,6 +1226,7 @@ class TestNixlHandshake:
             worker.slot_size_per_layer = [4096, 512]
             worker.block_len_per_layer = [fa_len, idx_len]
             worker._region_is_mla = [False, True]
+            worker.use_mla = True
             worker.num_blocks = 1
             worker.dst_num_blocks[worker.engine_id] = worker.num_blocks
             worker.src_blocks_data = np.array(
@@ -1264,6 +1265,7 @@ class TestNixlHandshake:
             )
             worker2.block_len_per_layer = [fa_len, idx_len]
             worker2._region_is_mla = [False, True]
+            worker2.use_mla = True
             worker2.num_blocks = 1
             worker2.dst_num_blocks[worker2.engine_id] = worker2.num_blocks
             bad_meta = NixlAgentMetadata(
