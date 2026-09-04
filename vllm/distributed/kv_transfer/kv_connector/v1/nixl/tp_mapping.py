@@ -12,7 +12,13 @@ from vllm.distributed.kv_transfer.kv_connector.utils import (
     BlockIds,
     TransferTopology,
 )
-from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheSpec, MambaSpec
+from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
+    KVCacheSpec,
+    MambaSpec,
+    MLAAttentionSpec,
+    SlidingWindowMLASpec,
+)
 
 # ======================================================================
 # Data structures
@@ -26,6 +32,7 @@ class ReadSpec:
     remote_rank: int
     local_block_ids: BlockIds
     remote_block_ids: BlockIds
+    block_ids_by_region: bool = False
 
 
 def _is_attention_spec(spec_type: type[KVCacheSpec]) -> bool:
@@ -34,6 +41,10 @@ def _is_attention_spec(spec_type: type[KVCacheSpec]) -> bool:
 
 def _is_ssm_spec(spec_type: type[KVCacheSpec]) -> bool:
     return issubclass(spec_type, MambaSpec)
+
+
+def _is_mla_spec(spec_type: type[KVCacheSpec]) -> bool:
+    return issubclass(spec_type, (MLAAttentionSpec, SlidingWindowMLASpec))
 
 
 @dataclass(frozen=True)
@@ -71,6 +82,7 @@ def compute_tp_mapping(
     remote_tp_size: int,
     group_spec_types: tuple[type[KVCacheSpec], ...],
     remote_dcp_size: int = 1,
+    attention_group_num_splits: tuple[int, ...] | None = None,
 ) -> TPMapping:
     """Build the complete local-to-remote TP mapping.
 
@@ -107,6 +119,29 @@ def compute_tp_mapping(
         _, unique_idx = np.unique(heads, return_index=True)
         attn_ranks = (start + np.sort(unique_idx)).tolist()
 
+    # A model-level MLA flag is insufficient when an ordinary-attention draft
+    # group accompanies an MLA verifier. In that case the draft group must read
+    # every distinct remote shard while MLA still reads one replica.
+    if attention_group_num_splits is not None:
+        assert len(attention_group_num_splits) == len(group_spec_types)
+        if remote_dcp_size > 1 and any(
+            _is_attention_spec(t) and not _is_mla_spec(t) for t in group_spec_types
+        ):
+            raise NotImplementedError(
+                "Mixed MLA and sharded attention is not supported with DCP"
+            )
+        if tp_size < remote_tp_size:
+            start = tp_rank * (remote_tp_size // tp_size)
+            max_splits = max(attention_group_num_splits, default=1)
+            sharded_attn_ranks = list(range(start, start + max_splits))
+        else:
+            sharded_attn_ranks = [tp_rank * remote_tp_size // tp_size]
+        replicated_attn_ranks = (
+            transfer_topology.dcp_source_ranks(remote_tp_size, remote_dcp_size)
+            if remote_dcp_size > 1
+            else [tp_rank * remote_tp_size // tp_size]
+        )
+
     # --- SSM source ranks ---
     has_ssm = any(_is_ssm_spec(t) for t in group_spec_types)
     if has_ssm:
@@ -118,25 +153,46 @@ def compute_tp_mapping(
     else:
         ssm_ranks = []
 
-    all_ranks = sorted(set(attn_ranks) | set(ssm_ranks))
-
     # --- Per-group ordered source ranks ---
-    source_ranks_per_group = tuple(
-        tuple(ssm_ranks) if _is_ssm_spec(t) else tuple(attn_ranks)
-        for t in group_spec_types
-    )
+    if attention_group_num_splits is None:
+        source_ranks_per_group = tuple(
+            tuple(ssm_ranks) if _is_ssm_spec(t) else tuple(attn_ranks)
+            for t in group_spec_types
+        )
+        slot_ranks = attn_ranks
+    else:
+        source_ranks_per_group = tuple(
+            tuple(ssm_ranks)
+            if _is_ssm_spec(t)
+            else tuple(replicated_attn_ranks)
+            if _is_mla_spec(t)
+            else tuple(sharded_attn_ranks[: attention_group_num_splits[i]])
+            for i, t in enumerate(group_spec_types)
+        )
+        slot_ranks = sharded_attn_ranks
+
+    all_ranks = sorted({rank for ranks in source_ranks_per_group for rank in ranks})
 
     # --- Attention head slots ---
     head_to_slot: dict[int, int] = {}
-    for i, r in enumerate(attn_ranks):
+    for i, r in enumerate(slot_ranks):
         head_to_slot[r * total_num_kv_heads // remote_tp_size] = i
-    rank_to_attention_slot = {
-        r: head_to_slot.get(r * total_num_kv_heads // remote_tp_size, 0)
-        for r in all_ranks
-    }
+    rank_to_attention_slot = {r: i for i, r in enumerate(slot_ranks)}
+    rank_to_attention_slot.update(
+        {
+            r: head_to_slot.get(r * total_num_kv_heads // remote_tp_size, 0)
+            for r in all_ranks
+            if r not in rank_to_attention_slot
+        }
+    )
 
     # --- Rank offset factor ---
-    if transfer_topology.is_mla or tp_size <= remote_tp_size:
+    has_sharded_attention = any(
+        _is_attention_spec(t) and not _is_mla_spec(t) for t in group_spec_types
+    )
+    if (transfer_topology.is_mla and not has_sharded_attention) or (
+        tp_size <= remote_tp_size
+    ):
         # We don't index into remote for reading, no offset needed.
         rank_offset_factor = 0
     elif tp_size > total_num_kv_heads:
