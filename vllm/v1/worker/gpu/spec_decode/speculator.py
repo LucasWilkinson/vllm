@@ -15,6 +15,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.models import supports_multimodal_embeddings
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.v1.attention.backends.utils import record_kv_cache_layout
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.attn_utils import (
     build_attn_metadata,
@@ -22,7 +23,6 @@ from vllm.v1.worker.gpu.attn_utils import (
 )
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
-from vllm.v1.worker.gpu.dp_utils import DPSyncState
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
@@ -32,12 +32,7 @@ logger = init_logger(__name__)
 
 
 def _target_feeds_hc_residual(vllm_config: VllmConfig) -> bool:
-    """Whether the target replaces the drafter's input with its HC residual.
-
-    Keyed on the same hook the model runner calls to perform that swap. It is
-    resolved from the target model class because speculators are built before
-    the target model is instantiated.
-    """
+    """Whether the target replaces the drafter's input with its HC residual."""
     from vllm.model_executor.model_loader.utils import get_model_cls
 
     target_cls = get_model_cls(vllm_config.model_config)
@@ -75,7 +70,7 @@ class BaseSpeculator(ABC):
         temperature: torch.Tensor,
         # [max_num_reqs]
         seeds: torch.Tensor,
-        dp_sync: DPSyncState | None = None,
+        num_tokens_across_dp: torch.Tensor | None = None,
         dummy_run: bool = False,
         skip_attn_for_dummy_run: bool = False,
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
@@ -86,19 +81,43 @@ class BaseSpeculator(ABC):
 
 class DraftModelSpeculator(BaseSpeculator):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
-        # Under PCP the drafter runs replicated over the global batch on
-        # every rank, so its attention groups, forward context, and
-        # cudagraphs must not see PCP.
+        # The target model is PCP-sharded, but the drafter runs replicated
+        # over the global batch on every PCP rank: its attention groups,
+        # forward context, and cudagraphs must not see PCP.
         target_parallel_config = vllm_config.parallel_config
+        speculative_config = vllm_config.speculative_config
         self.replicated_pcp = (
             getattr(target_parallel_config, "prefill_context_parallel_size", 1) > 1
+            and speculative_config is not None
+            and (speculative_config.method == "mtp" or speculative_config.use_dspark())
         )
-        if self.replicated_pcp:
+        if (
+            self.replicated_pcp
+            and target_parallel_config.decode_context_parallel_size == 1
+        ):
             vllm_config = replace(
                 vllm_config,
                 parallel_config=replace(
                     target_parallel_config,
                     prefill_context_parallel_size=1,
+                ),
+            )
+        # fp8_ds_mla describes the target MLA cache's packed physical layout.
+        # DFlash/DSpark drafts use standard K/V attention, so carrying that
+        # target-only layout into the draft makes every standard attention
+        # backend reject the cache configuration. Keep the target config
+        # untouched and use the equivalent standard FP8 cache for the draft.
+        if (
+            speculative_config is not None
+            and speculative_config.method == "dspark"
+            and vllm_config.cache_config.cache_dtype == "fp8_ds_mla"
+        ):
+            vllm_config = replace(
+                vllm_config,
+                cache_config=replace(vllm_config.cache_config, cache_dtype="fp8"),
+                attention_config=replace(
+                    vllm_config.attention_config,
+                    disable_flashinfer_q_quantization=True,
                 ),
             )
         self.vllm_config = vllm_config
@@ -119,13 +138,6 @@ class DraftModelSpeculator(BaseSpeculator):
         # the draft model's hidden size can be different from the target model's
         # hidden size (e.g., Llama 3.3 70B).
         self.hidden_size = self.draft_model_config.get_hidden_size()
-        # Widen for HC-multiplexed residuals: a target that implements
-        # get_mtp_target_hidden_states() (e.g. DeepSeek V4) hands the drafter
-        # its pre-hc_head (T, hc_mult * hidden_size) residual in place of the
-        # collapsed hidden states, so the drafter's buffers must match. Key off
-        # that hook rather than hc_mult alone -- HY V4 runs iHC in its backbone
-        # (hc_mult=4) but its MTP head consumes the collapsed states, so
-        # widening it feeds propose() a 4x-too-wide buffer.
         if _target_feeds_hc_residual(vllm_config):
             hc_mult = getattr(self.draft_model_config.hf_config, "hc_mult", 1)
             self.hidden_size = self.hidden_size * hc_mult
@@ -249,11 +261,19 @@ class DraftModelSpeculator(BaseSpeculator):
     ) -> None:
         self.model_state = model_state
         self.kv_cache_config = kv_cache_config
+        if kv_cache_config.kv_cache_layout is not None:
+            # The engine resolves layout after the draft-local CacheConfig copy
+            # is created. Mirror that physical layout while keeping the draft's
+            # standard FP8 dtype independent from the target MLA cache dtype.
+            record_kv_cache_layout(
+                self.vllm_config.cache_config, kv_cache_config.kv_cache_layout
+            )
         self.attn_groups, self.attn_cg_support, _ = init_attn_backend(
             kv_cache_config,
             self.attn_vllm_config,
             self.device,
             active_layer_names=self.draft_attn_layer_names,
+            kernel_block_sizes=block_tables.kernel_block_sizes,
         )
         self.block_tables = block_tables
         # The target model runner's buffers and attention groups. Draft
@@ -274,6 +294,7 @@ class DraftModelSpeculator(BaseSpeculator):
         causal: bool | Mapping[int, bool] = True,
         query_start_loc_np: np.ndarray | None = None,
         dcp_local_seq_lens: torch.Tensor | None = None,
+        is_prefilling: torch.Tensor | None = None,
     ) -> dict[str, Any] | None:
         if query_start_loc_np is not None:
             # Non-uniform query layout (e.g. multi-module MTP's mixed
@@ -320,6 +341,8 @@ class DraftModelSpeculator(BaseSpeculator):
                 self.block_tables.cp_interleave,
             )
             dcp_local_seq_lens = self.input_buffers.dcp_local_seq_lens
+        if is_prefilling is None and self.replicated_pcp:
+            is_prefilling = torch.zeros(num_reqs_padded, dtype=torch.bool)
         attn_metadata = build_attn_metadata(
             attn_groups=self.attn_groups,
             num_reqs=num_reqs_padded,
@@ -341,6 +364,7 @@ class DraftModelSpeculator(BaseSpeculator):
             kv_cache_config=self.kv_cache_config,
             causal=causal,
             seq_lens_cpu_upper_bound=draft_seq_lens_cpu_upper_bound,
+            is_prefilling=is_prefilling,
         )
         return attn_metadata
 
@@ -379,7 +403,7 @@ class DraftModelSpeculator(BaseSpeculator):
     def sample_draft(
         self,
         hidden_states: torch.Tensor,
-        sample_src_positions: torch.Tensor,
+        positions: torch.Tensor,
         idx_mapping: torch.Tensor,
         temperature: torch.Tensor,
         seeds: torch.Tensor,
@@ -388,12 +412,14 @@ class DraftModelSpeculator(BaseSpeculator):
     ) -> torch.Tensor:
         if draft_logits is not None:
             logits = self.model.compute_logits(hidden_states)
+            # NOTE(woosuk): We must add 1 to the positions to match the Gumbel noise
+            # used for draft and target sampling.
             return gumbel_sample(
                 logits,
                 idx_mapping,
                 temperature,
                 seeds,
-                sample_src_positions,
+                positions + 1,
                 apply_temperature=True,
                 is_drafting=True,
                 logits_cache=draft_logits,
@@ -424,22 +450,3 @@ class DraftModelSpeculator(BaseSpeculator):
         # idx_mapping for CG padded requests points to -1, which is ignored
         # during sampling to prevent writing stale values to draft logits.
         self.idx_mapping[num_reqs:].fill_(-1)
-
-    def _build_uniform_batch_dp_sync(
-        self,
-        target_dp_sync: DPSyncState,
-        num_reqs: int,
-        num_query_per_req: int = 1,
-    ) -> tuple[DPSyncState, int]:
-        num_batch_tokens = target_dp_sync.num_reqs * num_query_per_req
-        assert num_reqs * num_query_per_req <= num_batch_tokens, (
-            "reusing a DP sync that does not cover this batch's requests"
-        )
-        return replace(
-            target_dp_sync,
-            num_tokens_across_dp=torch.full_like(
-                target_dp_sync.num_tokens_across_dp, num_batch_tokens
-            ),
-            uniform_token_count=num_query_per_req,
-            eager=False,
-        ), num_batch_tokens

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Mapping, Sequence
-from contextlib import AbstractContextManager, nullcontext
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -79,6 +79,7 @@ def init_attn_backend(
     vllm_config: VllmConfig,
     device: torch.device,
     active_layer_names: set[str] | None = None,
+    kernel_block_sizes: list[int] | None = None,
 ) -> tuple[list[list[AttentionGroup]], AttentionCGSupportInfo, list[int]]:
     # Phase 1: discover attention groups for each kv cache group.
     attn_groups: list[list[AttentionGroup]] = []
@@ -127,7 +128,8 @@ def init_attn_backend(
 
     # Phase 2: pick a kernel block size per kv cache group that is supported
     # by all backends within that group.
-    kernel_block_sizes = prepare_kernel_block_sizes(kv_cache_config, attn_groups)
+    if kernel_block_sizes is None:
+        kernel_block_sizes = prepare_kernel_block_sizes(kv_cache_config, attn_groups)
 
     # Phase 3: create metadata builders and determine cudagraph support.
     attn_backend_workspace: torch.Tensor | None = None
@@ -211,14 +213,37 @@ def init_kv_cache(
     vllm_config: VllmConfig,
     kv_cache_allocation_context: AbstractContextManager | None = None,
 ) -> dict[str, Any]:
-    allocation_context = kv_cache_allocation_context or nullcontext()
-    with allocation_context:
-        kv_caches = allocate_kv_cache(
-            kv_cache_config,
-            device,
-            vllm_config.cache_config.get_resolved_kv_cache_layout(),
-            kernel_block_sizes,
-        )
+    buffer_allocator = None
+    from vllm.distributed.parallel_state import get_pcp_group
+    from vllm.model_executor.layers.attention.pcp_direct_kv import (
+        allocate_pcp_direct_backing,
+        close_pcp_direct_kv,
+        pcp_direct_kv_requested,
+    )
+
+    if pcp_direct_kv_requested():
+        # Memory profiling initializes a temporary KV cache before the serving
+        # cache. Release its symmetric-memory state before allocating the
+        # replacement so both allocations are not retained.
+        close_pcp_direct_kv()
+        pcp_group = get_pcp_group()
+        if pcp_group.world_size <= 1:
+            raise RuntimeError(
+                "VLLM_USE_PCP_DIRECT_KV=1 requires PCP world size greater than 1"
+            )
+
+        def buffer_allocator(nbytes: int, device: torch.device) -> torch.Tensor:
+            return allocate_pcp_direct_backing(
+                nbytes, device, pcp_group.device_group
+            ).storage
+
+    kv_caches = allocate_kv_cache(
+        kv_cache_config,
+        device,
+        vllm_config.cache_config.get_resolved_kv_cache_layout(),
+        kernel_block_sizes,
+        buffer_allocator=buffer_allocator,
+    )
     for layer_name, target in get_shared_kv_cache_layers(vllm_config).items():
         kv_caches[layer_name] = kv_caches[target]
     # Dual-attention models (e.g. LongCat-Flash) put two Attention modules per
@@ -229,13 +254,23 @@ def init_kv_cache(
         in ("longcat_flash", "longcat_flash_ngram")
         else 1
     )
-    bind_kv_cache(
-        kv_caches,
-        forward_context,
-        runner_kv_caches,
-        num_attn_module,
-        kv_cache_groups=kv_cache_config.kv_cache_groups,
+    bind_kv_cache(kv_caches, forward_context, runner_kv_caches, num_attn_module)
+    from vllm.model_executor.layers.attention.pcp_direct_kv import (
+        bind_pcp_direct_layer_views,
+        pcp_peer_kv_active,
+        should_allocate_pcp_direct_kv,
     )
+
+    if should_allocate_pcp_direct_kv(vllm_config):
+        pcp_group = get_pcp_group()
+        try:
+            bind_pcp_direct_layer_views(kv_caches, pcp_group.device_group, device)
+        except Exception:
+            close_pcp_direct_kv()
+            raise
+        if not pcp_peer_kv_active():
+            close_pcp_direct_kv()
+            raise RuntimeError("VLLM_USE_PCP_DIRECT_KV=1 failed to enable after bind")
     return kv_caches
 
 

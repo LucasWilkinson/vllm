@@ -1165,17 +1165,25 @@ class VllmConfig:
         self._verify_sampling_replay_config()
         self._verify_trace_replay_config()
 
-        # A NIXL DCP side is either fully replicated or fully sharded; MLA only.
-        # PCP producer constraints are validated by NixlBaseConnector.
+        # A NIXL side is either fully replicated or fully DCP-sharded; MLA only.
         if (
             self.kv_transfer_config is not None
             and self.kv_transfer_config.has_connector("NixlConnector")
         ):
+            pcp_size = self.parallel_config.prefill_context_parallel_size
             dcp_size = self.parallel_config.decode_context_parallel_size
             tp_size = self.parallel_config.tensor_parallel_size
-            assert dcp_size in (1, tp_size), (
+            transfer_size = tp_size
+            if pcp_size > 1 and dcp_size > 1:
+                assert tp_size == 1 and dcp_size == pcp_size, (
+                    "NIXL PCP+DCP currently supports only TP1 with DCP spanning "
+                    f"the full PCP group; got TP={tp_size}, PCP={pcp_size}, "
+                    f"DCP={dcp_size}."
+                )
+                transfer_size = pcp_size
+            assert dcp_size in (1, transfer_size), (
                 f"decode_context_parallel_size={dcp_size} must be 1 or equal "
-                f"to tensor_parallel_size={tp_size} when using NixlConnector."
+                f"to the NIXL transfer parallel size={transfer_size}."
             )
             if self.model_config is not None:
                 assert self.model_config.use_mla or dcp_size == 1, (
@@ -1247,6 +1255,26 @@ class VllmConfig:
             and self.parallel_config.enable_dbo
             and self.parallel_config.all2all_backend == "deepep_high_throughput"
         )
+        if envs.VLLM_USE_PCP_DIRECT_KV:
+            if self.scheduler_config.async_scheduling is True:
+                raise ValueError(
+                    "VLLM_USE_PCP_DIRECT_KV=1 is incompatible with explicitly "
+                    "enabled async scheduling. Use --no-async-scheduling."
+                )
+            if self.scheduler_config.async_scheduling is None:
+                logger.info_once(
+                    "Disabling async scheduling because PCP direct-KV is enabled."
+                )
+                self.scheduler_config.async_scheduling = False
+            if (
+                self.cache_config is not None
+                and self.cache_config.enable_prefix_caching
+            ):
+                logger.warning_once(
+                    "Disabling prefix caching because PCP direct-KV does not yet "
+                    "support copy-on-write."
+                )
+                self.cache_config.enable_prefix_caching = False
 
         if self.scheduler_config.async_scheduling:
             # Async scheduling explicitly enabled, hard fail any incompatibilities.
@@ -2773,7 +2801,7 @@ class VllmConfig:
     def adjust_dcp_kv_cache_interleave_size(
         self, kv_cache_config: "KVCacheConfig"
     ) -> None:
-        """Normalize DCP interleave size against block_size for NIXL P/D.
+        """Normalize DCP interleave size against the resolved block_size for PD.
 
         Called by each worker (via ensure_kv_transfer_initialized), once it knows its
         own final block_size via kv_cache_config.
@@ -2781,6 +2809,11 @@ class VllmConfig:
         dcp_size = self.parallel_config.decode_context_parallel_size
         if dcp_size <= 1:
             return
+        # Get the kernel block_size, but don't use resolve_kv_cache_block_size to avoid
+        # scaling by dcp_size (we need the local block_size here).
+        local_block_size = min(
+            g.kv_cache_spec.block_size for g in kv_cache_config.kv_cache_groups
+        )
         if self.parallel_config.dcp_kv_cache_interleave_size > 1 and (
             self.parallel_config.cp_kv_cache_interleave_size
             != self.parallel_config.dcp_kv_cache_interleave_size
@@ -2794,17 +2827,11 @@ class VllmConfig:
                 "deprecated when PCP is fully supported."
             )
 
-        if self.kv_transfer_config is None or not self.kv_transfer_config.has_connector(
-            "NixlConnector"
+        if (
+            self.kv_transfer_config is not None
+            and self.kv_transfer_config.kv_connector is not None
+            and self.parallel_config.cp_kv_cache_interleave_size != local_block_size
         ):
-            return
-
-        # Get the kernel block_size, but don't use resolve_kv_cache_block_size to avoid
-        # scaling by dcp_size (we need the local block_size here).
-        local_block_size = min(
-            g.kv_cache_spec.block_size for g in kv_cache_config.kv_cache_groups
-        )
-        if self.parallel_config.cp_kv_cache_interleave_size != local_block_size:
             interleave = self.parallel_config.cp_kv_cache_interleave_size
             self.parallel_config.cp_kv_cache_interleave_size = local_block_size
             logger.info_once(
@@ -2825,13 +2852,14 @@ class VllmConfig:
         """
         block_size = self.cache_config.block_size
 
-        # Skip DCP interleave-size compatibility for NIXL P/D: the interleave
-        # size is pinned to block_size by each worker.
-        nixl_pd_active = (
+        # Skip DCP interleave-size compatibility when a KV connector is configured:
+        # cp_kv_cache_interleave_size is pinned to block_size for PD by each worker
+        pd_active = (
             self.kv_transfer_config is not None
-            and self.kv_transfer_config.has_connector("NixlConnector")
+            and self.kv_transfer_config.kv_connector is not None
+            and self.kv_transfer_config.is_kv_transfer_instance
         )
-        if self.parallel_config.decode_context_parallel_size > 1 and not nixl_pd_active:
+        if self.parallel_config.decode_context_parallel_size > 1 and not pd_active:
             assert (
                 self.parallel_config.cp_kv_cache_interleave_size <= block_size
                 and block_size % self.parallel_config.cp_kv_cache_interleave_size == 0

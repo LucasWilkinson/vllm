@@ -966,31 +966,48 @@ def test_flashmla_forward_bf16_kv_slices_req_id_to_mqa_tokens():
         ),
         block_table=torch.arange(40, dtype=torch.int32, device=device).view(4, 10),
         block_size=block_size,
+        physical_topk_indices=torch.empty(
+            num_mqa_tokens,
+            num_topk_tokens,
+            dtype=torch.int32,
+            device=device,
+        ),
+        physical_topk_valid_counts=torch.empty(
+            num_mqa_tokens, dtype=torch.int32, device=device
+        ),
+        physical_topk_is_valid=False,
     )
     assert attn_metadata.req_id_per_token.shape[0] == num_batch_tokens
 
     q = torch.zeros(num_mqa_tokens, 4, 576, dtype=torch.bfloat16, device=device)
     kv_cache = torch.zeros(40, block_size, 576, dtype=torch.bfloat16, device=device)
-    topk_indices = torch.randint(
-        0,
-        block_size * 10,
-        (num_mqa_tokens, num_topk_tokens),
+    topk_indices = torch.arange(
+        num_mqa_tokens * num_topk_tokens,
         dtype=torch.int32,
         device=device,
-    )
+    ).view(num_mqa_tokens, num_topk_tokens)
 
     captured = {}
 
     def _stub_kernel(q, kv, indices, lengths, actual_num_heads):
         captured["indices"] = indices
-        captured["actual_num_heads"] = actual_num_heads
-        return torch.zeros(q.shape[0], q.shape[1], 512, dtype=q.dtype, device=q.device)
+        return (
+            torch.zeros(q.shape[0], q.shape[1], 512, dtype=q.dtype, device=q.device),
+            None,
+        )
 
-    stub_impl = SimpleNamespace(_bf16_flash_mla_kernel=_stub_kernel)
-
-    out = FlashMLASparseImpl._forward_bf16_kv(
-        stub_impl, q, kv_cache, topk_indices, attn_metadata, q.shape[1]
+    stub_impl = SimpleNamespace(
+        _bf16_flash_mla_kernel=_stub_kernel,
+        kv_cache_dtype="auto",
+        topk_indices_buffer=topk_indices,
+        dcp_world_size=1,
+        need_to_return_lse_for_decode=False,
     )
+    stub_impl._forward_bf16_kv = MethodType(
+        FlashMLASparseImpl._forward_bf16_kv, stub_impl
+    )
+
+    out, _ = FlashMLASparseImpl.forward_mqa(stub_impl, q, kv_cache, attn_metadata, None)
 
     assert out.shape[0] == num_mqa_tokens
     assert captured["indices"].shape[0] == num_mqa_tokens
@@ -1002,6 +1019,10 @@ def test_flashmla_forward_bf16_kv_slices_req_id_to_mqa_tokens():
         block_size,
         num_topk_tokens,
     )
+    torch.testing.assert_close(captured["indices"], reference, rtol=0, atol=0)
+
+    topk_indices.zero_()
+    FlashMLASparseImpl.forward_mqa(stub_impl, q, kv_cache, attn_metadata, None)
     torch.testing.assert_close(captured["indices"], reference, rtol=0, atol=0)
 
 
@@ -1497,6 +1518,25 @@ def test_triton_convert_returns_valid_counts(num_topk_tokens: int):
 
     torch.testing.assert_close(valid_counts, expected_valid_tensor, rtol=0, atol=0)
 
+    output_buffer = torch.empty_like(token_indices)
+    valid_counts_buffer = torch.full_like(expected_valid_tensor, -1)
+    buffered_result, buffered_valid_counts = triton_convert_req_index_to_global_index(
+        req_id,
+        block_table,
+        token_indices,
+        BLOCK_SIZE=block_size,
+        NUM_TOPK_TOKENS=num_topk_tokens,
+        return_valid_counts=True,
+        output=output_buffer,
+        valid_counts_out=valid_counts_buffer,
+    )
+    assert buffered_result.data_ptr() == output_buffer.data_ptr()
+    assert buffered_valid_counts.data_ptr() == valid_counts_buffer.data_ptr()
+    torch.testing.assert_close(buffered_result, result, rtol=0, atol=0)
+    torch.testing.assert_close(
+        buffered_valid_counts, expected_valid_tensor, rtol=0, atol=0
+    )
+
     # Test that return_valid_counts=False returns only the indices
     result_only = triton_convert_req_index_to_global_index(
         req_id,
@@ -1682,6 +1722,11 @@ def test_flashmla_fp8_paths_accept_decode_subset(monkeypatch, use_mixed_batch: b
         ),
         block_table=torch.empty(1, 1, dtype=torch.int32, device=DEVICE_TYPE),
         block_size=64,
+        physical_topk_indices=torch.empty_like(topk_indices),
+        physical_topk_valid_counts=torch.empty(
+            num_decode_tokens, dtype=torch.int32, device=DEVICE_TYPE
+        ),
+        physical_topk_is_valid=False,
     )
     impl = SimpleNamespace(
         kv_cache_dtype="fp8_ds_mla",
@@ -1716,6 +1761,7 @@ def _build_sparse_dcp_vllm_config(
     local_heads: int,
     dcp_world_size: int,
     comm_backend: str = "ag_rs",
+    pcp_world_size: int = 1,
 ):
     """Minimal sparse-MLA VllmConfig for the FlashMLASparse DCP head-envelope
     guard. TP is simulated by mocking ``get_num_attention_heads`` to return the
@@ -1759,6 +1805,7 @@ def _build_sparse_dcp_vllm_config(
 
     vllm_config.cache_config.cache_dtype = "fp8_ds_mla"
     vllm_config.parallel_config.decode_context_parallel_size = dcp_world_size
+    vllm_config.parallel_config.prefill_context_parallel_size = pcp_world_size
     vllm_config.parallel_config.dcp_comm_backend = comm_backend
     # The base builder clones the layer's dense-MHA prefill backend from
     # static_forward_context; the guard tests never run prefill.
@@ -1801,6 +1848,28 @@ def test_fp8_dcp_head_envelope_guard(local_heads, dcp_world_size, should_raise):
         gathered_pad = 64 if gathered_heads <= 64 else 128
         assert builder.fp8_decode_padded_heads == local_pad
         assert local_pad == gathered_pad
+
+
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability() < (9, 0),
+    reason="FlashMLASparseBackend requires CUDA 9.0 or higher",
+)
+def test_fp8_pcp_spanning_dcp_uses_mixed_batch_without_head_gather():
+    """PCP-spanning DCP combines partial outputs without gathering query heads."""
+    local_heads = 64
+    world_size = 8
+    device = torch.device(DEVICE_TYPE)
+    vllm_config = _build_sparse_dcp_vllm_config(
+        local_heads, world_size, pcp_world_size=world_size
+    )
+    kv_cache_spec = create_standard_kv_cache_spec(vllm_config)
+    builder_cls = FlashMLASparseBackend.get_builder_cls()
+
+    builder = builder_cls(kv_cache_spec, ["placeholder"], vllm_config, device)
+
+    assert builder.fp8_use_mixed_batch
+    assert builder.fp8_decode_padded_heads == local_heads
+    assert FlashMLASparseImpl.supports_mtp_with_cp_non_trivial_interleave_size
 
 
 def test_fp8_mixed_batch_dcp_neutralizes_empty_rows(monkeypatch):

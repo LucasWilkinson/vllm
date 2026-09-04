@@ -38,6 +38,7 @@ from vllm.v1.attention.backends.utils import (
     get_num_attention_heads_from_layers,
 )
 from vllm.v1.attention.ops.dcp import (
+    cp_lse_ag_out_ar,
     cp_lse_ag_out_rs,
     dcp_a2a_lse_reduce,
 )
@@ -76,6 +77,38 @@ from vllm.v1.worker.cp_utils import (
 )
 
 logger = init_logger(__name__)
+
+
+def _get_split_dcp_context_window(
+    sliding_window: list[int] | None,
+    *,
+    causal: bool,
+    max_query_len: int,
+    num_query_tokens: int,
+    num_reqs: int,
+    num_prefill_reqs: int,
+) -> list[int] | None:
+    """Align a context-only FlashAttention window with a detached Q block."""
+    if (
+        sliding_window is None
+        or not causal
+        or num_prefill_reqs > 0
+        or max_query_len < 1
+        or num_query_tokens != num_reqs * max_query_len
+        or max_query_len > sliding_window[0]
+    ):
+        return sliding_window
+
+    # The DCP path evaluates cached context and the current query block in
+    # separate attention calls. FlashAttention bottom-right aligns a Q block
+    # of length Q with its K block, so the regular causal window (W-1, 0)
+    # makes query row 0 miss the newest Q-1 cached tokens. Shift the
+    # context-only window right while preserving the combined context+query
+    # causal window. This is exact for uniform decode/speculative Q blocks.
+    return [
+        sliding_window[0] - max_query_len,
+        sliding_window[1] + max_query_len - 1,
+    ]
 
 
 class FlashAttentionBackend(AttentionBackend):
@@ -504,6 +537,14 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
 
         if self.dcp_world_size > 1:
             max_num_reqs = vllm_config.scheduler_config.max_num_seqs
+            # PCP DualChunkSwap splits each prefill request into two rank-local
+            # segments, so a PCP-partitioned batch drives build() with up to
+            # 2 * max_num_seqs requests (see pcp_manager.py: max_num_local_reqs
+            # = 2 * max_num_reqs). Size this persistent buffer for that upper
+            # bound; otherwise `self._dcp_context_kv_lens[:num_reqs] = ...`
+            # overflows during the shared prepare_attn pass under PCP-spanning DCP.
+            if vllm_config.parallel_config.prefill_context_parallel_size > 1:
+                max_num_reqs *= 2
             self._dcp_context_kv_lens = torch.zeros(
                 max_num_reqs,
                 dtype=torch.int32,
@@ -650,6 +691,7 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
                     common_attn_metadata.seq_lens_cpu_upper_bound,
                     max_query_len,
                     num_actual_tokens,
+                    common_attn_metadata.is_prefilling,
                 )
 
             # After DCP distribution, the maximum number of tokens for any rank is
@@ -935,6 +977,18 @@ class FlashAttentionImpl(AttentionImpl):
             and vllm_config.parallel_config.dcp_comm_backend == "a2a"
         )
         self.dcp_combine = dcp_a2a_lse_reduce if dcp_a2a else cp_lse_ag_out_rs
+        self.dcp_has_replicated_heads = bool(
+            vllm_config is not None
+            and self.dcp_world_size > 1
+            and vllm_config.parallel_config.tensor_parallel_size == 1
+            and vllm_config.parallel_config.prefill_context_parallel_size > 1
+            and vllm_config.parallel_config.decode_context_parallel_size
+            == vllm_config.parallel_config.prefill_context_parallel_size
+        )
+        if self.dcp_has_replicated_heads:
+            # PCP-spanning DCP ranks hold replicas of every query head rather
+            # than distinct TP head shards. Preserve the full local head set.
+            self.dcp_combine = cp_lse_ag_out_ar
 
         self._dcp_dtype: torch.dtype | None = None
         self._dcp_max_num_tokens: int = 0
@@ -1300,7 +1354,11 @@ class FlashAttentionImpl(AttentionImpl):
             )
             return output
 
-        query_across_dcp = get_dcp_group().all_gather(query, dim=1)
+        query_across_dcp = (
+            query
+            if self.dcp_has_replicated_heads
+            else get_dcp_group().all_gather(query, dim=1)
+        )
         sliding_window_size = (
             list(self.sliding_window) if self.sliding_window is not None else None
         )
@@ -1308,6 +1366,14 @@ class FlashAttentionImpl(AttentionImpl):
         num_reqs = cu_seqlens_q.shape[0] - 1
         num_decodes = attn_metadata.num_decode_reqs
         num_context_prefills = attn_metadata.num_prefill_reqs
+        context_sliding_window_size = _get_split_dcp_context_window(
+            sliding_window_size,
+            causal=attn_metadata.causal,
+            max_query_len=max_seqlen_q,
+            num_query_tokens=n,
+            num_reqs=num_reqs,
+            num_prefill_reqs=num_context_prefills,
+        )
         num_decode_tokens = attn_metadata.num_decode_tokens
         num_context_prefill_tokens = attn_metadata.num_prefill_tokens
         split_dcp_context = should_split_fa2_dcp_context_attention(
@@ -1321,7 +1387,7 @@ class FlashAttentionImpl(AttentionImpl):
         dcp_context_out_spec = (
             (
                 dcp_context_out_tokens,
-                self.num_heads * self.dcp_world_size,
+                query_across_dcp.shape[1],
                 self.head_size,
             ),
             self._dcp_dtype,
@@ -1349,7 +1415,7 @@ class FlashAttentionImpl(AttentionImpl):
                 attn_metadata.max_dcp_context_kv_len,
                 self.scale,
                 self.alibi_slopes,
-                sliding_window_size,
+                context_sliding_window_size,
                 block_table,
                 self.logits_soft_cap,
                 self.vllm_flash_attn_version,
@@ -1377,7 +1443,7 @@ class FlashAttentionImpl(AttentionImpl):
                 softmax_scale=self.scale,
                 causal=False,
                 alibi_slopes=self.alibi_slopes,
-                window_size=sliding_window_size,
+                window_size=context_sliding_window_size,
                 block_table=block_table,
                 softcap=self.logits_soft_cap,
                 return_softmax_lse=True,
@@ -1394,6 +1460,8 @@ class FlashAttentionImpl(AttentionImpl):
             context_lse.transpose(0, 1),
             get_dcp_group(),
             return_lse=True,
+            seq_lens=attn_metadata.dcp_context_kv_lens,
+            query_start_loc=cu_seqlens_q,
         )
         context_lse_cor = context_lse_cor.transpose(0, 1).contiguous()
 

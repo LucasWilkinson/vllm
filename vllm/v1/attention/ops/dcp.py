@@ -50,6 +50,10 @@ def mask_dcp_empty_shards_(
     ):
         raise ValueError("query_start_loc must contain one boundary per sequence")
 
+    if seq_lens.numel() == 0:
+        lse.fill_(float("-inf"))
+        return
+
     row_indices = torch.arange(
         lse.shape[0], device=lse.device, dtype=query_start_loc.dtype
     )
@@ -775,6 +779,54 @@ def dcp_a2a_lse_reduce(
     )
 
 
+def dcp_a2a_lse_reduce_token_sharded(
+    cp_attn_out: torch.Tensor,
+    cp_attn_lse: torch.Tensor,
+    cp_group: GroupCoordinator,
+    is_lse_base_on_e: bool = True,
+) -> torch.Tensor:
+    """LSE-combine DCP partials and scatter contiguous token rows.
+
+    ``dcp_a2a_lse_reduce`` scatters its head axis. Transposing tokens into that
+    axis reuses the same packed output+LSE collective for the PCP x DCP path,
+    where every rank computes partial attention for every gathered token and
+    the result must return to the token's owning PCP rank.
+
+    Args:
+        cp_attn_out: [N * B_local, H, D] partial attention outputs.
+        cp_attn_lse: [N * B_local, H] corresponding partial LSE values.
+        cp_group: The DCP/PCP group of size N.
+        is_lse_base_on_e: Whether the LSE uses base e rather than base 2.
+
+    Returns:
+        Combined output [B_local, H, D] for this rank's token slice.
+    """
+    if cp_attn_out.ndim != 3 or cp_attn_lse.ndim != 2:
+        raise ValueError(
+            "Token-sharded DCP A2A expects output [B, H, D] and LSE [B, H]; "
+            f"got {tuple(cp_attn_out.shape)} and {tuple(cp_attn_lse.shape)}."
+        )
+    if cp_attn_out.shape[:2] != cp_attn_lse.shape:
+        raise ValueError(
+            "Token-sharded DCP output and LSE dimensions must match; got "
+            f"{tuple(cp_attn_out.shape[:2])} and {tuple(cp_attn_lse.shape)}."
+        )
+    if cp_attn_out.shape[0] % cp_group.world_size != 0:
+        raise ValueError(
+            f"B={cp_attn_out.shape[0]} must be divisible by DCP world size "
+            f"{cp_group.world_size}."
+        )
+
+    combined = dcp_a2a_lse_reduce(
+        cp_attn_out.transpose(0, 1),
+        cp_attn_lse.transpose(0, 1),
+        cp_group,
+        is_lse_base_on_e=is_lse_base_on_e,
+    )
+    assert isinstance(combined, torch.Tensor)
+    return combined.transpose(0, 1).contiguous()
+
+
 def get_dcp_workspace_max_num_tokens(vllm_config: VllmConfig) -> int:
     scheduler_config = vllm_config.scheduler_config
     speculative_config = vllm_config.speculative_config
@@ -1270,11 +1322,12 @@ class MLADCPManager:
     ) -> DCPCombine:
         direct_workspace = None
         if self.use_a2a:
+            output_heads = num_heads // self.group.world_size if use_pcp else num_heads
             direct_workspace = get_direct_dcp_a2a_workspace(
                 self.group,
                 self.device,
                 self.max_num_tokens,
-                num_heads,
+                output_heads,
                 head_dim,
                 dtype,
                 self.num_ubatches,

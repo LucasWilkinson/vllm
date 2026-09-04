@@ -26,16 +26,23 @@ def check_attention_cp_compatibility(
     pcp_size = vllm_config.parallel_config.prefill_context_parallel_size
     dcp_size = vllm_config.parallel_config.decode_context_parallel_size
     interleave_size = vllm_config.parallel_config.cp_kv_cache_interleave_size
+    kv_transfer_config = vllm_config.kv_transfer_config
+    producer_only = (
+        kv_transfer_config is not None
+        and kv_transfer_config.is_kv_producer
+        and not kv_transfer_config.is_kv_consumer
+    )
     if pcp_size * dcp_size > 1:
         layer_type = cast(type[Any], AttentionLayerBase)
         layers = get_layers_from_vllm_config(vllm_config, layer_type)
         for name, layer in layers.items():
-            # A replicated drafter's layers never run CP-sharded attention,
-            # so they are exempt from the PCP/DCP backend checks.
+            # Replicated drafter layers do not execute PCP/DCP-sharded
+            # attention, even though they share the target runner.
             if exclude_layer_names is not None and name in exclude_layer_names:
                 continue
             get_attn_backend = getattr(layer, "get_attn_backend", None)
-            if pcp_size > 1 and get_attn_backend is not None:
+            layer_uses_pcp = getattr(layer, "use_pcp", pcp_size > 1)
+            if layer_uses_pcp and get_attn_backend is not None:
                 backend = get_attn_backend()
                 assert backend.supports_pcp(), (
                     "PCP requires attention backend support, "
@@ -44,7 +51,11 @@ def check_attention_cp_compatibility(
             layer_impl = getattr(layer, "impl", None)
             if layer_impl is None:
                 continue
-            if vllm_config.speculative_config is not None and interleave_size > 1:
+            if (
+                vllm_config.speculative_config is not None
+                and interleave_size > 1
+                and not producer_only
+            ):
                 assert layer_impl.supports_mtp_with_cp_non_trivial_interleave_size, (
                     "MTP with cp_kv_cache_interleave_size > 1 is not "
                     f"supported in {layer_impl.__class__.__name__}."
@@ -145,6 +156,7 @@ def split_dcp_context_queries(
     seq_lens_cpu_upper_bound: torch.Tensor | None,
     max_query_len: int,
     num_actual_tokens: int,
+    is_prefilling: torch.Tensor | None = None,
 ) -> tuple[int, int, int, int]:
     """Split reordered DCP context queries into decode and extend regions."""
     num_reqs = query_start_loc.shape[0] - 1
@@ -152,6 +164,34 @@ def split_dcp_context_queries(
         return num_reqs, 0, num_actual_tokens, 0
     if seq_lens_cpu_upper_bound is None:
         return 0, num_reqs, 0, num_actual_tokens
+
+    if is_prefilling is not None:
+        # Multi-token speculative verification/proposal batches are decodes,
+        # even though their query length is greater than one. In particular,
+        # DSpark submits the anchor and all mask queries in one forward and
+        # explicitly marks them as non-prefill. Do not infer their phase from
+        # query length, or DCP will route them through the extend-only path.
+        prefill_mask = is_prefilling[:num_reqs].to(device="cpu", dtype=torch.bool)
+        query_lens = query_start_loc[1:] - query_start_loc[:-1]
+        seq_lens = seq_lens_cpu_upper_bound[:num_reqs]
+        pure_prefill_mask = prefill_mask & (seq_lens == query_lens)
+        extend_mask = prefill_mask & ~pure_prefill_mask
+
+        num_decodes = int((~prefill_mask).sum().item())
+        num_extends = int(extend_mask.sum().item())
+        # PCP/DCP batches are ordered as decode, extend, then pure prefill.
+        # Keep the boundary-based token counts used by the split FA2 path.
+        first_extend = num_decodes
+        first_prefill = num_decodes + num_extends
+        if torch.any(prefill_mask[:num_decodes]):
+            raise ValueError("DCP batch must place decode requests first")
+        if torch.any(pure_prefill_mask[:first_prefill]):
+            raise ValueError("DCP batch must place pure prefill requests last")
+        num_decode_tokens = int(query_start_loc[first_extend].item())
+        num_extend_tokens = int(
+            query_start_loc[first_prefill].item() - num_decode_tokens
+        )
+        return num_decodes, num_extends, num_decode_tokens, num_extend_tokens
 
     common_attn_metadata = cast(
         CommonAttentionMetadata,

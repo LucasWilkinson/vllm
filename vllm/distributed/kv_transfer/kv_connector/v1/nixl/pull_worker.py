@@ -77,7 +77,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         while not self._ready_requests.empty():
             self._read_blocks_for_req(*self._ready_requests.get_nowait())
 
-        if self.pcp_rank > 0:
+        if self.pcp_rank > 0 and not self.pcp_dcp_sharded:
             return
 
         # Keep around the requests that have been part of a batch. This is
@@ -156,104 +156,66 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         remote_info = self.transfer_topo.get_engine_info(engine_id)
         tp_ratio = self.transfer_topo.tp_ratio(remote_info.remote_tp_size)
 
-        dcp_active = self.dcp_size > 1 or remote_info.remote_dcp_size > 1
-        local_block_ids = meta.local_physical_block_ids
-        local_region_groups = getattr(self, "region_group_ids", [])
-        remote_region_groups = getattr(self, "dst_region_group_ids", {}).get(
-            engine_id, local_region_groups
+        remote_logical_block_ids = meta.remote.block_ids
+        meta.remote.block_ids = self._logical_to_kernel_block_ids(
+            remote_logical_block_ids,
+            remote_info.remote_physical_blocks_per_logical,
         )
-        if local_region_groups != remote_region_groups:
-            if not self.use_mla or self._has_mamba:
-                raise NotImplementedError(
-                    "Different NIXL cache-group layouts are only supported for "
-                    "pure MLA models"
-                )
-            assert len(plan.all_source_ranks) == 1
-            remote_by_region = self._block_ids_by_region(
-                meta.remote.block_ids, remote_region_groups
-            )
-            remote_by_region = self._split_block_ids_by_region(
-                remote_by_region, self.dst_region_split_ratios[engine_id]
-            )
-            read_specs = [
-                ReadSpec(
-                    remote_rank=plan.all_source_ranks[0],
-                    local_block_ids=self._block_ids_by_region(
-                        local_block_ids, local_region_groups
-                    ),
-                    remote_block_ids=remote_by_region,
-                    block_ids_by_region=True,
-                )
+        num_groups = len(meta.local_block_ids)
+        dcp_active = self.dcp_size > 1 or remote_info.remote_dcp_size > 1
+
+        def group_ids(block_ids: BlockIds, rank: int) -> list[list[int]]:
+            return [
+                list(block_ids[g]) if rank in plan.source_ranks_per_group[g] else []
+                for g in range(num_groups)
             ]
-        else:
-            remote_logical_block_ids = meta.remote.block_ids
-            meta.remote.block_ids = self._logical_to_kernel_block_ids(
-                remote_logical_block_ids,
-                remote_info.remote_physical_blocks_per_logical,
-            )
-            num_groups = len(meta.local_block_ids)
 
-            def group_ids(block_ids: BlockIds, rank: int) -> list[list[int]]:
-                return [
-                    list(block_ids[g]) if rank in plan.source_ranks_per_group[g] else []
-                    for g in range(num_groups)
-                ]
-
-            read_specs = []
-            for rank in plan.all_source_ranks:
-                if dcp_active:
-                    # DCP interleaves at block granularity, so slicing happens
-                    # here on logical blocks, before kernel-block expansion.
-                    local_ids = group_ids(meta.local_block_ids, rank)
-                    remote_ids = group_ids(remote_logical_block_ids, rank)
-                    for g in range(num_groups):
-                        if not local_ids[g]:
-                            continue
-                        # Prefix cache hit may lead to skip some remote reads.
-                        local_ids[g], remote_ids[g] = self._apply_dcp_prefix_caching(
-                            local_ids[g],
-                            remote_ids[g],
-                            remote_rank=rank,
-                            local_dcp_size=self.dcp_size,
-                            local_dcp_rank=self.dcp_rank,
-                            remote_dcp_size=remote_info.remote_dcp_size,
-                            local_num_computed_blocks=(
-                                meta.local_num_computed_blocks[g]
-                            ),
-                        )
-                    local_physical_ids = self._logical_to_kernel_block_ids(
-                        local_ids, self._physical_blocks_per_logical_kv_block
-                    )
-                    remote_physical_ids = self._logical_to_kernel_block_ids(
-                        remote_ids,
-                        remote_info.remote_physical_blocks_per_logical,
-                    )
-                else:
-                    local_physical_ids = group_ids(meta.local_physical_block_ids, rank)
-                    remote_physical_ids = group_ids(meta.remote.block_ids, rank)
-                read_specs.append(
-                    ReadSpec(
+        read_specs = []
+        for rank in plan.all_source_ranks:
+            if dcp_active:
+                # DCP interleaves at block granularity, so slicing happens
+                # here on logical blocks, before kernel-block expansion.
+                local_ids = group_ids(meta.local_block_ids, rank)
+                remote_ids = group_ids(remote_logical_block_ids, rank)
+                for g in range(num_groups):
+                    if not local_ids[g]:
+                        continue
+                    # Prefix cache hit may lead to skip some of the remote reads
+                    # TODO (NickLucche) consider unifying prefix cache handling on
+                    # logical blocks here for both dcp and non-dcp
+                    local_ids[g], remote_ids[g] = self._apply_dcp_prefix_caching(
+                        local_ids[g],
+                        remote_ids[g],
                         remote_rank=rank,
-                        local_block_ids=local_physical_ids,
-                        remote_block_ids=remote_physical_ids,
+                        local_dcp_size=self.dcp_size,
+                        local_dcp_rank=self.dcp_rank,
+                        remote_dcp_size=remote_info.remote_dcp_size,
+                        local_num_computed_blocks=meta.local_num_computed_blocks[g],
                     )
+                local_physical_ids = self._logical_to_kernel_block_ids(
+                    local_ids, self._physical_blocks_per_logical_kv_block
                 )
+                remote_physical_ids = self._logical_to_kernel_block_ids(
+                    remote_ids, remote_info.remote_physical_blocks_per_logical
+                )
+            else:
+                # No DCP realignment needed: reuse the already-expanded full
+                # physical lists instead of re-deriving them from logical ids.
+                local_physical_ids = group_ids(meta.local_physical_block_ids, rank)
+                remote_physical_ids = group_ids(meta.remote.block_ids, rank)
+            read_specs.append(
+                ReadSpec(
+                    remote_rank=rank,
+                    local_block_ids=local_physical_ids,
+                    remote_block_ids=remote_physical_ids,
+                )
+            )
 
         # D may have to perform multiple reads from different remote ranks.
         # Pure MLA reads once because its cache is replicated. Hybrid
         # MLA+SSM still needs one read per SSM source rank. With DCP, pure
         # MLA may also read from multiple ranks (disjoint token slices).
-        region_is_mla = getattr(self, "_region_is_mla", ())
-        has_sharded_attention = not self.use_mla or any(
-            not value for value in region_is_mla
-        )
-        if (
-            self.use_mla
-            and not has_sharded_attention
-            and tp_ratio < 0
-            and not self._has_mamba
-            and not dcp_active
-        ):
+        if self.use_mla and tp_ratio < 0 and not self._has_mamba and not dcp_active:
             assert len(read_specs) == 1
 
         for i, spec in enumerate(read_specs):
@@ -372,30 +334,24 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 self.xfer_stats.record_failed_notification()
             return
 
-        if read_spec.block_ids_by_region:
-            local_block_ids, remote_block_ids = self._apply_prefix_caching_by_region(
+        assert (
+            len(remote_block_ids)
+            == len(local_block_ids)
+            == len(self.kv_cache_config.kv_cache_groups)
+        )
+        if not (self.dcp_size > 1 or remote_info.remote_dcp_size > 1):
+            # DCP-active reads were already trimmed (and DCP-realigned, when
+            # sizes mismatch) in _read_blocks_for_req, at logical granularity.
+            local_block_ids, remote_block_ids = self._apply_prefix_caching(
                 decode_block_ids=local_block_ids,
                 prefill_block_ids=remote_block_ids,
+                decode_physical_per_logical=(
+                    self._physical_blocks_per_logical_kv_block
+                ),
+                prefill_physical_per_logical=(
+                    remote_info.remote_physical_blocks_per_logical
+                ),
             )
-        else:
-            assert (
-                len(remote_block_ids)
-                == len(local_block_ids)
-                == len(self.kv_cache_config.transfer_groups)
-            )
-            if not (self.dcp_size > 1 or remote_info.remote_dcp_size > 1):
-                # DCP-active reads were already trimmed and realigned in
-                # _read_blocks_for_req at logical granularity.
-                local_block_ids, remote_block_ids = self._apply_prefix_caching(
-                    decode_block_ids=local_block_ids,
-                    prefill_block_ids=remote_block_ids,
-                    decode_physical_per_logical=(
-                        self._physical_blocks_per_logical_kv_block
-                    ),
-                    prefill_physical_per_logical=(
-                        remote_info.remote_physical_blocks_per_logical
-                    ),
-                )
 
         # NOTE (nicolo) With homogeneous TP, each TP worker loads KV from
         # corresponding rank. With heterogeneous TP, fixing D>P, the D tp

@@ -2269,6 +2269,7 @@ def test_get_kv_cache_config_balanced_mamba_hybrid():
     """Hybrid slot sharing: mamba layers co-own the MLA slot tensors."""
     model_config = ModelConfig(max_model_len=8192)
     vllm_config = VllmConfig(model_config=model_config)
+    vllm_config.cache_config.kv_cache_layout = "BLHNC"
 
     kv_cache_spec, mamba_layers = _glm5_like_kv_cache_spec()
     mla_page = kv_cache_spec["layers.3.attn"].page_size_bytes
@@ -2315,6 +2316,10 @@ def test_get_kv_cache_config_balanced_mamba_hybrid():
         vllm_config, groups, available_memory
     )
     assert kv_cache_config.num_blocks == 100
+    assert (
+        kv_cache_config.kv_cache_layout
+        == vllm_config.cache_config.get_resolved_kv_cache_layout().name
+    )
 
     # Every logical layer has a view into one backing allocation. Mamba views
     # alias their corresponding MLA slot by using the same byte offset.

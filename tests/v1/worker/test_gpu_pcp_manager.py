@@ -6,7 +6,8 @@ import numpy as np
 import pytest
 import torch
 
-from vllm.config.compilation import CUDAGraphMode
+from vllm.config import CUDAGraphMode
+from vllm.model_executor.layers.attention import pcp_direct_kv
 from vllm.v1.worker.gpu import pcp_manager as pcp_manager_module
 from vllm.v1.worker.gpu.pcp_manager import PCPManager
 
@@ -16,28 +17,6 @@ def _copy_to_cpu(value, out=None, device=None):
     if out is not None:
         return out.copy_(tensor)
     return tensor
-
-
-def test_validate_config_allows_dspark_with_pcp():
-    config = SimpleNamespace(
-        parallel_config=SimpleNamespace(
-            prefill_context_parallel_size=8,
-            decode_context_parallel_size=1,
-            pipeline_parallel_size=1,
-        ),
-        model_config=SimpleNamespace(
-            use_mla=True,
-            is_encoder_decoder=False,
-            hf_text_config=SimpleNamespace(index_topk=2048),
-        ),
-        speculative_config=SimpleNamespace(
-            method="dspark", enable_adaptive_verification=False
-        ),
-        compilation_config=SimpleNamespace(cudagraph_mode=CUDAGraphMode.PIECEWISE),
-        lora_config=None,
-    )
-
-    PCPManager.validate_config(config, supports_mm_inputs=False)
 
 
 def test_replicated_decode_piecewise_graph_padding(monkeypatch):
@@ -115,6 +94,25 @@ def test_num_tokens_for_dispatch_uses_largest_pcp_rank(
     assert actual == expected
 
 
+@pytest.mark.parametrize(
+    ("pcp_world_size", "num_tokens", "num_reqs", "expected"),
+    [
+        (4, 32768, 256, 8192),
+        (4, 8192, 256, 2048),
+        (4, 9, 1, 3),
+    ],
+)
+def test_max_num_tokens_for_profile_is_rank_local(
+    pcp_world_size, num_tokens, num_reqs, expected
+):
+    assert (
+        pcp_manager_module.get_max_num_tokens_for_profile(
+            num_tokens, num_reqs, pcp_world_size
+        )
+        == expected
+    )
+
+
 def test_graph_padding_cannot_be_smaller_than_largest_pcp_rank(monkeypatch):
     manager = PCPManager(
         pcp_world_size=2,
@@ -132,3 +130,271 @@ def test_graph_padding_cannot_be_smaller_than_largest_pcp_rank(monkeypatch):
             query_start_loc_np=np.arange(4, dtype=np.int32),
             padded_num_tokens=2,
         )
+
+
+def test_sparse_mla_pcp_accepts_piecewise_cudagraphs():
+    def make_config(cudagraph_mode: CUDAGraphMode):
+        return SimpleNamespace(
+            parallel_config=SimpleNamespace(
+                prefill_context_parallel_size=4,
+                pipeline_parallel_size=1,
+            ),
+            model_config=SimpleNamespace(
+                use_mla=True,
+                is_encoder_decoder=False,
+                hf_text_config=SimpleNamespace(index_topk=2048),
+            ),
+            lora_config=None,
+            speculative_config=None,
+            compilation_config=SimpleNamespace(cudagraph_mode=cudagraph_mode),
+        )
+
+    PCPManager.validate_config(
+        make_config(CUDAGraphMode.PIECEWISE), supports_mm_inputs=False
+    )
+
+    with pytest.raises(NotImplementedError, match="PIECEWISE CUDA graphs only"):
+        PCPManager.validate_config(
+            make_config(CUDAGraphMode.FULL), supports_mm_inputs=False
+        )
+
+
+def _make_dspark_pcp_config(*, pcp_size: int, dcp_size: int, tp_size: int = 1):
+    return SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=tp_size,
+            prefill_context_parallel_size=pcp_size,
+            decode_context_parallel_size=dcp_size,
+            pipeline_parallel_size=1,
+        ),
+        model_config=SimpleNamespace(
+            use_mla=True,
+            is_encoder_decoder=False,
+            hf_text_config=SimpleNamespace(index_topk=2048),
+        ),
+        lora_config=None,
+        speculative_config=SimpleNamespace(
+            method="dspark",
+            use_dspark=lambda: True,
+        ),
+        compilation_config=SimpleNamespace(cudagraph_mode=CUDAGraphMode.PIECEWISE),
+    )
+
+
+def test_dspark_pcp_rejects_matching_dcp_shards_without_direct_kv(monkeypatch):
+    # Historically (commit 8c008aabe) dcp == pcp was an escape hatch that let
+    # DSpark+PCP start without symmetric-memory peer KV.  enforce-clearly removed
+    # that hatch: every DSpark+PCP layout now requires VLLM_USE_PCP_DIRECT_KV=1
+    # so prefill context KV can be published to / read from every peer draft cache.
+    monkeypatch.setattr(pcp_manager_module.envs, "VLLM_USE_PCP_DIRECT_KV", False)
+
+    with pytest.raises(NotImplementedError, match="VLLM_USE_PCP_DIRECT_KV=1"):
+        PCPManager.validate_config(
+            _make_dspark_pcp_config(pcp_size=8, dcp_size=8),
+            supports_mm_inputs=False,
+        )
+
+
+@pytest.mark.parametrize(("dcp_size", "tp_size"), [(1, 1), (8, 2)])
+def test_dspark_pcp_other_topologies_still_require_direct_kv(
+    monkeypatch, dcp_size, tp_size
+):
+    monkeypatch.setattr(pcp_manager_module.envs, "VLLM_USE_PCP_DIRECT_KV", False)
+
+    with pytest.raises(NotImplementedError, match="VLLM_USE_PCP_DIRECT_KV=1"):
+        PCPManager.validate_config(
+            _make_dspark_pcp_config(
+                pcp_size=8,
+                dcp_size=dcp_size,
+                tp_size=tp_size,
+            ),
+            supports_mm_inputs=False,
+        )
+
+
+@pytest.mark.parametrize(
+    ("connector", "role", "allowed"),
+    [
+        ("NixlConnector", "kv_producer", True),
+        ("NixlConnector", "kv_consumer", False),
+        ("LMCacheConnectorV1", "kv_producer", False),
+    ],
+)
+def test_direct_pcp_kv_allows_nixl_producer_only(monkeypatch, connector, role, allowed):
+    monkeypatch.setattr(pcp_manager_module.current_platform, "is_cuda", lambda: True)
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=1,
+            prefill_context_parallel_size=8,
+            decode_context_parallel_size=8,
+            data_parallel_size=1,
+            use_ubatching=False,
+        ),
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(model_type="glm_moe_dsa"),
+            enable_sleep_mode=False,
+        ),
+        compilation_config=SimpleNamespace(static_forward_context={}),
+        scheduler_config=SimpleNamespace(async_scheduling=False),
+        cache_config=SimpleNamespace(cache_dtype="fp8", enable_prefix_caching=False),
+        kv_transfer_config=SimpleNamespace(kv_connector=connector, kv_role=role),
+    )
+
+    if allowed:
+        pcp_manager_module._validate_pcp_direct_kv_config(config)
+    else:
+        with pytest.raises(NotImplementedError, match="NixlConnector kv_producer"):
+            pcp_manager_module._validate_pcp_direct_kv_config(config)
+
+
+@pytest.mark.parametrize("dcp_world_size", [1, 4])
+def test_sparse_mla_pcp_rejects_mtp(dcp_world_size):
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=4,
+            decode_context_parallel_size=dcp_world_size,
+            pipeline_parallel_size=1,
+        ),
+        model_config=SimpleNamespace(
+            use_mla=True,
+            is_encoder_decoder=False,
+            hf_text_config=SimpleNamespace(index_topk=2048),
+        ),
+        lora_config=None,
+        speculative_config=SimpleNamespace(
+            method="mtp",
+            use_dspark=lambda: False,
+            enable_adaptive_verification=False,
+        ),
+        compilation_config=SimpleNamespace(cudagraph_mode=CUDAGraphMode.PIECEWISE),
+    )
+
+    with pytest.raises(NotImplementedError, match="supports dense MLA only"):
+        PCPManager.validate_config(config, supports_mm_inputs=False)
+
+
+@pytest.fixture
+def pcp_peer_kv_state_guard():
+    state = pcp_direct_kv._STATE
+    prev = (state.enabled, state.sharded)
+    try:
+        yield state
+    finally:
+        state.enabled, state.sharded = prev
+
+
+@pytest.mark.parametrize(
+    ("enabled", "sharded", "direct_active", "peer_active", "sharded_active"),
+    [
+        (False, False, False, False, False),  # peer cache off
+        (True, False, True, True, False),  # replicated-to-every-peer
+        (True, True, False, True, True),  # DCP-sharded peer views
+    ],
+)
+def test_pcp_peer_kv_predicates(
+    pcp_peer_kv_state_guard,
+    enabled,
+    sharded,
+    direct_active,
+    peer_active,
+    sharded_active,
+):
+    state = pcp_peer_kv_state_guard
+    state.enabled = enabled
+    state.sharded = sharded
+
+    # direct_kv = replicated-only; peer_kv = either layout; sharded = DCP only.
+    assert pcp_direct_kv.pcp_direct_kv_active() is direct_active
+    assert pcp_direct_kv.pcp_peer_kv_active() is peer_active
+    assert pcp_direct_kv.pcp_sharded_peer_kv_active() is sharded_active
+
+
+def test_pcp_manager_peer_kv_enabled_tracks_sharded_state(
+    pcp_peer_kv_state_guard, monkeypatch
+):
+    state = pcp_peer_kv_state_guard
+    manager = PCPManager(
+        pcp_world_size=4,
+        pcp_rank=0,
+        dcp_world_size=4,
+        device=torch.device("cpu"),
+    )
+    monkeypatch.setattr(manager, "_direct_kv_requested", True)
+
+    # Peer cache off: nothing active.
+    state.enabled = False
+    state.sharded = False
+    assert manager.peer_kv_enabled is False
+    assert manager.direct_kv_enabled is False
+
+    # DCP-sharded peer cache: peer_kv_enabled must be True even though
+    # direct_kv_enabled (replicated-only) is False.  This is the exact gate the
+    # DSpark context-KV precompute depends on under PCP-spanning DCP.
+    state.enabled = True
+    state.sharded = True
+    assert manager.peer_kv_enabled is True
+    assert manager.direct_kv_enabled is False
+
+    # Replicated peer cache: both are active.
+    state.sharded = False
+    assert manager.peer_kv_enabled is True
+    assert manager.direct_kv_enabled is True
+
+
+def test_gather_pcp_sharded_peer_cache_preconditions(pcp_peer_kv_state_guard):
+    state = pcp_peer_kv_state_guard
+    args = dict(
+        cache=torch.zeros(1, 1),
+        dst=torch.zeros(1, 1),
+        block_table=torch.zeros(1, 1, dtype=torch.int32),
+        cu_seq_lens=torch.zeros(2, dtype=torch.int32),
+        token_to_seq=torch.zeros(1, dtype=torch.int32),
+        seq_starts=torch.zeros(1, dtype=torch.int32),
+        num_tokens=1,
+        scale=torch.ones(1),
+        cache_block_size=16,
+        packed_ds_mla=False,
+    )
+
+    # Not in sharded-peer mode: reject before any peer load is attempted.
+    state.enabled = False
+    state.sharded = False
+    with pytest.raises(RuntimeError, match="not active"):
+        pcp_direct_kv.gather_pcp_sharded_peer_cache(**args)
+
+    # Sharded-peer mode but no peer pointers registered for this cache tensor.
+    state.enabled = True
+    state.sharded = True
+    with pytest.raises(RuntimeError, match="No PCP peer cache pointers"):
+        pcp_direct_kv.gather_pcp_sharded_peer_cache(**args)
+
+
+@pytest.mark.parametrize("dcp_world_size", [1, 4])
+def test_dspark_pcp_requires_direct_kv_env(monkeypatch, dcp_world_size):
+    monkeypatch.setenv("VLLM_USE_PCP_DIRECT_KV", "0")
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=4,
+            decode_context_parallel_size=dcp_world_size,
+            tensor_parallel_size=1,
+            pipeline_parallel_size=1,
+        ),
+        model_config=SimpleNamespace(
+            use_mla=True,
+            is_encoder_decoder=False,
+            hf_text_config=SimpleNamespace(index_topk=2048),
+        ),
+        lora_config=None,
+        speculative_config=SimpleNamespace(
+            method="dspark",
+            use_dspark=lambda: True,
+            enable_adaptive_verification=False,
+        ),
+        compilation_config=SimpleNamespace(cudagraph_mode=CUDAGraphMode.PIECEWISE),
+    )
+
+    # dcp == pcp (dcp_spans_pcp) used to be an escape hatch that let DSpark+PCP
+    # start without symmetric-memory peer KV; enforce-clearly now requires
+    # VLLM_USE_PCP_DIRECT_KV=1 for every DSpark+PCP layout.
+    with pytest.raises(NotImplementedError, match="VLLM_USE_PCP_DIRECT_KV=1"):
+        PCPManager.validate_config(config, supports_mm_inputs=False)

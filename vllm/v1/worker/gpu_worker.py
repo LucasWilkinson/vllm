@@ -43,6 +43,7 @@ from vllm.distributed.parallel_state import (
     Handle,
     checkpoint_prepare_distributed_state,
     checkpoint_restore_distributed_state,
+    get_pcp_group,
     get_pp_group,
     get_tp_group,
     resume_device_comms,
@@ -573,6 +574,7 @@ class Worker(WorkerBase):
         if (
             current_platform.is_cuda_alike()
             and self.vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+            and envs.VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS
         ):
             cudagraph_memory_estimate = self.model_runner.profile_cudagraph_memory()
 
@@ -698,6 +700,14 @@ class Worker(WorkerBase):
 
         pp_rank = get_pp_group().rank_in_group
         tp_rank = get_tp_group().rank_in_group
+        parallel_config = self.vllm_config.parallel_config
+        if (
+            parallel_config.prefill_context_parallel_size > 1
+            and parallel_config.decode_context_parallel_size > 1
+        ):
+            tp_rank += (
+                get_pcp_group().rank_in_group * parallel_config.tensor_parallel_size
+            )
         return {(pp_rank, tp_rank): metadata}
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
@@ -868,9 +878,27 @@ class Worker(WorkerBase):
 
             maybe_save_startup_plan(self, kv_cache_memory_bytes_to_requested_limit)
 
-        if self.use_v2_model_runner:
+        kv_transfer_config = self.vllm_config.kv_transfer_config
+        skip_v2_warmup = (
+            self.parallel_config.prefill_context_parallel_size > 1
+            and kv_transfer_config is not None
+            and kv_transfer_config.is_kv_producer
+        )
+        if self.use_v2_model_runner and not skip_v2_warmup:
             # V2: Run full execute_model + sample_tokens to JIT compile triton kernels.
             warmup_kernels(self.model_runner, self.execute_model, self.sample_tokens)
+            # Synthetic PCP direct-KV traffic must not leak its device epoch
+            # into the first scheduler-owned batch.
+            from vllm.model_executor.layers.attention.pcp_direct_kv import (
+                reset_pcp_peer_cache_fence,
+            )
+
+            reset_pcp_peer_cache_fence()
+        elif skip_v2_warmup:
+            # A disaggregated PCP prefiller never executes decode or sampling.
+            # The scheduler-realistic V2 warmup includes both and can deadlock
+            # PCP/DCP collectives before the producer starts serving.
+            logger.info("Skipping V2 decode/sampler warmup on PCP KV producer")
         elif get_pp_group().is_last_rank:
             # V1: Warm up sampler and preallocate memory buffer for logits and other
             # sampling related tensors of max possible shape to avoid memory
@@ -1453,6 +1481,13 @@ class Worker(WorkerBase):
             weight_transfer_engine.shutdown()
 
         self.elastic_ep_executor.shutdown()
+
+        # Drop SymmMem peer views before the runner releases KV tensors.
+        from vllm.model_executor.layers.attention.pcp_direct_kv import (
+            close_pcp_direct_kv,
+        )
+
+        close_pcp_direct_kv()
 
         # Release GPU resources held by the model runner so that memory
         # can be reclaimed when running in-process

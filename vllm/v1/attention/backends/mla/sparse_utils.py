@@ -407,6 +407,8 @@ def triton_convert_req_index_to_global_index(
     prefill_workspace_request_ids: torch.Tensor | None = None,
     prefill_workspace_starts: torch.Tensor | None = None,
     return_valid_counts: bool = False,
+    output: torch.Tensor | None = None,
+    valid_counts_out: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
     out[token_id, indice_id] =
@@ -429,6 +431,7 @@ def triton_convert_req_index_to_global_index(
 
     When return_valid_counts is True, also returns the count of valid (non -1)
     indices per row, computed during the same kernel pass (no extra overhead).
+    Callers may provide output and valid_counts_out to reuse existing buffers.
     """
     assert req_id.dtype == torch.int32
     assert block_table.dtype == torch.int32
@@ -458,20 +461,31 @@ def triton_convert_req_index_to_global_index(
     req_id_c = req_id.contiguous()
     block_table_c = block_table.contiguous()
     token_indices_c = token_indices.contiguous()
-    # When return_valid_counts, the kernel scatters valid entries to a
-    # contiguous prefix [0, valid_count) and leaves the tail unwritten, so
-    # pre-fill -1 there. flash_mla_sparse_fwd then bounds attention to
-    # [:topk_length] == exactly the valid set (no dropped tokens).
-    if return_valid_counts:
-        out = torch.full_like(token_indices_c, -1)
-    else:
+    if output is None:
         out = torch.empty_like(token_indices_c)
+    else:
+        assert output.shape == token_indices.shape
+        assert output.dtype == torch.int32
+        assert output.device == token_indices.device
+        out = output
 
     valid_counts: torch.Tensor | None = None
     if return_valid_counts:
         # Zero-init only matters for the atomic accumulation path.
-        alloc = torch.empty if single_tile else torch.zeros
-        valid_counts = alloc(num_tokens, dtype=torch.int32, device=token_indices.device)
+        if valid_counts_out is None:
+            alloc = torch.empty if single_tile else torch.zeros
+            valid_counts = alloc(
+                num_tokens, dtype=torch.int32, device=token_indices.device
+            )
+        else:
+            assert valid_counts_out.shape == (num_tokens,)
+            assert valid_counts_out.dtype == torch.int32
+            assert valid_counts_out.device == token_indices.device
+            valid_counts = valid_counts_out
+            if not single_tile:
+                valid_counts.zero_()
+    else:
+        assert valid_counts_out is None
 
     # Prepare prefill pointers
     if HAS_PREFILL_WORKSPACE:

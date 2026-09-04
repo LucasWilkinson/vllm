@@ -30,6 +30,7 @@ import torch
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.logger import init_logger
+from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 from vllm.v1.worker.gpu.spec_decode.dspark.utils import load_dspark_model
@@ -117,6 +118,41 @@ class DSparkSpeculator(DFlashSpeculator):
             )
         return model
 
+    @torch.inference_mode()
+    def precompute_pcp_context_kv(
+        self,
+        input_batch: InputBatch,
+        aux_hidden_states: list[torch.Tensor],
+        slot_mappings: dict[str, torch.Tensor],
+        retain_for_proposal: bool = True,
+    ) -> None:
+        """Build rank-local context KV and publish it to every PCP peer."""
+        if self._pcp_context_kv_precomputed:
+            raise RuntimeError("DSpark PCP context KV was already precomputed")
+        if not aux_hidden_states:
+            raise RuntimeError("DSpark PCP precompute requires auxiliary hidden states")
+
+        num_tokens = input_batch.num_tokens
+        layer_names = self.model.get_draft_kv_cache_layer_names()
+        missing = [name for name in layer_names if name not in slot_mappings]
+        if missing:
+            raise RuntimeError(
+                "Missing DSpark PCP slot mappings for: " + ", ".join(missing)
+            )
+        context_slot_mappings = [
+            slot_mappings[name][:num_tokens] for name in layer_names
+        ]
+        context_states = self.model.combine_hidden_states(
+            torch.cat(aux_hidden_states, dim=-1)
+        )
+        self.model.precompute_and_store_context_kv(
+            context_states[:num_tokens],
+            input_batch.positions[:num_tokens],
+            context_slot_mappings,
+            publish_to_pcp=True,
+        )
+        self._pcp_context_kv_precomputed = retain_for_proposal
+
     def _sample_logits(
         self,
         logits: torch.Tensor,
@@ -135,8 +171,8 @@ class DSparkSpeculator(DFlashSpeculator):
             buf.index_copy_(1, self._d2t_scatter_index, logits.to(buf.dtype))
             logits = buf
 
-        # sample_pos is the predicted token's position P. Sampling keys a draw
-        # by the position before the sampled token, P-1.
+        # sample_pos is the predicted token's position Q; the target verifies
+        # it with the predecessor's Gumbel key (Q-1). Pass Q-1.
         return gumbel_sample(
             logits,
             idx_map,

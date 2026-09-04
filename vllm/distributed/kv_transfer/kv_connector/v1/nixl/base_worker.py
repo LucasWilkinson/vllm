@@ -371,10 +371,7 @@ class NixlBaseConnectorWorker:
         splitting the local region. Hybrid MLA+SSM is different: its mapping
         contains multiple source ranks for the sharded SSM state.
         """
-        source_ranks_per_group = plan.source_ranks_per_group
-        if not isinstance(source_ranks_per_group, tuple):
-            return tp_ratio < 0 and (not self.use_mla or len(plan.all_source_ranks) > 1)
-        return tp_ratio < 0 and any(len(ranks) > 1 for ranks in source_ranks_per_group)
+        return tp_ratio < 0 and (not self.use_mla or len(plan.all_source_ranks) > 1)
 
     def _fa_desc_replicated(self, num_fa_descs: int) -> list[bool]:
         """Per-FA-descriptor replicate flag, in _build_fa_local emission order
@@ -594,9 +591,22 @@ class NixlBaseConnectorWorker:
         self.dcp_size = vllm_config.parallel_config.decode_context_parallel_size
         self.pcp_rank = get_pcp_group().rank_in_group if self.pcp_size > 1 else 0
 
+        # Replicated PCP exposes only its canonical rank. When DCP spans a TP1
+        # PCP group, however, every PCP rank owns a distinct sequence shard and
+        # must be addressable as a NIXL transfer rank.
+        self.pcp_dcp_sharded = self.pcp_size > 1 and self.dcp_size > 1
+        self.transfer_tp_size = (
+            self.world_size * self.pcp_size if self.pcp_dcp_sharded else self.world_size
+        )
+        self.transfer_tp_rank = (
+            self.pcp_rank * self.world_size + self.tp_rank
+            if self.pcp_dcp_sharded
+            else self.tp_rank
+        )
+
         # DCP support is scoped to MLA, with dcp_size in (1, tp_size): either fully
         # replicated or fully sharded. A DCP rank is always derivable this way.
-        self.dcp_rank = self.tp_rank % self.dcp_size
+        self.dcp_rank = self.transfer_tp_rank % self.dcp_size
         if self._has_mamba and self.dcp_size > 1:
             # Prefix-cache-aware DCP slicing isn't implemented for the Mamba group.
             raise ValueError("DCP is not supported for hybrid MLA+Mamba models.")
@@ -821,12 +831,22 @@ class NixlBaseConnectorWorker:
         local_dcp_size = self.dcp_size
         remote_pcp_size = agent_metadata.pcp_size
         remote_dcp_size = agent_metadata.dcp_size
-        if (local_pcp_size > 1 and remote_dcp_size > 1) or (
-            remote_pcp_size > 1 and local_dcp_size > 1
+        if local_pcp_size > 1 and local_dcp_size not in (1, local_pcp_size):
+            raise NotImplementedError(
+                "NixlConnector PCP+DCP requires DCP to span the full PCP group. "
+                f"Local PCP/DCP={local_pcp_size}/{local_dcp_size}; "
+                f"remote PCP/DCP={remote_pcp_size}/{remote_dcp_size}."
+            )
+        if remote_pcp_size > 1 and remote_dcp_size not in (1, remote_pcp_size):
+            raise NotImplementedError(
+                "Remote NixlConnector PCP+DCP does not span the full PCP group. "
+                f"Remote PCP/DCP={remote_pcp_size}/{remote_dcp_size}."
+            )
+        if (local_pcp_size > 1 and local_dcp_size == 1 and remote_dcp_size > 1) or (
+            remote_pcp_size > 1 and remote_dcp_size == 1 and local_dcp_size > 1
         ):
             raise NotImplementedError(
-                "NixlConnector PCP requires decode_context_parallel_size=1 "
-                "on both instances. "
+                "Replicated PCP cannot be paired with a DCP-sharded NIXL peer. "
                 f"Local PCP/DCP={local_pcp_size}/{local_dcp_size}; "
                 f"remote PCP/DCP={remote_pcp_size}/{remote_dcp_size}."
             )
@@ -1250,8 +1270,8 @@ class NixlBaseConnectorWorker:
         """Register the KV Cache data in nixl."""
 
         self.transfer_topo = TransferTopology(
-            tp_rank=self.tp_rank,
-            tp_size=self.world_size,
+            tp_rank=self.transfer_tp_rank,
+            tp_size=self.transfer_tp_size,
             block_size=self.block_size,
             engine_id=self.engine_id,
             is_mla=self.use_mla,
@@ -2053,6 +2073,13 @@ class NixlBaseConnectorWorker:
         )
         transfer_topo.register_remote_engine(engine_id, transfer_info)
         logger.info("Transfer plan: %s", transfer_topo.describe(engine_id))
+
+        self.tp_mappings[engine_id] = compute_tp_mapping(
+            transfer_topology=transfer_topo,
+            remote_tp_size=remote_tp_size,
+            group_spec_types=self._group_spec_types,
+            remote_dcp_size=remote_dcp_size,
+        )
 
         remote_agent_name = self.nixl_wrapper.add_remote_agent(
             nixl_agent_meta.agent_metadata
@@ -2989,60 +3016,6 @@ class NixlBaseConnectorWorker:
                     ).tolist()
                 )
         return physical_block_ids
-
-    @staticmethod
-    def _block_ids_by_region(
-        block_ids: BlockIds, region_group_ids: list[int]
-    ) -> BlockIds:
-        """Expand group block IDs into the corresponding region order."""
-        shared_block_ids = list(itertools.chain.from_iterable(block_ids))
-        block_ids_by_region = []
-        for group_id in region_group_ids:
-            if group_id == _SHARED_REGION_GROUP_ID:
-                block_ids_by_region.append(shared_block_ids.copy())
-                continue
-            block_ids_by_region.append(list(block_ids[group_id]))
-        return block_ids_by_region
-
-    @staticmethod
-    def _split_block_ids_by_region(
-        block_ids: BlockIds, split_ratios: list[int]
-    ) -> BlockIds:
-        assert len(block_ids) == len(split_ratios)
-        return [
-            (
-                BlockTable.map_to_kernel_blocks(
-                    np.asarray(region),
-                    ratio,
-                    np.arange(ratio).reshape(1, -1),
-                ).tolist()
-                if ratio > 1
-                else list(region)
-            )
-            for region, ratio in zip(block_ids, split_ratios, strict=True)
-        ]
-
-    @staticmethod
-    def _apply_prefix_caching_by_region(
-        decode_block_ids: BlockIds, prefill_block_ids: BlockIds
-    ) -> tuple[BlockIds, BlockIds]:
-        """Pair an uncached decode suffix with the same prefill regions."""
-        assert len(decode_block_ids) == len(prefill_block_ids)
-        if not any(decode_block_ids):
-            return [], prefill_block_ids
-
-        trimmed_prefill: list[list[int]] = []
-        for decode_region, prefill_region in zip(
-            decode_block_ids, prefill_block_ids, strict=True
-        ):
-            if len(decode_region) > len(prefill_region):
-                raise ValueError(
-                    "Decode allocated more KV pages than the prefill worker supplied"
-                )
-            trimmed_prefill.append(
-                list(prefill_region[-len(decode_region) :]) if decode_region else []
-            )
-        return decode_block_ids, trimmed_prefill
 
     def _apply_dcp_prefix_caching(
         self,

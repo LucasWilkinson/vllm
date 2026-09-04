@@ -554,6 +554,14 @@ class DeepseekV32IndexerMetadata:
     decode: DeepSeekV32IndexerDecodeMetadata | None = None
     prefill: DeepseekV32IndexerPrefillMetadata | None = None
 
+    # DCP spanning the PCP group (dcp == pcp): this metadata describes the
+    # *global* PCP batch (every rank's tokens, in global order) so that each
+    # rank's DCP top-k merge sees identical rows. The runner fills these in.
+    pcp_num_padded: int | None = None  # uniform per-rank row count
+    pcp_restore_idx: torch.Tensor | None = None  # global token -> gathered row
+    pcp_local_rows: torch.Tensor | None = None  # local token -> global row
+    pcp_gathered_slot_mapping: torch.Tensor | None = None  # rank-major, DCP-masked
+
 
 def compute_kpool_tail_slot_mapping(
     slot_mapping: torch.Tensor,
@@ -714,18 +722,13 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         parallel_config = self.vllm_config.parallel_config
         self.dcp_world_size = parallel_config.decode_context_parallel_size
         self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0
-        self.pcp_world_size = parallel_config.prefill_context_parallel_size
+        self.pcp_world_size = (
+            1
+            if self.vllm_config.attention_config.disable_pcp
+            else parallel_config.prefill_context_parallel_size
+        )
         self.use_pcp = self.pcp_world_size > 1
         self.cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size
-        # The DCP sparse-indexer code is parameterized by interleave size, but
-        # interleave > 1 is not yet validated end-to-end (gsm8k parity fails),
-        # so fail closed here rather than silently produce wrong output.
-        if self.dcp_world_size > 1 and self.cp_kv_cache_interleave_size > 1:
-            raise NotImplementedError(
-                "DCP sparse indexer currently supports only "
-                f"cp_kv_cache_interleave_size=1 (got "
-                f"{self.cp_kv_cache_interleave_size})."
-            )
         # NOTE(Chen):an estimated max size of flattened_kv. Need to double check.
         self.max_prefill_buffer_size = get_max_prefill_buffer_size(self.vllm_config)
         self.num_speculative_tokens = (
