@@ -28,12 +28,12 @@ def test_validate_config_allows_dspark_with_pcp():
         model_config=SimpleNamespace(
             use_mla=True,
             is_encoder_decoder=False,
-            hf_text_config=SimpleNamespace(),
+            hf_text_config=SimpleNamespace(index_topk=2048),
         ),
         speculative_config=SimpleNamespace(
             method="dspark", enable_adaptive_verification=False
         ),
-        compilation_config=SimpleNamespace(cudagraph_mode=CUDAGraphMode.NONE),
+        compilation_config=SimpleNamespace(cudagraph_mode=CUDAGraphMode.PIECEWISE),
         lora_config=None,
     )
 

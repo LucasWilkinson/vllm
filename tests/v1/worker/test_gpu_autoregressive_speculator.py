@@ -8,6 +8,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from vllm.config import ParallelConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.model_executor.models import supports_multimodal_embeddings
 from vllm.model_executor.models.exaone4_5_mtp import Exaone4_5_MTP
@@ -67,6 +68,19 @@ class _TextOnlyDraftModel(torch.nn.Module):
         is_multimodal=None,
     ):
         raise AssertionError("embed_input_ids should not be called during loading")
+
+
+def test_replicated_pcp_config_clone_omits_derived_fields():
+    config = ParallelConfig(prefill_context_parallel_size=8)
+
+    draft_config = base_spec_module.replace(
+        config,
+        prefill_context_parallel_size=1,
+    )
+
+    assert config.world_size == 8
+    assert draft_config.prefill_context_parallel_size == 1
+    assert draft_config.world_size == 1
 
 
 def _mock_base_model_load(monkeypatch):
