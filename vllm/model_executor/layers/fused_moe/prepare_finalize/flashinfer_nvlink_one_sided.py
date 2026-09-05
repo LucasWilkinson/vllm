@@ -13,10 +13,11 @@ from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
 from vllm.utils.flashinfer import nvfp4_block_scale_interleave
 
 
-def get_local_sizes():
+def get_local_sizes(local_num_tokens: int, world_size: int) -> list[int]:
     dp_metadata = get_forward_context().dp_metadata
-    assert dp_metadata is not None
-    return dp_metadata.get_chunk_sizes_across_dp_rank()
+    if dp_metadata is not None and dp_metadata.local_sizes is not None:
+        return dp_metadata.local_sizes
+    return [local_num_tokens] * world_size
 
 
 class FlashInferNVLinkOneSidedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
@@ -89,7 +90,9 @@ class FlashInferNVLinkOneSidedPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeMo
             )
             a1.mul_(topk_weights.to(a1.dtype))
 
-        global_num_tokens_cpu = get_local_sizes()
+        global_num_tokens_cpu = get_local_sizes(
+            a1.shape[0], self.all2all_manager.world_size
+        )
         self.runtime_max_tokens_per_rank = (
             max(global_num_tokens_cpu)
             if global_num_tokens_cpu is not None
