@@ -830,11 +830,6 @@ def _validate_pcp_direct_kv_config(vllm_config: VllmConfig) -> None:
         raise NotImplementedError(
             "Direct PCP KV requires --kv-cache-dtype fp8 or fp8_ds_mla."
         )
-    if cache_config.enable_prefix_caching:
-        raise NotImplementedError(
-            "Direct PCP KV does not support prefix caching or copy-on-write. "
-            "Set --no-enable-prefix-caching."
-        )
     if getattr(model_config, "enable_sleep_mode", False):
         raise NotImplementedError("Direct PCP KV does not support sleep mode.")
 
