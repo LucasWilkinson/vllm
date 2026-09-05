@@ -821,8 +821,6 @@ def _validate_pcp_direct_kv_config(vllm_config: VllmConfig) -> None:
         raise NotImplementedError(
             "Direct PCP KV does not support dual batch overlap or ubatching."
         )
-    if vllm_config.scheduler_config.async_scheduling:
-        raise NotImplementedError("Direct PCP KV does not support async scheduling.")
     if vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
         raise NotImplementedError(
             "Direct PCP KV currently requires eager execution. Set --enforce-eager."
@@ -836,11 +834,6 @@ def _validate_pcp_direct_kv_config(vllm_config: VllmConfig) -> None:
         raise NotImplementedError(
             "Direct PCP KV does not support prefix caching or copy-on-write. "
             "Set --no-enable-prefix-caching."
-        )
-    kv_transfer_config = vllm_config.kv_transfer_config
-    if kv_transfer_config is not None and kv_transfer_config.kv_connector is not None:
-        raise NotImplementedError(
-            "Direct PCP KV does not support KV connectors or offloading."
         )
     if getattr(model_config, "enable_sleep_mode", False):
         raise NotImplementedError("Direct PCP KV does not support sleep mode.")

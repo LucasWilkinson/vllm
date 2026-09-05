@@ -342,8 +342,8 @@ class DeepseekV32Attention(MLAAttention):
             mla_kv_cache = self.kv_cache
             mla_k_scale = self._k_scale
 
-        kv_c_out = torch.empty_like(kv_c) if collect_pcp else None
-        k_pe_out = torch.empty_like(k_pe) if collect_pcp else None
+        kv_c_out = torch.empty_like(kv_c)
+        k_pe_out = torch.empty_like(k_pe)
         mla_peer_ptrs = None
         indexer_peer_ptrs = None
         pcp_world_size = 1
