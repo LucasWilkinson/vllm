@@ -164,6 +164,23 @@ def test_pd_dcp_interleave_size_is_adjusted_to_block_size(
     assert "automatically adjusted from 3 to block_size 16" in caplog.text
 
 
+def test_nixl_allows_pcp_producer_config():
+    config = VllmConfig(
+        device_config=DeviceConfig(device="cpu"),
+        parallel_config=ParallelConfig(
+            tensor_parallel_size=1,
+            prefill_context_parallel_size=8,
+            distributed_executor_backend="mp",
+        ),
+        kv_transfer_config=KVTransferConfig(
+            kv_connector="NixlConnector",
+            kv_role="kv_producer",
+        ),
+    )
+
+    assert config.parallel_config.prefill_context_parallel_size == 8
+
+
 def test_kv_offloading_does_not_adjust_dcp_interleave_size():
     config = VllmConfig(
         cache_config=CacheConfig(block_size=16),

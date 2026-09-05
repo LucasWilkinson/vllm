@@ -1151,14 +1151,12 @@ class VllmConfig:
         self._verify_sampling_replay_config()
         self._verify_trace_replay_config()
 
-        # A NIXL side is either fully replicated or fully DCP-sharded; MLA only.
+        # A NIXL DCP side is either fully replicated or fully sharded; MLA only.
+        # PCP producer constraints are validated by NixlBaseConnector.
         if (
             self.kv_transfer_config is not None
             and self.kv_transfer_config.has_connector("NixlConnector")
         ):
-            assert self.parallel_config.prefill_context_parallel_size == 1, (
-                "NIXL does not support prefill context parallelism."
-            )
             dcp_size = self.parallel_config.decode_context_parallel_size
             tp_size = self.parallel_config.tensor_parallel_size
             assert dcp_size in (1, tp_size), (

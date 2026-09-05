@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
-from dataclasses import replace
 from typing import Any
 
 import numpy as np
@@ -11,6 +10,7 @@ import torch.nn as nn
 
 from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.config.compilation import CUDAGraphMode
+from vllm.config.utils import replace
 from vllm.distributed.eplb.eplb_state import EplbState
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -87,6 +87,21 @@ class BaseSpeculator(ABC):
 
 class DraftModelSpeculator(BaseSpeculator):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
+        # Under PCP the drafter runs replicated over the global batch on
+        # every rank, so its attention groups, forward context, and
+        # cudagraphs must not see PCP.
+        target_parallel_config = vllm_config.parallel_config
+        self.replicated_pcp = (
+            getattr(target_parallel_config, "prefill_context_parallel_size", 1) > 1
+        )
+        if self.replicated_pcp:
+            vllm_config = replace(
+                vllm_config,
+                parallel_config=replace(
+                    target_parallel_config,
+                    prefill_context_parallel_size=1,
+                ),
+            )
         self.vllm_config = vllm_config
         self.device = device
 

@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 import msgspec
 import numpy as np
+import regex as re
 import torch
 import zmq
 
@@ -92,6 +93,16 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+_SHARED_REGION_GROUP_ID = -1
+
+
+def _region_sort_key(layer_name: str) -> tuple[tuple[int, int | str], ...]:
+    """Sort transfer regions in model-layer order, then by cache name."""
+    return tuple(
+        (0, int(part)) if part.isdigit() else (1, part)
+        for part in re.split(r"(\d+)", layer_name)
+    )
+
 
 def _share_storage_and_block_stride(caches: list[torch.Tensor]) -> bool:
     """Return whether all views share storage and a block stride."""
@@ -154,6 +165,8 @@ class NixlBaseConnectorWorker:
         dst_num_blocks: int,
         block_size_ratio: float | None,
         physical_blocks_per_logical: int,
+        region_num_blocks: list[int] | None = None,
+        region_group_ids: list[int] | None = None,
     ) -> np.ndarray:
         """Compute NIXL descriptor IDs for given block IDs."""
         num_ssm_regions = 0
@@ -172,21 +185,44 @@ class NixlBaseConnectorWorker:
         num_blocks = dst_num_blocks
         if block_size_ratio is not None:
             num_blocks = int(num_blocks * block_size_ratio)
-        num_fa_descs = self.num_regions * num_blocks
+        if region_num_blocks is None:
+            region_num_blocks = [num_blocks] * self.num_regions
+        elif block_size_ratio is not None:
+            region_num_blocks = [
+                int(count * block_size_ratio) for count in region_num_blocks
+            ]
+        assert len(region_num_blocks) == self.num_regions
+        region_offsets = np.cumsum([0, *region_num_blocks[:-1]])
+        num_fa_descs = sum(region_num_blocks)
 
         # All-attention fast path: single vectorized broadcast.
         if num_ssm_regions == 0:
-            # NOTE (NickLucche) With HMA, every kv group has the same number of layers
-            # and layers from different groups share the same kv tensor.
-            # eg block_ids=[[1, 2], [3]]->blocks [1, 2] need to be
-            # read across all regions, same for [3], but group0-group1 blocks will
-            # always differ (different areas). Therefore we can just flatten the
-            # block_ids and compute the descs ids for all groups at once.
-            block_arr = np.concatenate(
-                [np.asarray(g, dtype=np.int32) for g in block_ids]
-            )[None, :]
-            region_ids = np.arange(self.num_regions, dtype=np.int32)[:, None]
-            return (region_ids * num_blocks + block_arr).ravel()
+            if region_group_ids is None:
+                region_group_ids = self.region_group_ids
+            assert len(region_group_ids) == self.num_regions
+            region_group_ids_array = np.asarray(region_group_ids)
+            region_num_blocks_array = np.asarray(region_num_blocks)
+            if np.unique(region_group_ids_array).size == 1:
+                block_arr = np.concatenate(block_ids)[None, :]
+                if block_arr.size and block_arr.max() >= region_num_blocks_array.min():
+                    raise IndexError("KV block ID exceeds its NIXL region capacity")
+                return (region_offsets[:, None] + block_arr).flatten()
+            desc_ids = []
+            for group_id, group in enumerate(block_ids):
+                if not group:
+                    continue
+                region_ids = np.flatnonzero(
+                    (region_group_ids_array == group_id)
+                    | (region_group_ids_array == _SHARED_REGION_GROUP_ID)
+                )[:, None]
+                assert region_ids.size > 0
+                group_blocks = np.asarray(group)[None, :]
+                if group_blocks.max() >= region_num_blocks_array[region_ids].min():
+                    raise IndexError("KV block ID exceeds its NIXL region capacity")
+                desc_ids.append((region_offsets[region_ids] + group_blocks).flatten())
+            if not desc_ids:
+                return np.array([], dtype=np.int64)
+            return np.concatenate(desc_ids)
 
         # Compute desc ids per group using the right stride: FA descs have
         # num_blocks entries per region (kernel granularity, expanded by
@@ -250,11 +286,6 @@ class NixlBaseConnectorWorker:
         FA uses rank_to_attention_slot for the slot offset;
         SSM uses the rank's positional index.
         """
-        fa_idx = next(
-            i for i, t in enumerate(self._group_spec_types) if _is_attention_spec(t)
-        )
-        fa_num_splits = len(plan.source_ranks_per_group[fa_idx])
-
         has_ssm_descs = num_fa_descs < len(src_blocks_data)
         ssm_idx = next(
             (i for i, t in enumerate(self._group_spec_types) if _is_ssm_spec(t)),
@@ -273,11 +304,40 @@ class NixlBaseConnectorWorker:
         )
         assert num_fa_descs <= sharded_desc_end
 
-        assert block_size_ratio == 1 or fa_num_splits == 1 or all(fa_desc_replicated), (
+        max_fa_splits = max(
+            (
+                len(plan.source_ranks_per_group[i])
+                for i, t in enumerate(self._group_spec_types)
+                if _is_attention_spec(t)
+            ),
+            default=1,
+        )
+        assert block_size_ratio == 1 or max_fa_splits == 1 or all(fa_desc_replicated), (
             "Head-sharded attention reads with P_TP > D_TP and heterogeneous "
             "block sizes are not supported"
         )
         src_blocks_list = src_blocks_data.tolist()
+
+        region_num_blocks = getattr(self, "region_num_blocks", None)
+        num_regions = self.num_regions or 1
+        if not region_num_blocks or sum(region_num_blocks) * block_size_ratio != (
+            num_fa_descs
+        ):
+            divisor = num_regions * block_size_ratio
+            assert num_fa_descs % divisor == 0
+            region_num_blocks = [num_fa_descs // divisor]
+            region_num_blocks *= num_regions
+        region_group_ids = getattr(self, "region_group_ids", None)
+        if not region_group_ids or len(region_group_ids) != num_regions:
+            fallback_group = next(
+                i for i, t in enumerate(self._group_spec_types) if _is_attention_spec(t)
+            )
+            region_group_ids = [fallback_group] * num_regions
+        desc_region_ids = np.repeat(
+            np.arange(num_regions),
+            np.asarray(region_num_blocks) * block_size_ratio,
+        )
+        assert len(desc_region_ids) == num_fa_descs
 
         for p_idx, p_rank in enumerate(plan.all_source_ranks):
             fa_slot = plan.rank_to_attention_slot.get(p_rank, 0)
@@ -290,6 +350,9 @@ class NixlBaseConnectorWorker:
                         handle.append((addr, local_len, dev))
                     else:
                         # SPLIT (full-attn): this rank's head slice.
+                        region_idx = int(desc_region_ids[j])
+                        group_idx = region_group_ids[region_idx]
+                        fa_num_splits = len(plan.source_ranks_per_group[group_idx])
                         chunk = local_len // fa_num_splits
                         handle.append((addr + fa_slot * chunk, chunk, dev))
                 elif j < sharded_desc_end:
@@ -308,7 +371,10 @@ class NixlBaseConnectorWorker:
         splitting the local region. Hybrid MLA+SSM is different: its mapping
         contains multiple source ranks for the sharded SSM state.
         """
-        return tp_ratio < 0 and (not self.use_mla or len(plan.all_source_ranks) > 1)
+        source_ranks_per_group = plan.source_ranks_per_group
+        if not isinstance(source_ranks_per_group, tuple):
+            return tp_ratio < 0 and (not self.use_mla or len(plan.all_source_ranks) > 1)
+        return tp_ratio < 0 and any(len(ranks) > 1 for ranks in source_ranks_per_group)
 
     def _fa_desc_replicated(self, num_fa_descs: int) -> list[bool]:
         """Per-FA-descriptor replicate flag, in _build_fa_local emission order
@@ -337,6 +403,51 @@ class NixlBaseConnectorWorker:
         block_len_per_layer without register_kv_caches).
         """
         return region_idx < len(self._region_is_mla) and self._region_is_mla[region_idx]
+
+    def _attention_group_num_splits(
+        self,
+        nixl_agent_meta: NixlAgentMetadata,
+        remote_tp_size: int,
+    ) -> tuple[int, ...]:
+        """Infer distinct remote shards for each attention transfer group."""
+        num_groups = len(self._group_spec_types)
+        splits = [1] * num_groups
+        if remote_tp_size <= self.world_size:
+            return tuple(splits)
+
+        max_splits = remote_tp_size // self.world_size
+        remote_group_ids = self.dst_region_group_ids[nixl_agent_meta.engine_id]
+        remote_block_sizes = self.dst_region_block_sizes[nixl_agent_meta.engine_id]
+        assert len(self.block_len_per_layer) == len(nixl_agent_meta.block_lens)
+        for i, local_len in enumerate(self.block_len_per_layer):
+            if self._is_region_replicated(i):
+                continue
+            group_id = self.region_group_ids[i]
+            if group_id == _SHARED_REGION_GROUP_ID:
+                continue
+            assert group_id == remote_group_ids[i]
+            numerator = local_len * remote_block_sizes[i]
+            denominator = nixl_agent_meta.block_lens[i] * self.region_block_sizes[i]
+            if numerator % denominator:
+                raise ValueError(
+                    "NIXL sharded region widths must be integer multiples: "
+                    f"region={i}, local={local_len}, "
+                    f"remote={nixl_agent_meta.block_lens[i]}"
+                )
+            region_splits = numerator // denominator
+            if not 1 <= region_splits <= max_splits:
+                raise ValueError(
+                    "NIXL sharded region split count exceeds the TP ratio: "
+                    f"region={i}, splits={region_splits}, max={max_splits}"
+                )
+            if splits[group_id] not in (1, region_splits):
+                raise ValueError(
+                    "NIXL regions in one transfer group disagree on sharding: "
+                    f"group={group_id}, splits={splits[group_id]} and "
+                    f"{region_splits}"
+                )
+            splits[group_id] = region_splits
+        return tuple(splits)
 
     def __init__(
         self,
@@ -556,6 +667,11 @@ class NixlBaseConnectorWorker:
         # Number of NIXL regions. Currently one region per cache
         # (so 1 per layer for MLA, otherwise 2 per layer)
         self.num_regions = 0
+        self.region_strides: list[int] = []
+        self.region_group_ids: list[int] = []
+        self.region_block_sizes: list[int] = []
+        self.region_names: list[str] = []
+        self.region_num_blocks: list[int] = []
 
         # PP>1 (push mode): this worker holds a contiguous layer slice and
         # transfers into the matching sub-range of a PP=1 remote's regions.
@@ -590,6 +706,10 @@ class NixlBaseConnectorWorker:
         # Map of engine_id -> num_blocks. All ranks in the same deployment will
         # have the same number of blocks.
         self.dst_num_blocks: dict[EngineId, int] = {}
+        self.dst_region_num_blocks: dict[EngineId, list[int]] = {}
+        self.dst_region_group_ids: dict[EngineId, list[int]] = {}
+        self.dst_region_block_sizes: dict[EngineId, list[int]] = {}
+        self.dst_region_split_ratios: dict[EngineId, list[int]] = {}
         self._registered_descs: list[Any] = []
 
         # In progress transfers.
@@ -598,6 +718,9 @@ class NixlBaseConnectorWorker:
         self._recving_transfers = defaultdict[ReqId, list[TransferHandle]](list)
         # Track the expiration time of requests that are waiting to be sent.
         self._reqs_to_send: dict[ReqId, float] = {}
+        # Replicated-KV PCP ranks > 0 never transfer; requests they are asked
+        # to send are reported finished immediately (see get_finished).
+        self._replicated_pcp_done_sending: set[ReqId] = set()
         # Set of requests that have been part of a batch, regardless of status.
         self._reqs_to_process: set[ReqId] = set()
 
@@ -1219,7 +1342,13 @@ class NixlBaseConnectorWorker:
         # K and V are packed into the content dim, so each attention layer is a
         # single NIXL region whose block transfers as one unit. Mamba layers instead
         # register separate conv/ssm sub-regions (see `_build_mamba_local`).
-        for layer_name, cache in xfer_buffers.items():
+        layer_names = (
+            xfer_buffers
+            if self._is_csa_linear
+            else sorted(xfer_buffers, key=_region_sort_key)
+        )
+        for layer_name in layer_names:
+            cache = xfer_buffers[layer_name]
             # NOTE (NickLucche) Hybrid SSM mamba/FA physical page_size may differ when
             # kernel requires a specific block size. This leads to SSM and FA layers
             # having different num_blocks.
@@ -1240,6 +1369,7 @@ class NixlBaseConnectorWorker:
                 else layer_spec.page_size_bytes
                 // self._physical_blocks_per_logical_kv_block
             )
+            group_id = self.kv_cache_config.transfer_group_index_by_layer[layer_name]
             num_blocks = (
                 self._logical_num_blocks
                 if isinstance(layer_spec, MambaSpec)
@@ -1366,12 +1496,28 @@ class NixlBaseConnectorWorker:
             for base_addr, block_len, block_stride in region_specs:
                 if base_addr in seen_base_addresses:
                     region_index = seen_base_addresses.index(base_addr)
-                    self._region_is_mla[region_index] |= is_mla_region
+                    if is_mla_region:
+                        # Dual-purpose HMA tensor: an MLA layer shares a region
+                        # that a non-MLA layer registered first. MLA is not
+                        # head-sharded, so the region must be flagged MLA.
+                        self._region_is_mla[region_index] = True
+                    if self.region_group_ids[region_index] != group_id:
+                        self.region_group_ids[region_index] = _SHARED_REGION_GROUP_ID
                 else:
                     region_index = len(seen_base_addresses)
                     seen_base_addresses.append(base_addr)
                     self.block_len_per_layer.append(block_len)
                     self.block_stride_per_layer.append(block_stride)
+                    self.region_strides.append(block_stride)
+                    self.region_group_ids.append(group_id)
+                    self.region_block_sizes.append(
+                        layer_spec.block_size
+                        if isinstance(layer_spec, MambaSpec)
+                        else layer_spec.block_size
+                        // self._physical_blocks_per_logical_kv_block
+                    )
+                    self.region_names.append(layer_name)
+                    self.region_num_blocks.append(num_blocks)
                     self._region_is_mla.append(is_mla_region)
 
                 if isinstance(layer_spec, MambaSpec):
@@ -1391,10 +1537,10 @@ class NixlBaseConnectorWorker:
             # caches are either [NB, PS] or [NB*r, PS/r] where r is bs/kbs.
             if (
                 self._physical_blocks_per_logical_kv_block == 1
-                and cache.shape[0] != num_blocks
+                and cache.shape[0] < num_blocks
             ):
                 raise AssertionError(
-                    "All kv cache tensors must have the same number of "
+                    "KV cache tensor has too few "
                     f"blocks; layer={layer_name}, "
                     f"expected_num_blocks={num_blocks}, "
                     f"cache_shape={tuple(cache.shape)}, "
@@ -1414,12 +1560,19 @@ class NixlBaseConnectorWorker:
             == len(seen_base_addresses)
             == len(self._region_is_mla)
             == len(self.block_stride_per_layer)
+            == len(self.region_strides)
+            == len(self.region_group_ids)
+            == len(self.region_block_sizes)
+            == len(self.region_names)
+            == len(self.region_num_blocks)
         )
         # Descriptor ids must be region-ordered, matching the remote side.
         self._scratch_region_indices.sort()
 
         self.kv_caches_base_addr[self.engine_id][self.tp_rank] = seen_base_addresses
         self.num_regions = len(seen_base_addresses)
+        if self._has_mamba:
+            self.region_num_blocks = [self.num_blocks] * self.num_regions
 
         if self.pp_size > 1:
             start_layer, end_layer = self.model_config.get_layers_start_end_indices(
@@ -1431,7 +1584,7 @@ class NixlBaseConnectorWorker:
             self._remote_region_offset = regions_per_layer * start_layer
 
         # Total local FA descriptors (boundary between FA and mamba descs).
-        self.num_descs = self.num_regions * self.num_blocks
+        self.num_descs = sum(self.region_num_blocks)
 
         descs = self.nixl_wrapper.get_reg_descs(caches_data, self.nixl_memory_type)
         logger.debug("Registering descs: %s", caches_data)
@@ -1441,6 +1594,10 @@ class NixlBaseConnectorWorker:
 
         self.device_kv_caches = kv_caches
         self.dst_num_blocks[self.engine_id] = self.num_blocks
+        self.dst_region_num_blocks[self.engine_id] = self.region_num_blocks
+        self.dst_region_group_ids[self.engine_id] = self.region_group_ids
+        self.dst_region_block_sizes[self.engine_id] = self.region_block_sizes
+        self.dst_region_split_ratios[self.engine_id] = [1] * self.num_regions
 
         if self._has_mamba:
             logger.info(
@@ -1479,6 +1636,11 @@ class NixlBaseConnectorWorker:
             physical_blocks_per_logical_kv_block=(
                 self._physical_blocks_per_logical_kv_block
             ),
+            region_strides=self.region_strides,
+            region_num_blocks=self.region_num_blocks,
+            region_group_ids=self.region_group_ids,
+            region_block_sizes=self.region_block_sizes,
+            region_names=self.region_names,
             dcp_size=self.dcp_size,
             pcp_size=self.pcp_size,
         )
@@ -1642,14 +1804,23 @@ class NixlBaseConnectorWorker:
         """Build local FA descriptors for all layers as an Nx3 uint64 array."""
         assert self.transfer_topo is not None
         assert base_addresses, "Local KV cache base addresses must not be empty."
-        num_blocks = self.num_blocks * block_size_ratio
         device_id = self.device_id
-        block_arange = np.arange(num_blocks, dtype=np.uint64)
         parts: list[np.ndarray] = []
         for i, base_addr in enumerate(base_addresses):
             block_len = self.block_len_per_layer[i] // block_size_ratio
-            block_stride = self.block_stride_per_layer[i] // block_size_ratio
-            addrs = base_addr + block_arange * block_stride
+            logical_blocks = np.repeat(
+                np.arange(self.region_num_blocks[i], dtype=np.uint64),
+                block_size_ratio,
+            )
+            split_offsets = np.tile(
+                np.arange(block_size_ratio, dtype=np.uint64),
+                self.region_num_blocks[i],
+            )
+            addrs = (
+                base_addr
+                + logical_blocks * self.region_strides[i]
+                + split_offsets * block_len
+            )
             parts.append(self._stack_descs(addrs, block_len, device_id))
         return np.concatenate(parts)
 
@@ -1658,24 +1829,58 @@ class NixlBaseConnectorWorker:
         plan: TPMapping,
         nixl_agent_meta: NixlAgentMetadata,
         block_size_ratio: int,
+        region_split_ratios: list[int] | None = None,
     ) -> np.ndarray:
         """Build remote FA descriptors for all layers as an Nx3 uint64 array."""
         assert self.transfer_topo is not None
         assert nixl_agent_meta.kv_caches_base_addr, (
             "Remote KV cache base addresses must not be empty."
         )
-        fa_group_idx = next(
-            i for i, t in enumerate(self._group_spec_types) if _is_attention_spec(t)
-        )
-        # SPLIT regions read their head slice from this many remote ranks at a
-        # per-rank offset; REPLICATE regions read the whole block once.
-        split_reads = len(plan.source_ranks_per_group[fa_group_idx])
-        num_blocks = nixl_agent_meta.num_blocks
+        region_num_blocks = nixl_agent_meta.region_num_blocks or [
+            nixl_agent_meta.num_blocks
+        ] * len(nixl_agent_meta.kv_caches_base_addr)
         device_id = nixl_agent_meta.device_id
-        block_arange = np.arange(num_blocks, dtype=np.uint64)
+        region_strides = nixl_agent_meta.region_strides or nixl_agent_meta.block_lens
         parts: list[np.ndarray] = []
+        region_group_ids = getattr(self, "region_group_ids", None)
+        if not region_group_ids or len(region_group_ids) != len(
+            nixl_agent_meta.kv_caches_base_addr
+        ):
+            fallback_group = next(
+                i for i, t in enumerate(self._group_spec_types) if _is_attention_spec(t)
+            )
+            region_group_ids = [fallback_group] * len(
+                nixl_agent_meta.kv_caches_base_addr
+            )
         for i, base_addr in enumerate(nixl_agent_meta.kv_caches_base_addr):
             replicated = self._is_region_replicated(i)
+            group_idx = region_group_ids[i]
+            split_reads = (
+                1
+                if replicated or group_idx == _SHARED_REGION_GROUP_ID
+                else len(plan.source_ranks_per_group[group_idx])
+            )
+            region_split_ratio = (
+                1 if not region_split_ratios else region_split_ratios[i]
+            )
+            if region_split_ratio > 1:
+                assert replicated and block_size_ratio == 1
+                block_len = nixl_agent_meta.block_lens[i] // region_split_ratio
+                logical_blocks = np.repeat(
+                    np.arange(region_num_blocks[i], dtype=np.uint64),
+                    region_split_ratio,
+                )
+                split_offsets = np.tile(
+                    np.arange(region_split_ratio, dtype=np.uint64),
+                    region_num_blocks[i],
+                )
+                addrs = (
+                    base_addr
+                    + logical_blocks * region_strides[i]
+                    + split_offsets * block_len
+                )
+                parts.append(self._stack_descs(addrs, block_len, device_id))
+                continue
             # Read our whole local region size from remote..
             local_block_len = self.block_len_per_layer[i]
             remote_kv_block_len = local_block_len // block_size_ratio
@@ -1691,8 +1896,8 @@ class NixlBaseConnectorWorker:
             )
             local_block_len = local_block_len // num_reads
 
-            page_size = nixl_agent_meta.block_strides[i]
-            addrs = base_addr + rank_offset + block_arange * page_size
+            block_arange = np.arange(region_num_blocks[i], dtype=np.uint64)
+            addrs = base_addr + rank_offset + block_arange * region_strides[i]
             parts.append(self._stack_descs(addrs, local_block_len, device_id))
         return np.concatenate(parts)
 
@@ -1817,6 +2022,24 @@ class NixlBaseConnectorWorker:
             ]
             nixl_agent_meta.block_lens = nixl_agent_meta.block_lens[start:end]
             nixl_agent_meta.block_strides = nixl_agent_meta.block_strides[start:end]
+            if nixl_agent_meta.region_strides is not None:
+                nixl_agent_meta.region_strides = nixl_agent_meta.region_strides[
+                    start:end
+                ]
+            if nixl_agent_meta.region_num_blocks is not None:
+                nixl_agent_meta.region_num_blocks = nixl_agent_meta.region_num_blocks[
+                    start:end
+                ]
+            if nixl_agent_meta.region_group_ids is not None:
+                nixl_agent_meta.region_group_ids = nixl_agent_meta.region_group_ids[
+                    start:end
+                ]
+            if nixl_agent_meta.region_block_sizes is not None:
+                nixl_agent_meta.region_block_sizes = nixl_agent_meta.region_block_sizes[
+                    start:end
+                ]
+            if nixl_agent_meta.region_names is not None:
+                nixl_agent_meta.region_names = nixl_agent_meta.region_names[start:end]
 
         ### Register remote engine in TransferTopology (idempotent).
         assert self.transfer_topo is not None
@@ -1834,13 +2057,6 @@ class NixlBaseConnectorWorker:
         transfer_topo.register_remote_engine(engine_id, transfer_info)
         logger.info("Transfer plan: %s", transfer_topo.describe(engine_id))
 
-        self.tp_mappings[engine_id] = compute_tp_mapping(
-            transfer_topology=transfer_topo,
-            remote_tp_size=remote_tp_size,
-            group_spec_types=self._group_spec_types,
-            remote_dcp_size=remote_dcp_size,
-        )
-
         remote_agent_name = self.nixl_wrapper.add_remote_agent(
             nixl_agent_meta.agent_metadata
         )
@@ -1855,7 +2071,75 @@ class NixlBaseConnectorWorker:
         block_size_ratio = transfer_topo.block_size_ratio(nixl_agent_meta.block_size)
 
         if engine_id not in self.dst_num_blocks:
+            num_remote_regions = len(nixl_agent_meta.kv_caches_base_addr)
             self.dst_num_blocks[engine_id] = nixl_agent_meta.num_blocks
+            self.dst_region_num_blocks[engine_id] = (
+                nixl_agent_meta.region_num_blocks
+                or [nixl_agent_meta.num_blocks] * num_remote_regions
+            )
+            self.dst_region_group_ids[engine_id] = nixl_agent_meta.region_group_ids or (
+                self.region_group_ids
+                if len(self.region_group_ids) == num_remote_regions
+                else [0] * num_remote_regions
+            )
+            remote_region_block_sizes = nixl_agent_meta.region_block_sizes or (
+                self.region_block_sizes
+                if len(self.region_block_sizes) == num_remote_regions
+                else [nixl_agent_meta.block_size] * num_remote_regions
+            )
+            self.dst_region_block_sizes[engine_id] = remote_region_block_sizes
+            local_region_block_sizes = (
+                self.region_block_sizes
+                if len(self.region_block_sizes) == num_remote_regions
+                else [self.block_size] * num_remote_regions
+            )
+            split_ratios = []
+            for local_size, remote_size in zip(
+                local_region_block_sizes,
+                remote_region_block_sizes,
+                strict=True,
+            ):
+                if remote_size % local_size == 0:
+                    split_ratios.append(remote_size // local_size)
+                    continue
+                if local_size % remote_size == 0:
+                    split_ratios.append(1)
+                    continue
+                raise ValueError(
+                    "NIXL region block sizes must be integer multiples: "
+                    f"local={local_size}, remote={remote_size}"
+                )
+            self.dst_region_split_ratios[engine_id] = split_ratios
+            self.dst_region_num_blocks[engine_id] = [
+                count * ratio
+                for count, ratio in zip(
+                    self.dst_region_num_blocks[engine_id],
+                    split_ratios,
+                    strict=True,
+                )
+            ]
+
+        has_mla_group = any(
+            issubclass(t, (MLAAttentionSpec, SlidingWindowMLASpec))
+            for t in self._group_spec_types
+        )
+        has_sharded_attention_group = any(
+            _is_attention_spec(t)
+            and not issubclass(t, (MLAAttentionSpec, SlidingWindowMLASpec))
+            for t in self._group_spec_types
+        ) or (has_mla_group and any(not is_mla for is_mla in self._region_is_mla))
+        attention_group_num_splits = (
+            self._attention_group_num_splits(nixl_agent_meta, remote_tp_size)
+            if has_mla_group and has_sharded_attention_group
+            else None
+        )
+        self.tp_mappings[engine_id] = compute_tp_mapping(
+            transfer_topology=transfer_topo,
+            remote_tp_size=remote_tp_size,
+            group_spec_types=self._group_spec_types,
+            remote_dcp_size=remote_dcp_size,
+            attention_group_num_splits=attention_group_num_splits,
+        )
 
         # Keep track of remote agent kv caches base addresses.
         self.kv_caches_base_addr[engine_id][remote_tp_rank] = (
@@ -1926,6 +2210,7 @@ class NixlBaseConnectorWorker:
             plan,
             nixl_agent_meta,
             block_size_ratio,
+            self.dst_region_split_ratios[engine_id],
         )
         logger.debug(
             "Created %s blocks for dst engine %s with remote rank %s and local rank %s",
@@ -2093,30 +2378,51 @@ class NixlBaseConnectorWorker:
             assert len(self.block_len_per_layer) == len(nixl_agent_meta.block_lens), (
                 "Number of KV layers must match between prefill and decode"
             )
-            model_replicated = self.use_mla or self.transfer_topo.is_kv_replicated(
-                remote_engine_id
-            )
+            plan = self.tp_mappings[remote_engine_id]
+            model_replicated = self.transfer_topo.is_kv_replicated(remote_engine_id)
             total_kv_heads = self.transfer_topo.total_num_kv_heads
             local_heads = self.transfer_topo.local_physical_heads
             remote_heads = max(1, total_kv_heads // remote_tp_size)
+            region_split_ratios = self.dst_region_split_ratios[remote_engine_id]
             for i, local_len in enumerate(self.block_len_per_layer):
-                replicated = model_replicated or self._is_region_replicated(i)
+                has_region_policy = i < len(self._region_is_mla)
+                replicated = (
+                    self._is_region_replicated(i)
+                    or (model_replicated and not self.use_mla)
+                    if has_region_policy
+                    else self.use_mla or model_replicated
+                )
                 remote_len = nixl_agent_meta.block_lens[i]
                 if replicated:
-                    assert local_len // block_size_ratio == remote_len, (
+                    assert (
+                        local_len * region_split_ratios[i] // block_size_ratio
+                        == remote_len
+                    ), (
                         "KV cache sizes must match between P and D when "
                         f"replicated (region {i}: local={local_len}, "
-                        f"remote={remote_len}, bsr={block_size_ratio})."
+                        f"remote={remote_len}, bsr={block_size_ratio}, "
+                        f"region_split={region_split_ratios[i]})."
+                    )
+                elif self.use_mla and tp_ratio < 0:
+                    group_id = self.region_group_ids[i]
+                    num_splits = len(plan.source_ranks_per_group[group_id])
+                    assert remote_len == local_len // num_splits, (
+                        f"SPLIT region {i}: remote P KV block_len {remote_len} "
+                        f"must equal local {local_len} // splits {num_splits}."
                     )
                 elif tp_ratio > 0:
-                    assert (
-                        remote_len
-                        == (local_len * remote_heads // local_heads) // block_size_ratio
-                    ), (
+                    expected_remote_len = (
+                        local_len * tp_ratio // block_size_ratio
+                        if self.use_mla and has_region_policy
+                        else (local_len * remote_heads // local_heads)
+                        // block_size_ratio
+                    )
+                    assert remote_len == expected_remote_len, (
                         f"SPLIT region {i}: remote P KV block_len {remote_len} "
-                        f"must equal local {local_len} * remote_heads "
-                        f"{remote_heads} // local_heads {local_heads} "
-                        f"// block_size_ratio {block_size_ratio}."
+                        f"must equal {expected_remote_len} for local block_len "
+                        f"{local_len}, tp_ratio {tp_ratio}, remote_heads "
+                        f"{remote_heads}, local_heads {local_heads}, and "
+                        f"block_size_ratio {block_size_ratio}."
                     )
                 else:
                     assert block_size_ratio == 1, (
@@ -2133,6 +2439,29 @@ class NixlBaseConnectorWorker:
         assert self.dst_num_blocks[remote_engine_id] == nixl_agent_meta.num_blocks
         # Same number of regions/~layers.
         assert len(nixl_agent_meta.kv_caches_base_addr) == len(self.block_len_per_layer)
+        num_remote_regions = len(nixl_agent_meta.kv_caches_base_addr)
+        if nixl_agent_meta.region_num_blocks is not None:
+            assert len(nixl_agent_meta.region_num_blocks) == num_remote_regions
+        if nixl_agent_meta.region_strides is not None:
+            assert len(nixl_agent_meta.region_strides) == num_remote_regions
+            assert all(
+                stride >= block_len
+                for stride, block_len in zip(
+                    nixl_agent_meta.region_strides,
+                    nixl_agent_meta.block_lens,
+                    strict=True,
+                )
+            )
+        if nixl_agent_meta.region_group_ids is not None:
+            assert len(nixl_agent_meta.region_group_ids) == num_remote_regions
+        if nixl_agent_meta.region_block_sizes is not None:
+            assert len(nixl_agent_meta.region_block_sizes) == num_remote_regions
+            assert all(size > 0 for size in nixl_agent_meta.region_block_sizes)
+        if nixl_agent_meta.region_names is not None:
+            assert nixl_agent_meta.region_names == self.region_names, (
+                "NIXL transfer regions must name the same model caches in the "
+                "same order"
+            )
 
     def sync_recved_kv_to_device(self, req_id: str, meta: ReqMeta):
         """copy recved kv from host buffer to device."""
@@ -2676,6 +3005,60 @@ class NixlBaseConnectorWorker:
                 )
         return physical_block_ids
 
+    @staticmethod
+    def _block_ids_by_region(
+        block_ids: BlockIds, region_group_ids: list[int]
+    ) -> BlockIds:
+        """Expand group block IDs into the corresponding region order."""
+        shared_block_ids = list(itertools.chain.from_iterable(block_ids))
+        block_ids_by_region = []
+        for group_id in region_group_ids:
+            if group_id == _SHARED_REGION_GROUP_ID:
+                block_ids_by_region.append(shared_block_ids.copy())
+                continue
+            block_ids_by_region.append(list(block_ids[group_id]))
+        return block_ids_by_region
+
+    @staticmethod
+    def _split_block_ids_by_region(
+        block_ids: BlockIds, split_ratios: list[int]
+    ) -> BlockIds:
+        assert len(block_ids) == len(split_ratios)
+        return [
+            (
+                BlockTable.map_to_kernel_blocks(
+                    np.asarray(region),
+                    ratio,
+                    np.arange(ratio).reshape(1, -1),
+                ).tolist()
+                if ratio > 1
+                else list(region)
+            )
+            for region, ratio in zip(block_ids, split_ratios, strict=True)
+        ]
+
+    @staticmethod
+    def _apply_prefix_caching_by_region(
+        decode_block_ids: BlockIds, prefill_block_ids: BlockIds
+    ) -> tuple[BlockIds, BlockIds]:
+        """Pair an uncached decode suffix with the same prefill regions."""
+        assert len(decode_block_ids) == len(prefill_block_ids)
+        if not any(decode_block_ids):
+            return [], prefill_block_ids
+
+        trimmed_prefill: list[list[int]] = []
+        for decode_region, prefill_region in zip(
+            decode_block_ids, prefill_block_ids, strict=True
+        ):
+            if len(decode_region) > len(prefill_region):
+                raise ValueError(
+                    "Decode allocated more KV pages than the prefill worker supplied"
+                )
+            trimmed_prefill.append(
+                list(prefill_region[-len(decode_region) :]) if decode_region else []
+            )
+        return decode_block_ids, trimmed_prefill
+
     def _apply_dcp_prefix_caching(
         self,
         local_ids: list[int],
@@ -2893,6 +3276,10 @@ class NixlBaseConnectorWorker:
 
         self.kv_caches_base_addr.pop(engine_id, None)
         self.dst_num_blocks.pop(engine_id, None)
+        self.dst_region_num_blocks.pop(engine_id, None)
+        self.dst_region_group_ids.pop(engine_id, None)
+        self.dst_region_block_sizes.pop(engine_id, None)
+        self.dst_region_split_ratios.pop(engine_id, None)
         self.tp_mappings.pop(engine_id, None)
         if self.transfer_topo is not None:
             self.transfer_topo.unregister_remote_engine(engine_id)

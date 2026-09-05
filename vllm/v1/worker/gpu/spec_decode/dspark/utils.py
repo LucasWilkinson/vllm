@@ -59,11 +59,15 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
             backend=draft_attention_backend,
         ),
         cache_config=(
+            # Preserve the target CacheConfig identity when the dtype is
+            # unchanged so the engine's resolved KV layout reaches the draft.
             replace(
                 vllm_config.cache_config,
                 cache_dtype=speculative_config.kv_cache_dtype,
             )
             if speculative_config.kv_cache_dtype is not None
+            and speculative_config.kv_cache_dtype
+            != vllm_config.cache_config.cache_dtype
             else vllm_config.cache_config
         ),
     )
