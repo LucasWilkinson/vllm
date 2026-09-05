@@ -128,6 +128,7 @@ def test_select_pcp_direct_slot_row_rejects_global_token_count():
 def run_fp8_ds_mla_indexer_oracle(
     group: dist.ProcessGroup | None = None,
     seed_offset: int = 0,
+    cow_prefix_tokens: int = 0,
 ) -> None:
     """Byte-exact fused peer stores vs gather+insert for production GLM layout.
 
@@ -164,6 +165,14 @@ def run_fp8_ds_mla_indexer_oracle(
     ].view(num_blocks, block_size, idx_entry)
     mla_view.zero_()
     idx_view.zero_()
+    if cow_prefix_tokens:
+        source_block, cow_block = 3, 11
+        mla_view[source_block].fill_(0x3C)
+        idx_view[source_block].fill_(0x5A)
+        mla_view[cow_block].copy_(mla_view[source_block])
+        idx_view[cow_block].copy_(idx_view[source_block])
+    initial_mla = mla_view.clone()
+    initial_idx = idx_view.clone()
     fence = PCPPeerCacheFence(group, device)
     q_w = torch.ones(q_dim, device=device, dtype=torch.bfloat16)
     kv_w = torch.ones(kv_dim, device=device, dtype=torch.bfloat16)
@@ -171,7 +180,12 @@ def run_fp8_ds_mla_indexer_oracle(
     idx_b = torch.zeros(idx_dim, device=device, dtype=torch.float32)
     cos_sin = torch.randn(8192, rope, device=device, dtype=torch.float32)
     torch.manual_seed(seed_offset + rank + 1)
-    slots = torch.arange(local, device=device, dtype=torch.int64) + rank * local
+    slot_offset = cow_block * block_size + cow_prefix_tokens if cow_prefix_tokens else 0
+    slots = (
+        torch.arange(local, device=device, dtype=torch.int64)
+        + rank * local
+        + slot_offset
+    )
     positions = torch.arange(local, device=device)
     q_c = torch.randn(local, q_dim, device=device, dtype=torch.bfloat16)
     kv_c = torch.randn(local, kv_dim, device=device, dtype=torch.bfloat16)
@@ -190,8 +204,8 @@ def run_fp8_ds_mla_indexer_oracle(
     dist.all_gather_into_tensor(g_ik, index_k.contiguous(), group=group)
     dist.all_gather_into_tensor(g_pos, positions.contiguous(), group=group)
     dist.all_gather_into_tensor(g_slots, slots.contiguous(), group=group)
-    ref_mla = torch.zeros_like(mla_view)
-    ref_idx = torch.zeros_like(idx_view)
+    ref_mla = initial_mla.clone()
+    ref_idx = initial_idx.clone()
     fused_norm_rope(
         g_pos,
         g_q,
@@ -215,8 +229,8 @@ def run_fp8_ds_mla_indexer_oracle(
         has_indexer=True,
         index_rope_interleave=True,
     )
-    mla_view.zero_()
-    idx_view.zero_()
+    mla_view.copy_(initial_mla)
+    idx_view.copy_(initial_idx)
     dist.barrier(group=group)
     fused_norm_rope(
         positions,
@@ -248,6 +262,17 @@ def run_fp8_ds_mla_indexer_oracle(
     torch.cuda.synchronize()
     assert torch.equal(mla_view, ref_mla)
     assert torch.equal(idx_view, ref_idx)
+    if cow_prefix_tokens:
+        assert torch.equal(mla_view[source_block], initial_mla[source_block])
+        assert torch.equal(idx_view[source_block], initial_idx[source_block])
+        assert torch.equal(
+            mla_view[cow_block, :cow_prefix_tokens],
+            mla_view[source_block, :cow_prefix_tokens],
+        )
+        # The Indexer scale plane is not token-major in this raw byte view.
+        # The full-buffer equality above proves its direct writes match the
+        # gather+insert reference; the source-block assertion proves COW did
+        # not mutate the shared prefix.
     expected_guard = torch.full(
         (layer_offset,), guard, dtype=torch.uint8, device=device
     )
@@ -265,6 +290,17 @@ def _worker_fused_direct_matches_gather_insert(env: dict[str, str]) -> None:
         backend="nccl", rank=rank, world_size=int(env["WORLD_SIZE"])
     )
     run_fp8_ds_mla_indexer_oracle()
+    dist.destroy_process_group()
+
+
+def _worker_fused_direct_preserves_cow_prefix(env: dict[str, str]) -> None:
+    update_environment_variables(env)
+    rank = int(env["RANK"])
+    torch.cuda.set_device(rank)
+    dist.init_process_group(
+        backend="nccl", rank=rank, world_size=int(env["WORLD_SIZE"])
+    )
+    run_fp8_ds_mla_indexer_oracle(cow_prefix_tokens=17)
     dist.destroy_process_group()
 
 
@@ -315,6 +351,11 @@ def _worker_fused_direct_tp2_pcp2(env: dict[str, str]) -> None:
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2+ GPUs")
 def test_fused_direct_fp8_ds_mla_indexer_pcp2():
     _distributed_run(_worker_fused_direct_matches_gather_insert, world_size=2)
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2+ GPUs")
+def test_fused_direct_fp8_ds_mla_indexer_preserves_cow_prefix():
+    _distributed_run(_worker_fused_direct_preserves_cow_prefix, world_size=2)
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 4, reason="needs 4 GPUs")

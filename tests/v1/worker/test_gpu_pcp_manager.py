@@ -40,6 +40,31 @@ def test_validate_config_allows_dspark_with_pcp():
     PCPManager.validate_config(config, supports_mm_inputs=False)
 
 
+def test_validate_direct_kv_allows_prefix_caching(monkeypatch):
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=1,
+            data_parallel_size=1,
+            use_ubatching=False,
+        ),
+        model_config=SimpleNamespace(
+            hf_text_config=SimpleNamespace(model_type="glm_moe_dsa"),
+            enable_sleep_mode=False,
+        ),
+        compilation_config=SimpleNamespace(
+            static_forward_context={},
+            cudagraph_mode=CUDAGraphMode.NONE,
+        ),
+        cache_config=SimpleNamespace(
+            cache_dtype="fp8",
+            enable_prefix_caching=True,
+        ),
+    )
+    monkeypatch.setattr(pcp_manager_module.current_platform, "is_cuda", lambda: True)
+
+    pcp_manager_module._validate_pcp_direct_kv_config(config)
+
+
 def test_replicated_decode_piecewise_graph_padding(monkeypatch):
     manager = PCPManager(
         pcp_world_size=2,
