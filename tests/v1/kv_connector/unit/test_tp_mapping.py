@@ -22,7 +22,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.worker import (
     NixlConnectorWorker,
 )
-from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    MambaSpec,
+    MLAAttentionSpec,
+)
 
 # ======================================================================
 # Test fixtures / helpers
@@ -38,6 +42,7 @@ def _compute_mapping(
     group_spec_types: tuple[type, ...] = (FullAttentionSpec,),
     dcp_size: int = 1,
     remote_dcp_size: int = 1,
+    attention_group_num_splits: tuple[int, ...] | None = None,
 ) -> TPMapping:
     transfer_topology = object.__new__(TransferTopology)
     transfer_topology.tp_rank = tp_rank
@@ -50,6 +55,7 @@ def _compute_mapping(
         remote_tp_size=remote_tp_size,
         group_spec_types=group_spec_types,
         remote_dcp_size=remote_dcp_size,
+        attention_group_num_splits=attention_group_num_splits,
     )
 
 
@@ -70,6 +76,49 @@ class TestTPMappingStructure:
     def test_source_ranks_p_gt_d(self):
         m = _compute_mapping(tp_size=1, tp_rank=0, remote_tp_size=2)
         assert m.all_source_ranks == (0, 1)
+
+    def test_mla_verifier_with_sharded_draft_p_gt_d(self):
+        mapping = _compute_mapping(
+            tp_size=1,
+            remote_tp_size=4,
+            is_mla=True,
+            num_kv_heads=1,
+            group_spec_types=(MLAAttentionSpec, FullAttentionSpec),
+            attention_group_num_splits=(1, 4),
+        )
+
+        assert mapping.source_ranks_per_group == ((0,), (0, 1, 2, 3))
+        assert mapping.all_source_ranks == (0, 1, 2, 3)
+        assert mapping.rank_to_attention_slot == {0: 0, 1: 1, 2: 2, 3: 3}
+
+    @pytest.mark.parametrize("tp_rank", range(4))
+    def test_mla_verifier_with_sharded_draft_d_gt_p(self, tp_rank):
+        mapping = _compute_mapping(
+            tp_rank=tp_rank,
+            tp_size=4,
+            remote_tp_size=1,
+            is_mla=True,
+            num_kv_heads=1,
+            group_spec_types=(MLAAttentionSpec, FullAttentionSpec),
+            attention_group_num_splits=(1, 1),
+        )
+
+        assert mapping.source_ranks_per_group == ((0,), (0,))
+        assert mapping.rank_offset_factor == tp_rank
+
+    @pytest.mark.parametrize("tp_rank", range(4))
+    def test_merged_mla_draft_group_d_gt_p(self, tp_rank):
+        mapping = _compute_mapping(
+            tp_rank=tp_rank,
+            tp_size=4,
+            remote_tp_size=1,
+            is_mla=True,
+            num_kv_heads=1,
+            group_spec_types=(MLAAttentionSpec,),
+            attention_group_num_splits=(1,),
+        )
+
+        assert mapping.rank_offset_factor == tp_rank
 
 
 @pytest.mark.parametrize(
@@ -189,6 +238,83 @@ class TestBuildSrcSplitHandles:
             assert len(handle) == len(src_blocks_data)
             for _, length, _ in handle:
                 assert length == 1024 // remote_tp_size
+
+    def test_mla_and_draft_regions_use_different_split_factors(self):
+        plan = _compute_mapping(
+            tp_size=1,
+            remote_tp_size=4,
+            is_mla=True,
+            num_kv_heads=1,
+            group_spec_types=(MLAAttentionSpec, FullAttentionSpec),
+            attention_group_num_splits=(1, 4),
+        )
+        worker = _make_mock_worker_for_splits((MLAAttentionSpec, FullAttentionSpec))
+        worker.num_regions = 2
+        worker.region_num_blocks = [1, 1]
+        worker.region_group_ids = [0, 1]
+        worker.block_len_per_layer = [100, 400]
+        worker._region_is_mla = [True, False]
+        src_blocks_data = np.array(
+            [(0x1000, 100, 0), (0x2000, 400, 0)], dtype=np.uint64
+        )
+
+        splits = list(worker._build_local_splits_from_plan(plan, src_blocks_data, 2))
+
+        assert [split[0] for split in splits] == [(0x1000, 100, 0)] * 4
+        assert [split[1] for split in splits] == [
+            (0x2000, 100, 0),
+            (0x2064, 100, 0),
+            (0x20C8, 100, 0),
+            (0x212C, 100, 0),
+        ]
+
+    def test_mla_and_draft_split_factors_are_inferred_from_region_widths(self):
+        worker = _make_mock_worker_for_splits((MLAAttentionSpec, FullAttentionSpec))
+        worker.world_size = 1
+        worker.block_len_per_layer = [100, 400]
+        worker.region_block_sizes = [128, 128]
+        worker.region_group_ids = [0, 1]
+        worker._region_is_mla = [True, False]
+        worker.dst_region_group_ids = {"prefill": [0, 1]}
+        worker.dst_region_block_sizes = {"prefill": [128, 128]}
+        remote = SimpleNamespace(
+            engine_id="prefill",
+            block_lens=[100, 100],
+        )
+
+        assert worker._attention_group_num_splits(remote, 4) == (1, 4)
+
+    def test_mla_and_draft_d_gt_p_reads_ranked_draft_slice(self):
+        plan = _compute_mapping(
+            tp_rank=3,
+            tp_size=4,
+            remote_tp_size=1,
+            is_mla=True,
+            num_kv_heads=1,
+            group_spec_types=(MLAAttentionSpec, FullAttentionSpec),
+            attention_group_num_splits=(1, 1),
+        )
+        worker = _make_mock_worker_for_splits((MLAAttentionSpec, FullAttentionSpec))
+        worker.device_id = 0
+        worker.block_len_per_layer = [100, 100]
+        worker.region_num_blocks = [1, 1]
+        worker.region_group_ids = [0, 1]
+        worker._region_is_mla = [True, False]
+        remote = SimpleNamespace(
+            kv_caches_base_addr=[0x1000, 0x2000],
+            device_id=0,
+            region_num_blocks=[1, 1],
+            num_blocks=1,
+            region_strides=[100, 400],
+            block_lens=[100, 400],
+        )
+
+        descriptors = worker._build_fa_remote(plan, remote, block_size_ratio=1)
+
+        assert descriptors.tolist() == [
+            [0x1000, 100, 0],
+            [0x2000 + 300, 100, 0],
+        ]
 
 
 class TestMambaPlanSplitHandles:
