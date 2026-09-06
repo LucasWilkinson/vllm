@@ -432,6 +432,11 @@ class NixlBaseConnectorWorker:
             for group in kv_cache_config.kv_cache_groups
             for layer in group.layer_names
         }
+        self._group_index_by_layer = {
+            layer: group_id
+            for group_id, group in enumerate(kv_cache_config.kv_cache_groups)
+            for layer in group.layer_names
+        }
 
         # ---- Model state (derived from model config) ----
         mamba_ssm_size = (0, 0)
@@ -1238,7 +1243,7 @@ class NixlBaseConnectorWorker:
                 else layer_spec.page_size_bytes
                 // self._physical_blocks_per_logical_kv_block
             )
-            group_id = self.kv_cache_config.transfer_group_index_by_layer[layer_name]
+            group_id = self._group_index_by_layer[layer_name]
             num_blocks = (
                 self._logical_num_blocks
                 if isinstance(layer_spec, MambaSpec)
