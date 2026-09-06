@@ -15,6 +15,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.models import supports_multimodal_embeddings
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.v1.attention.backends.utils import record_kv_cache_layout
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.attn_utils import (
     build_attn_metadata,
@@ -251,6 +252,12 @@ class DraftModelSpeculator(BaseSpeculator):
     ) -> None:
         self.model_state = model_state
         self.kv_cache_config = kv_cache_config
+        if kv_cache_config.kv_cache_layout is not None:
+            # The engine resolves layout after the draft-local CacheConfig copy
+            # is created. Mirror the physical layout into the draft config.
+            record_kv_cache_layout(
+                self.vllm_config.cache_config, kv_cache_config.kv_cache_layout
+            )
         self.attn_groups, self.attn_cg_support, _ = init_attn_backend(
             kv_cache_config,
             self.attn_vllm_config,
