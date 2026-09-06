@@ -254,10 +254,19 @@ class DraftModelSpeculator(BaseSpeculator):
         self.kv_cache_config = kv_cache_config
         if kv_cache_config.kv_cache_layout is not None:
             # The engine resolves layout after the draft-local CacheConfig copy
-            # is created. Mirror the physical layout into the draft config.
+            # and draft Attention implementations are created. Mirror the
+            # physical layout into both retained configurations before capture.
             record_kv_cache_layout(
                 self.vllm_config.cache_config, kv_cache_config.kv_cache_layout
             )
+            static_layers = self.vllm_config.compilation_config.static_forward_context
+            for layer_name in self.draft_attn_layer_names:
+                layer = static_layers[layer_name]
+                impl_cache_config = getattr(layer.impl, "cache_config", None)
+                if impl_cache_config is not None:
+                    record_kv_cache_layout(
+                        impl_cache_config, kv_cache_config.kv_cache_layout
+                    )
         self.attn_groups, self.attn_cg_support, _ = init_attn_backend(
             kv_cache_config,
             self.attn_vllm_config,
