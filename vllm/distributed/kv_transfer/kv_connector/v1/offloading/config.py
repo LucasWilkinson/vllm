@@ -4,11 +4,13 @@
 
 from typing import TYPE_CHECKING
 
+import vllm.envs as envs
 from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     FullAttentionSpec,
     MLAAttentionSpec,
+    UniformTypeKVCacheSpecs,
 )
 from vllm.v1.kv_offload.config import (
     OffloadingCacheConfig,
@@ -102,7 +104,7 @@ def build_offloading_config(
         if len(kv_cache_config.kv_cache_groups) == 1
         else None
     )
-    replicated_layout = (
+    tp_replicated_layout = (
         vllm_config.model_config.use_mla
         # Exact type: fail closed on wrappers and sliding-window variants.
         and type(single_group_spec) is MLAAttentionSpec
@@ -121,6 +123,37 @@ def build_offloading_config(
         and parallel_config.distributed_executor_backend == "mp"
         and parallel_config.nnodes_within_dp == 1
     )
+    # PCP direct-KV publishes every attention cache row into every PCP rank's
+    # symmetric-memory allocation.  With DCP=1 those allocations are complete,
+    # byte-identical replicas, including mixed target + draft attention groups.
+    # Store one shared host copy and load it into every rank; otherwise native
+    # offload silently spends PCP_SIZE times the requested capacity and begins
+    # thrashing as soon as the active prefixes exceed that reduced capacity.
+    pcp_direct_replicated_layout = (
+        envs.VLLM_USE_PCP_DIRECT_KV
+        and worker_kv_bytes_per_block > 0
+        and bool(kv_cache_config.kv_cache_groups)
+        and all(
+            (
+                all(
+                    isinstance(spec, AttentionSpec)
+                    for spec in group.kv_cache_spec.kv_cache_specs.values()
+                )
+                if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+                else isinstance(group.kv_cache_spec, AttentionSpec)
+            )
+            for group in kv_cache_config.kv_cache_groups
+        )
+        and parallel_config.tensor_parallel_size == 1
+        and parallel_config.pipeline_parallel_size == 1
+        and parallel_config.prefill_context_parallel_size > 1
+        and parallel_config.decode_context_parallel_size == 1
+        and parallel_config.data_parallel_size == 1
+        and parallel_config.world_size == parallel_config.prefill_context_parallel_size
+        and parallel_config.distributed_executor_backend == "mp"
+        and parallel_config.nnodes_within_dp == 1
+    )
+    replicated_layout = tp_replicated_layout or pcp_direct_replicated_layout
 
     canonical_layout = bool(extra_config.get("canonical_layout", False))
 
