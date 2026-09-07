@@ -621,6 +621,15 @@ class DFlashQwen3Model(nn.Module):
         hd = self._head_dim
         nkv = self._num_kv_heads
 
+        if num_ctx == 0 and context_slot_mapping is not None:
+            # A PCP rank can own zero prompt tokens (the FlashMLA sparse
+            # builder does not pad the PCP shard, unlike FlashInfer's). There
+            # is nothing to project or store, but the peer-KV publication is
+            # a group-wide epoch handshake that every rank must still join.
+            if publish_to_pcp:
+                self._join_pcp_publication()
+            return
+
         all_k, all_v = self._project_context_kv(context_states, num_ctx, L, nkv, hd)
         all_k_normed = self._normalize_context_k(all_k)
 
@@ -705,6 +714,25 @@ class DFlashQwen3Model(nn.Module):
                 )
 
                 publish_pcp_sharded_peer_kv()
+
+    @staticmethod
+    def _join_pcp_publication() -> None:
+        from vllm.model_executor.layers.attention.pcp_direct_kv import (
+            pcp_direct_kv_active,
+            pcp_sharded_peer_kv_active,
+            publish_pcp_direct_kv,
+            publish_pcp_sharded_peer_kv,
+        )
+
+        if pcp_direct_kv_active():
+            publish_pcp_direct_kv()
+        elif pcp_sharded_peer_kv_active():
+            publish_pcp_sharded_peer_kv()
+        else:
+            raise RuntimeError(
+                "DFlash PCP publication requested without an active PCP peer "
+                "KV cache"
+            )
 
     def forward(
         self,
