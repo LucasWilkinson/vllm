@@ -1537,6 +1537,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.lora_config, self.lora_state, req_ids, dummy_run
             )
 
+        # PCP PIECEWISE graphs do not yet preserve correctness for speculative
+        # multi-token target verification batches. This leaves prefill graph
+        # execution enabled while the replicated verification forward runs eager.
+        pcp_spec_decode = self.pcp_manager is not None and bool(
+            scheduler_output.scheduled_spec_decode_tokens
+        )
         skip_compiled = False
         if self.is_encoder_decoder and scheduler_output.scheduled_encoder_inputs:
             # Encoder-decoder models such as Whisper should run eager/non-compiled
@@ -1552,7 +1558,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.dp_size,
             self.dp_rank,
             max_query_len=max_query_len,
-            need_eager=is_profile or skip_compiled,
+            need_eager=is_profile or skip_compiled or pcp_spec_decode,
             num_active_loras=num_active_loras,
         )
 
@@ -1826,10 +1832,38 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             output = ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
             return ModelRunnerOutput.with_ec_conn_output(output, ec_connector_output)
 
+        # Pure prefill retains PCP-local target auxiliary states and slot mappings.
+        # Project only this rank's shard, then publish those physical draft-cache
+        # rows to every PCP peer. Mixed/decode batches use the restored full-context
+        # fallback because rejected speculative suffixes must be filtered first.
+        if (
+            self.pcp_manager is not None
+            and self.speculator is not None
+            and aux_hidden_states is not None
+            and slot_mappings_by_layer is not None
+            and input_batch.has_prefill
+            and input_batch.is_prefilling_np.all()
+            and hasattr(self.speculator, "precompute_pcp_context_kv")
+        ):
+            with use_workspace_lane(self._draft_workspace_lane):
+                self.speculator.precompute_pcp_context_kv(
+                    input_batch,
+                    aux_hidden_states,
+                    slot_mappings_by_layer,
+                )
+            aux_hidden_states = None
+
         # Last rank: sample tokens
         hidden_states, input_batch = pcp.maybe_restore_pcp_for_sampling(
             self.pcp_manager, hidden_states, input_batch
         )
+        if self.pcp_manager is not None and aux_hidden_states is not None:
+            # Draft attention is replicated. Preserve existing DSpark semantics
+            # for mixed/decode batches by restoring its target auxiliary states.
+            aux_hidden_states = [
+                self.pcp_manager.restore_hidden_states(states)
+                for states in aux_hidden_states
+            ]
 
         sampler_output, num_sampled, num_rejected = self.sample(
             hidden_states, input_batch, grammar_output
