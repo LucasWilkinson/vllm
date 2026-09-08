@@ -6,7 +6,7 @@ from dataclasses import dataclass, replace
 import numpy as np
 import torch
 
-from vllm.config import CUDAGraphMode, VllmConfig
+from vllm.config import VllmConfig
 from vllm.distributed.parallel_state import get_dcp_group, get_pcp_group
 from vllm.logger import init_logger
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
@@ -145,18 +145,10 @@ class PCPManager:
             raise NotImplementedError("MRV2 PCP does not support MM inputs yet.")
         if vllm_config.lora_config is not None:
             raise NotImplementedError("MRV2 PCP does not support LoRA yet.")
-        if vllm_config.speculative_config is not None:
+        speculative_config = vllm_config.speculative_config
+        if speculative_config is not None and not speculative_config.use_dspark():
             raise NotImplementedError(
-                "MRV2 PCP does not support speculative decoding yet."
-            )
-        is_sparse_mla = hasattr(model_config.hf_text_config, "index_topk")
-        if (
-            is_sparse_mla
-            and vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
-        ):
-            raise NotImplementedError(
-                "MRV2 sparse MLA PCP does not support CUDA graphs yet. "
-                "Set -cc.cudagraph_mode=NONE."
+                "MRV2 PCP currently supports DSpark speculative decoding only."
             )
         if vllm_config.compilation_config.cudagraph_mode.has_full_cudagraphs():
             raise NotImplementedError("MRV2 PCP supports PIECEWISE CUDA graphs only.")
@@ -363,8 +355,6 @@ class PCPManager:
         assert self._input_buffers is not None
         req_states = self._req_states
         input_buffers = self._input_buffers
-        if input_batch.num_draft_tokens > 0:
-            raise NotImplementedError("MRV2 PCP does not support spec decode yet.")
 
         global_batch = input_batch
         self._global_batch = global_batch
