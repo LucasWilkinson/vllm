@@ -610,12 +610,18 @@ class DeepseekV32Attention(MLAAttention):
                 publish_pcp_sharded_peer_kv()
 
         num_actual = attn_metadata.num_actual_tokens  # type: ignore[attr-defined]
+        # FlashMLA peer-gather mode reads the context straight from the DCP
+        # peers and attends locally: no token sharding, no cross-rank merge.
+        pcp_peer_gather = bool(
+            getattr(attn_metadata, "pcp_peer_gather_prefill", False)
+        )
         pcp_token_sharded = (
             self.use_pcp
             and self.impl.dcp_world_size > 1
             and self.impl.dcp_world_size == self.impl.pcp_world_size
             # The global metadata is attached only when the batch has prefill.
             and attn_metadata.num_prefills > 0
+            and not pcp_peer_gather
         )
         if num_actual == 0 and not pcp_token_sharded:
             output.zero_()
@@ -658,7 +664,7 @@ class DeepseekV32Attention(MLAAttention):
             mqa_q_arg, kv_cache, attn_metadata, self
         )
 
-        if self.use_pcp and self.impl.dcp_world_size > 1:
+        if self.use_pcp and self.impl.dcp_world_size > 1 and not pcp_peer_gather:
             assert lse is not None and self.dcp_manager is not None
             if getattr(attn_metadata, "fp8_use_mixed_batch", False):
                 # Sparse FlashMLA's mixed FP8 path already turns rows with no
