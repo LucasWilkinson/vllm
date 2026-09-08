@@ -850,6 +850,53 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
                         cache_block_size=kv_c_and_k_pe_cache.shape[1],
                         packed_ds_mla=True,
                     )
+                    if os.environ.get("VLLM_PCP_PEER_GATHER_DEBUG") == "3":
+                        # Workspace self-consistency: with one global request
+                        # split into two local segments, the gathered prefix of
+                        # segment 1 must equal segment 0's rows; converted top-k
+                        # of each segment must fall inside its own span.
+                        torch.cuda.synchronize()
+                        cu = chunk.cu_seq_lens.tolist()
+                        ws = chunk.workspace_starts.tolist()
+                        nreq = len(cu) - 1
+                        msg = [
+                            f"rank={get_pcp_group().rank_in_group} nreq={nreq} cu={cu} "
+                            f"ws_starts={ws} tot={int(chunk.chunk_tot_seqlen)} "
+                            f"tokens={chunk.tokens_slice}"
+                        ]
+                        if nreq >= 2:
+                            n = min(cu[1] - cu[0], cu[2] - cu[1])
+                            a = chunk_workspace[cu[0] : cu[0] + n].float()
+                            b = chunk_workspace[cu[1] : cu[1] + n].float()
+                            d = (a - b).abs().amax(dim=1)
+                            nbad = int((d > 1e-3).sum().item())
+                            firstbad = torch.nonzero(d > 1e-3).flatten()[:6].tolist()
+                            msg.append(
+                                f"prefix_rows={n} prefix_bad={nbad} first_bad_pos={firstbad} "
+                                f"a_absmean={a.abs().mean().item():.4f} "
+                                f"b_absmean={b.abs().mean().item():.4f}"
+                            )
+                        idx = topk_indices[chunk.tokens_slice]
+                        ln = topk_length[chunk.tokens_slice]
+                        req_of_tok = (
+                            attn_metadata.req_id_per_token[chunk.tokens_slice]
+                            if attn_metadata.req_id_per_token is not None
+                            else None
+                        )
+                        if req_of_tok is not None:
+                            rs = req_of_tok.tolist()
+                            bounds = sorted(set(rs))
+                            for r in bounds:
+                                rows = [i for i, v in enumerate(rs) if v == r]
+                                sub = idx[rows]
+                                valid = sub[sub >= 0]
+                                msg.append(
+                                    f"req{r}: rows={len(rows)} idx_min={int(valid.min()) if valid.numel() else -1} "
+                                    f"idx_max={int(valid.max()) if valid.numel() else -1} "
+                                    f"len_mean={ln[rows].float().mean().item():.1f} "
+                                    f"neg={int((sub < 0).sum())}"
+                                )
+                        logger.warning("PEERGATHER-WS %s", " | ".join(msg))
                     if os.environ.get("VLLM_PCP_PEER_GATHER_DEBUG") == "2":
                         # Race vs mapping: re-gather after a hard cross-rank
                         # barrier and compare row by row.
