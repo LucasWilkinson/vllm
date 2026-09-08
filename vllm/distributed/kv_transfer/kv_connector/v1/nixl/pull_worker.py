@@ -268,12 +268,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 req_id,
             )
             # Get side handles.
-            row_split_handle = self.src_xfer_handles_by_row_split.get(engine_id)
-            if row_split_handle is not None:
-                # Head-sharded LBNHC regions are read per token row; the
-                # local side uses the matching row-expanded descriptor list.
-                local_xfer_side_handle = row_split_handle
-            elif tp_ratio < 0 and len(read_specs) > 1:
+            if tp_ratio < 0 and len(read_specs) > 1:
                 # Remote tp_size > local tp_size: we must perform multiple
                 # reads. Get the memory chunk onto which we will write to.
                 split_key = (tp_ratio, remote_block_size)
@@ -408,7 +403,6 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         # workers will issue xfers to parts of the P worker remote kv caches.
 
         # Get descs ids.
-        region_descs_per_block = self.dst_region_descs_per_block.get(dst_engine_id)
         remote_block_descs_ids = self._compute_desc_ids(
             block_ids=remote_block_ids,
             dst_num_blocks=self.dst_num_blocks[dst_engine_id],
@@ -420,7 +414,6 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 if read_spec.block_ids_by_region
                 else self.dst_region_group_ids[dst_engine_id]
             ),
-            region_descs_per_block=region_descs_per_block,
         )
         local_block_descs_ids = self._compute_desc_ids(
             block_ids=local_block_ids,
@@ -433,7 +426,6 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 if read_spec.block_ids_by_region
                 else self.region_group_ids
             ),
-            region_descs_per_block=region_descs_per_block,
         )
 
         assert len(local_block_descs_ids) == len(remote_block_descs_ids)
