@@ -372,6 +372,7 @@ class DeepseekV32Attention(MLAAttention):
             indexer_k_norm_eps = 1e-6
             indexer_k_rope_cos_sin_cache = None
             indexer_k_cache = None
+            index_k_out = None
             indexer_softmax_scale = 0.0
             indexer_n_head_scale = 0.0
 
