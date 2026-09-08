@@ -876,6 +876,21 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
                                 f"a_absmean={a.abs().mean().item():.4f} "
                                 f"b_absmean={b.abs().mean().item():.4f}"
                             )
+                        # Per-request row statistics in 8 position bins: zero
+                        # rows mean the peer read found nothing written there.
+                        for r in range(nreq):
+                            rows_r = chunk_workspace[cu[r] : cu[r + 1]].float()
+                            nb = 8
+                            edges = [int(round(k * rows_r.shape[0] / nb)) for k in range(nb + 1)]
+                            bins = []
+                            for k in range(nb):
+                                seg = rows_r[edges[k] : edges[k + 1]]
+                                if seg.numel() == 0:
+                                    bins.append("-")
+                                    continue
+                                zero = int((seg.abs().amax(dim=1) == 0).sum().item())
+                                bins.append(f"{seg.abs().mean().item():.3f}/z{zero}")
+                            msg.append(f"req{r}_bins[{rows_r.shape[0]}]=" + ",".join(bins))
                         idx = topk_indices[chunk.tokens_slice]
                         ln = topk_length[chunk.tokens_slice]
                         req_of_tok = (
