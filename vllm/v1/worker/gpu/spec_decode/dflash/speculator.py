@@ -238,7 +238,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         slot_mappings: dict[str, torch.Tensor],
         retain_for_proposal: bool = True,
     ) -> None:
-        """Build rank-local context KV and publish its rows to every PCP peer."""
+        """Build rank-local context KV and publish it in the active PCP layout."""
         if self._pcp_context_kv_precomputed:
             raise RuntimeError("DSpark PCP context KV was already precomputed")
         if not aux_hidden_states:

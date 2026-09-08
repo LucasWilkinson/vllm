@@ -162,6 +162,73 @@ class PCPManager:
 
         return self._direct_kv_requested and pcp_direct_kv_active()
 
+    @property
+    def sharded_peer_kv_enabled(self) -> bool:
+        """Whether DCP spans the PCP group with in-place sharded peer views.
+
+        Every rank then owns the DCP-interleaved rows of *every* request in
+        the global batch rather than a PCP token shard, so per-token cache
+        writes that are derived from PCP-sharded activations (the DSpark
+        context-KV precompute) must first be restored to the global batch.
+        """
+        from vllm.model_executor.layers.attention.pcp_direct_kv import (
+            pcp_sharded_peer_kv_active,
+        )
+
+        return self.dcp_world_size > 1 and pcp_sharded_peer_kv_active()
+
+    def restore_sharded_context(
+        self, states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Restore PCP-sharded per-token states to the global prefill batch.
+
+        Returns ``(states, positions, slot_mappings)`` in global batch order,
+        trimmed to the active token count. ``slot_mappings`` is the
+        ``[num_kv_cache_groups, num_tokens]`` rank-local mapping produced by
+        :meth:`prepare_slot_mappings` for this step: valid for the
+        DCP-interleaved rows this rank owns and ``PAD_SLOT_ID`` elsewhere, so
+        a cache write over the whole global batch stores exactly this rank's
+        shard of every request.
+        """
+        assert self._global_batch is not None
+        assert self._global_batch_slot_mappings is not None
+        assert self._padded_gather_idx is not None
+        num_tokens = self._global_batch.num_tokens
+        # The all-gather needs every rank to contribute the common padded
+        # shard width; a rank that owns few (or zero) prompt tokens may hold
+        # fewer rows than that.
+        padded = self._padded_gather_idx.shape[0] // self.pcp_world_size
+        if states.shape[0] < padded:
+            states = torch.cat(
+                [states, states.new_zeros(padded - states.shape[0], *states.shape[1:])]
+            )
+        restored = self.restore_hidden_state_buffer(states)
+        if restored.shape[0] < num_tokens:
+            raise RuntimeError(
+                "PCP sharded context restore produced "
+                f"{restored.shape[0]} rows for {num_tokens} global tokens"
+            )
+        return (
+            restored[:num_tokens],
+            self._global_batch.positions[:num_tokens],
+            self._global_batch_slot_mappings[:, :num_tokens],
+        )
+
+    @property
+    def peer_kv_enabled(self) -> bool:
+        """Whether any PCP peer cache view (replicated or DCP-sharded) is active.
+
+        Unlike ``direct_kv_enabled`` (replicated-to-every-peer only), this is
+        True in DCP-sharded mode as well, so it correctly gates work that must
+        run whenever peer KV is available in any layout (e.g. the DSpark
+        context-KV precompute).
+        """
+        from vllm.model_executor.layers.attention.pcp_direct_kv import (
+            pcp_peer_kv_active,
+        )
+
+        return pcp_peer_kv_active()
+
     @staticmethod
     def validate_config(
         vllm_config: VllmConfig,
@@ -189,20 +256,17 @@ class PCPManager:
         is_sparse_mla = hasattr(model_config.hf_text_config, "index_topk")
         if speculative_config is not None:
             if speculative_config.use_dspark():
-                # With TP1 and DCP spanning the complete PCP group, each PCP
-                # rank already owns the matching DCP KV shard.  Publishing
-                # every shard to every PCP peer is unnecessary (and would
-                # overwrite peer-local DCP slots).  Other PCP layouts still
-                # need the direct-KV replication path for DSpark.
-                dcp_spans_pcp = (
-                    parallel_config.tensor_parallel_size == 1
-                    and parallel_config.decode_context_parallel_size == pcp_size
-                )
-                if not envs.VLLM_USE_PCP_DIRECT_KV and not dcp_spans_pcp:
+                # DSpark with PCP always needs the direct/peer KV path: prefill
+                # context KV must be published to (and, under DCP sharding, read
+                # back from) every PCP peer via symmetric memory.  Without it the
+                # DSpark context-KV precompute is skipped and each rank drafts
+                # from an incomplete context.  Require it explicitly rather than
+                # letting a silently-broken config start.
+                if not envs.VLLM_USE_PCP_DIRECT_KV:
                     raise NotImplementedError(
                         "DSpark with PCP requires VLLM_USE_PCP_DIRECT_KV=1 so "
-                        "sharded prefill context KV can be published to every "
-                        "draft cache."
+                        "prefill context KV can be published to / read from "
+                        "every PCP peer's draft cache."
                     )
             elif speculative_config.method == "mtp":
                 if is_sparse_mla:
@@ -468,7 +532,19 @@ class PCPManager:
         self,
         input_batch: InputBatch,
         padded_num_tokens: int | None = None,
+        *,
+        adaptive_verification: bool = False,
     ) -> InputBatch:
+        if (
+            adaptive_verification
+            and input_batch.num_draft_tokens > 0
+            and input_batch.has_prefill
+        ):
+            raise NotImplementedError(
+                "PCP does not yet support adaptive speculative verification in "
+                "a mixed prefill/decode batch; use a disaggregated decoder or "
+                "disable adaptive verification."
+            )
         assert self._req_states is not None
         assert self._input_buffers is not None
         req_states = self._req_states
@@ -879,12 +955,14 @@ def maybe_partition_pcp_batch(
     manager: PCPManager | None,
     input_batch: InputBatch,
     padded_num_tokens: int | None = None,
+    adaptive_verification: bool = False,
 ) -> InputBatch:
     if manager is None:
         return input_batch
     return manager.partition_batch(
         input_batch,
         padded_num_tokens=padded_num_tokens,
+        adaptive_verification=adaptive_verification,
     )
 
 
