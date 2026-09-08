@@ -93,6 +93,22 @@ def test_num_tokens_for_dispatch_uses_largest_pcp_rank(
     assert actual == expected
 
 
+def test_num_tokens_for_dispatch_keeps_dcp_batch_replicated():
+    manager = PCPManager(
+        pcp_world_size=4,
+        pcp_rank=0,
+        device=torch.device("cpu"),
+        dcp_world_size=4,
+    )
+
+    actual = manager.get_num_tokens_for_dispatch(
+        np.array([2, 9], dtype=np.int32),
+        np.array([False, True], dtype=np.bool_),
+    )
+
+    assert actual == 11
+
+
 def test_graph_padding_cannot_be_smaller_than_largest_pcp_rank(monkeypatch):
     manager = PCPManager(
         pcp_world_size=2,
@@ -137,3 +153,28 @@ def test_sparse_mla_pcp_accepts_piecewise_cudagraphs():
         PCPManager.validate_config(
             make_config(CUDAGraphMode.FULL), supports_mm_inputs=False
         )
+
+
+@pytest.mark.parametrize("dcp_world_size", [1, 4])
+def test_sparse_mla_pcp_accepts_mtp(dcp_world_size):
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            prefill_context_parallel_size=4,
+            decode_context_parallel_size=dcp_world_size,
+            pipeline_parallel_size=1,
+        ),
+        model_config=SimpleNamespace(
+            use_mla=True,
+            is_encoder_decoder=False,
+            hf_text_config=SimpleNamespace(index_topk=2048),
+        ),
+        lora_config=None,
+        speculative_config=SimpleNamespace(
+            method="mtp",
+            use_dspark=lambda: False,
+            enable_adaptive_verification=False,
+        ),
+        compilation_config=SimpleNamespace(cudagraph_mode=CUDAGraphMode.PIECEWISE),
+    )
+
+    PCPManager.validate_config(config, supports_mm_inputs=False)
