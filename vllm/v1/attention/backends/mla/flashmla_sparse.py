@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, ClassVar
 import torch
 
 from vllm import _custom_ops as ops
+from vllm import envs
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.config.cache import CacheDType
 from vllm.distributed.parallel_state import GroupCoordinator
@@ -37,7 +38,14 @@ from vllm.v1.attention.backends.utils import (
     reshape_query_for_spec_decode,
     split_prefill_chunks,
 )
-from vllm.v1.attention.ops.dcp import CPTritonContext, correct_attn_out
+from vllm.v1.attention.ops.dcp import (
+    CPTritonContext,
+    DirectDCPA2AWorkspace,
+    DirectDCPQGatherWorkspace,
+    correct_attn_out,
+    get_direct_dcp_a2a_workspace,
+    get_direct_dcp_q_gather_workspace,
+)
 from vllm.v1.attention.ops.flashmla import (
     FlashMLASchedMeta,
     flash_mla_sparse_fwd,
@@ -622,6 +630,13 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
         # Tile-scheduler metadata for the PCP token-sharded chunks, keyed by
         # gathered row count (only the full and tail chunk sizes occur).
         self._token_sharded_sched_meta: dict[int, torch.Tensor] = {}
+        # Direct symmetric-memory workspaces for the token-sharded collectives
+        # (VLLM_USE_DIRECT_PCP_TOKEN_SHARDED); resolved on first use.
+        self._ts_direct: (
+            tuple[DirectDCPQGatherWorkspace, DirectDCPA2AWorkspace] | None
+        ) = None
+        self._ts_direct_resolved = False
+        self._ts_stage: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
 
         vllm_config = get_current_vllm_config()
         max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
@@ -940,6 +955,51 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
             dummy_block_table=base.dummy_block_table,
         )
 
+    def _token_sharded_direct_workspaces(
+        self,
+        cp_group: GroupCoordinator,
+        device: torch.device,
+        num_heads: int,
+        q_dim: int,
+        v_dim: int,
+    ) -> tuple[DirectDCPQGatherWorkspace, DirectDCPA2AWorkspace] | None:
+        """Symmetric-memory workspaces for one 256-row token-sharded chunk.
+
+        The row gather and the row reduce-scatter reuse the head-axis direct
+        DCP kernels with a single "token" of ``rows * num_heads`` "heads":
+        rank-major head blocks are exactly rank-major row blocks.
+        """
+        if self._ts_direct_resolved:
+            return self._ts_direct
+        self._ts_direct_resolved = True
+        if not envs.VLLM_USE_DIRECT_PCP_TOKEN_SHARDED:
+            return None
+        rows = self.TOKEN_SHARDED_ROWS_PER_RANK
+        num_ubatches = max(
+            get_current_vllm_config().parallel_config.num_ubatches, 1
+        )
+        q_gather = get_direct_dcp_q_gather_workspace(
+            cp_group, device, 1, rows * num_heads, q_dim, torch.bfloat16, num_ubatches
+        )
+        a2a = get_direct_dcp_a2a_workspace(
+            cp_group, device, 1, rows * num_heads, v_dim, torch.bfloat16, num_ubatches
+        )
+        if q_gather is None or a2a is None:
+            logger.warning_once(
+                "VLLM_USE_DIRECT_PCP_TOKEN_SHARDED=1 but direct symmetric-memory "
+                "DCP workspaces are unavailable (q_gather=%s, a2a=%s); using NCCL.",
+                q_gather is not None,
+                a2a is not None,
+            )
+            return None
+        logger.info_once(
+            "Using direct symmetric-memory collectives for the PCP token-sharded "
+            "sparse MLA prefill (%d rows/rank/chunk).",
+            rows,
+        )
+        self._ts_direct = (q_gather, a2a)
+        return self._ts_direct
+
     def forward_mqa_token_sharded(
         self,
         q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
@@ -1002,14 +1062,61 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
         gather_valid_mask = gather_valid_mask.view(world_size, num_padded_tokens)
         out_chunks: list[torch.Tensor] = []
         cp_ctx = CPTritonContext()
+        direct = self._token_sharded_direct_workspaces(
+            cp_group, q.device, num_heads, q.shape[2], w_uv.shape[-1]
+        )
+        chunk_rows = self.TOKEN_SHARDED_ROWS_PER_RANK
 
-        for start in range(0, num_padded_tokens, self.TOKEN_SHARDED_ROWS_PER_RANK):
-            stop = min(start + self.TOKEN_SHARDED_ROWS_PER_RANK, num_padded_tokens)
+        for start in range(0, num_padded_tokens, chunk_rows):
+            stop = min(start + chunk_rows, num_padded_tokens)
             rows = stop - start
-            num_all = rows * world_size
-            q_all = cp_group.all_gather(q[start:stop], dim=0)
-            gathered_rows = gather_idx[:, start:stop].flatten()
-            valid_rows = gather_valid_mask[:, start:stop].flatten()
+            if direct is not None:
+                # Fixed-size symmetric workspaces: pad the tail chunk to a full
+                # chunk with invalid rows (dropped after the reduce-scatter).
+                q_chunk = q[start:stop]
+                gathered_rows = gather_idx[:, start:stop]
+                valid_rows = gather_valid_mask[:, start:stop]
+                if rows < chunk_rows:
+                    if self._ts_stage is None:
+                        self._ts_stage = (
+                            torch.zeros(
+                                (chunk_rows, num_heads, q.shape[2]),
+                                dtype=q.dtype,
+                                device=q.device,
+                            ),
+                            torch.zeros(
+                                (world_size, chunk_rows),
+                                dtype=gather_idx.dtype,
+                                device=q.device,
+                            ),
+                            torch.zeros(
+                                (world_size, chunk_rows),
+                                dtype=torch.bool,
+                                device=q.device,
+                            ),
+                        )
+                    q_stage, gidx_stage, valid_stage = self._ts_stage
+                    q_stage[:rows].copy_(q_chunk)
+                    gidx_stage[:, :rows].copy_(gathered_rows)
+                    valid_stage.zero_()
+                    valid_stage[:, :rows].copy_(valid_rows)
+                    q_chunk, gathered_rows, valid_rows = (
+                        q_stage,
+                        gidx_stage,
+                        valid_stage,
+                    )
+                num_all = chunk_rows * world_size
+                q_gather_ws, a2a_ws = direct
+                q_all = q_gather_ws.gather(
+                    q_chunk.view(1, chunk_rows * num_heads, q.shape[2])
+                ).view(num_all, num_heads, q.shape[2])
+                gathered_rows = gathered_rows.flatten()
+                valid_rows = valid_rows.flatten()
+            else:
+                num_all = rows * world_size
+                q_all = cp_group.all_gather(q[start:stop], dim=0)
+                gathered_rows = gather_idx[:, start:stop].flatten()
+                valid_rows = gather_valid_mask[:, start:stop].flatten()
             physical, valid_counts = triton_filter_and_convert_dcp_index(
                 global_req_id,
                 global_block_table,
@@ -1048,6 +1155,15 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
                 .transpose(0, 1)
                 .contiguous()
             )
+            if direct is not None:
+                v_dim = partial.shape[-1]
+                merged = direct[1].lse_reduce(
+                    partial.view(1, num_all * num_heads, v_dim),
+                    lse.contiguous().view(1, num_all * num_heads),
+                    self.lse_base_on_e,
+                )
+                out_chunks.append(merged.view(chunk_rows, num_heads, v_dim)[:rows])
+                continue
             lses = cp_group.all_gather(lse.contiguous(), dim=0).view(
                 world_size, num_all, num_heads
             )
