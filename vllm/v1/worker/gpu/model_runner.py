@@ -1360,6 +1360,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.pcp_manager,
             input_batch,
             padded_num_tokens=batch_desc.num_tokens,
+            adaptive_verification=adaptive_verification is not None,
         )
 
     def prepare_attn(
@@ -1873,12 +1874,33 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             and input_batch.has_prefill
             and input_batch.is_prefilling_np.all()
         ):
+            # Every PCP layout needs the restore: the drafter projects this
+            # rank's PCP token shard, but the draft cache rows it must fill are
+            # indexed in the global batch (and, when DCP spans the PCP group,
+            # are the DCP-interleaved rows of every request rather than this
+            # rank's shard).
+            pcp_manager = self.pcp_manager
+            kv_cache_config = self.kv_cache_config
+
+            def restore_context(
+                states: torch.Tensor,
+            ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+                states, positions, slot_mappings = pcp_manager.restore_sharded_context(
+                    states
+                )
+                return (
+                    states,
+                    positions,
+                    build_slot_mappings_by_layer(slot_mappings, kv_cache_config),
+                )
+
             with use_workspace_lane(self._draft_workspace_lane):
                 self.speculator.precompute_pcp_context_kv(
                     input_batch,
                     aux_hidden_states,
                     slot_mappings_by_layer,
                     retain_for_proposal=not is_pcp_kv_producer,
+                    restore_context=restore_context,
                 )
             aux_hidden_states = None
 

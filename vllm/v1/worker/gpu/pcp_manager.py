@@ -146,6 +146,54 @@ class PCPManager:
             else None
         )
 
+    @property
+    def dcp_spans_pcp(self) -> bool:
+        """Whether DCP spans the PCP group (DCP-sharded rank-local caches).
+
+        Every rank then owns the DCP-interleaved rows of *every* request in
+        the global batch rather than a PCP token shard, so per-token cache
+        writes derived from PCP-sharded activations (the DSpark context-KV
+        precompute) must first be restored to the global batch.
+        """
+        return self.dcp_world_size > 1 and self.dcp_world_size == self.pcp_world_size
+
+    def restore_sharded_context(
+        self, states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Restore PCP-sharded per-token states to the global prefill batch.
+
+        Returns ``(states, positions, slot_mappings)`` in global batch order,
+        trimmed to the active token count. ``slot_mappings`` is the
+        ``[num_kv_cache_groups, num_tokens]`` rank-local mapping produced by
+        :meth:`prepare_slot_mappings` for this step: valid for the
+        DCP-interleaved rows this rank owns and ``PAD_SLOT_ID`` elsewhere, so
+        a cache write over the whole global batch stores exactly this rank's
+        shard of every request.
+        """
+        assert self._global_batch is not None
+        assert self._global_batch_slot_mappings is not None
+        assert self._padded_gather_idx is not None
+        num_tokens = self._global_batch.num_tokens
+        # The all-gather needs every rank to contribute the common padded
+        # shard width; a rank that owns few (or zero) prompt tokens may hold
+        # fewer rows than that.
+        padded = self._padded_gather_idx.shape[0] // self.pcp_world_size
+        if states.shape[0] < padded:
+            states = torch.cat(
+                [states, states.new_zeros(padded - states.shape[0], *states.shape[1:])]
+            )
+        restored = self.restore_hidden_state_buffer(states)
+        if restored.shape[0] < num_tokens:
+            raise RuntimeError(
+                "PCP sharded context restore produced "
+                f"{restored.shape[0]} rows for {num_tokens} global tokens"
+            )
+        return (
+            restored[:num_tokens],
+            self._global_batch.positions[:num_tokens],
+            self._global_batch_slot_mappings[:, :num_tokens],
+        )
+
     @staticmethod
     def validate_config(
         vllm_config: VllmConfig,
@@ -425,7 +473,19 @@ class PCPManager:
         self,
         input_batch: InputBatch,
         padded_num_tokens: int | None = None,
+        *,
+        adaptive_verification: bool = False,
     ) -> InputBatch:
+        if (
+            adaptive_verification
+            and input_batch.num_draft_tokens > 0
+            and input_batch.has_prefill
+        ):
+            raise NotImplementedError(
+                "PCP does not yet support adaptive speculative verification in "
+                "a mixed prefill/decode batch; use a disaggregated decoder or "
+                "disable adaptive verification."
+            )
         assert self._req_states is not None
         assert self._input_buffers is not None
         req_states = self._req_states
@@ -817,12 +877,14 @@ def maybe_partition_pcp_batch(
     manager: PCPManager | None,
     input_batch: InputBatch,
     padded_num_tokens: int | None = None,
+    adaptive_verification: bool = False,
 ) -> InputBatch:
     if manager is None:
         return input_batch
     return manager.partition_batch(
         input_batch,
         padded_num_tokens=padded_num_tokens,
+        adaptive_verification=adaptive_verification,
     )
 
 
