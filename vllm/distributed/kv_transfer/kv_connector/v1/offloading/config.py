@@ -4,7 +4,6 @@
 
 from typing import TYPE_CHECKING
 
-import vllm.envs as envs
 from vllm.v1.core.kv_cache_utils import resolve_kv_cache_block_sizes
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -123,15 +122,14 @@ def build_offloading_config(
         and parallel_config.distributed_executor_backend == "mp"
         and parallel_config.nnodes_within_dp == 1
     )
-    # PCP direct-KV publishes every attention cache row into every PCP rank's
-    # symmetric-memory allocation.  With DCP=1 those allocations are complete,
+    # Under PCP with DCP=1 every rank gathers the whole prefill and inserts
+    # every attention cache row, so the per-rank caches are complete,
     # byte-identical replicas, including mixed target + draft attention groups.
     # Store one shared host copy and load it into every rank; otherwise native
     # offload silently spends PCP_SIZE times the requested capacity and begins
     # thrashing as soon as the active prefixes exceed that reduced capacity.
-    pcp_direct_replicated_layout = (
-        envs.VLLM_USE_PCP_DIRECT_KV
-        and worker_kv_bytes_per_block > 0
+    pcp_replicated_layout = (
+        worker_kv_bytes_per_block > 0
         and bool(kv_cache_config.kv_cache_groups)
         and all(
             (
@@ -153,7 +151,7 @@ def build_offloading_config(
         and parallel_config.distributed_executor_backend == "mp"
         and parallel_config.nnodes_within_dp == 1
     )
-    replicated_layout = tp_replicated_layout or pcp_direct_replicated_layout
+    replicated_layout = tp_replicated_layout or pcp_replicated_layout
 
     canonical_layout = bool(extra_config.get("canonical_layout", False))
 

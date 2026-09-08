@@ -950,12 +950,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                             self._dummy_run(**batch)
                     self.adaptive_verification.set_initial_cost_curves(timings)
 
-        from vllm.model_executor.layers.attention.pcp_direct_kv import (
-            reset_pcp_peer_cache_fence,
-        )
-
-        reset_pcp_peer_cache_fence()
-
         end_time = time.perf_counter()
         end_free_gpu_memory = torch.accelerator.get_memory_info()[0]
         elapsed_time = end_time - start_time
@@ -1870,11 +1864,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             output = ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
             return ModelRunnerOutput.with_ec_conn_output(output, ec_connector_output)
 
-        # Pure prefill retains PCP-local target auxiliary states and slot mappings.
-        # Project only this rank's shard. Replicated PCP copies those physical
-        # draft-cache rows to every peer; PCP-spanning DCP leaves them sharded.
-        # Mixed/decode batches use the restored full-context fallback because
-        # rejected speculative suffixes must be filtered first.
+        # Pure prefill retains PCP-local target auxiliary states. Restore them
+        # to the global batch (all-gather) and write the draft-cache rows this
+        # rank owns: the full replica with DCP=1, or its DCP-interleaved rows
+        # when DCP spans the PCP group. Mixed/decode batches use the restored
+        # full-context fallback because rejected speculative suffixes must be
+        # filtered first.
         kv_transfer_config = self.vllm_config.kv_transfer_config
         is_pcp_kv_producer = bool(
             self.pcp_manager is not None
@@ -1883,7 +1878,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         if (
             self.pcp_manager is not None
-            and self.pcp_manager.peer_kv_enabled
             and isinstance(self.speculator, DSparkSpeculator)
             and self.speculative_config is not None
             and self.speculative_config.method == "dspark"
@@ -1892,22 +1886,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             and input_batch.has_prefill
             and input_batch.is_prefilling_np.all()
         ):
-            restore_sharded_context = None
-            if self.pcp_manager.sharded_peer_kv_enabled:
-                pcp_manager = self.pcp_manager
-                kv_cache_config = self.kv_cache_config
+            pcp_manager = self.pcp_manager
+            kv_cache_config = self.kv_cache_config
 
-                def restore_sharded_context(
-                    states: torch.Tensor,
-                ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
-                    states, positions, slot_mappings = (
-                        pcp_manager.restore_sharded_context(states)
-                    )
-                    return (
-                        states,
-                        positions,
-                        build_slot_mappings_by_layer(slot_mappings, kv_cache_config),
-                    )
+            def restore_context(
+                states: torch.Tensor,
+            ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+                states, positions, slot_mappings = pcp_manager.restore_sharded_context(
+                    states
+                )
+                return (
+                    states,
+                    positions,
+                    build_slot_mappings_by_layer(slot_mappings, kv_cache_config),
+                )
 
             with use_workspace_lane(self._draft_workspace_lane):
                 self.speculator.precompute_pcp_context_kv(
@@ -1915,7 +1907,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     aux_hidden_states,
                     slot_mappings_by_layer,
                     retain_for_proposal=not is_pcp_kv_producer,
-                    restore_sharded_context=restore_sharded_context,
+                    restore_context=restore_context,
                 )
             aux_hidden_states = None
 

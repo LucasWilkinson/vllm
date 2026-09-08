@@ -7,15 +7,12 @@ from typing import Any
 import numpy as np
 import torch
 
-import vllm.envs as envs
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed.parallel_state import (
     get_dcp_group,
     get_pcp_group,
-    in_the_same_node_as,
 )
 from vllm.logger import init_logger
-from vllm.platforms import current_platform
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.buffer_utils import async_copy_to_gpu
@@ -83,7 +80,6 @@ class PCPManager:
         dcp_world_size: int = 1,
         dcp_rank: int = 0,
         cp_interleave: int = 1,
-        direct_kv_enabled: bool = False,
         use_mtp: bool = False,
     ) -> None:
         self.pcp_world_size = pcp_world_size
@@ -92,7 +88,6 @@ class PCPManager:
         self.dcp_world_size = dcp_world_size
         self.dcp_rank = dcp_rank
         self.cp_interleave = cp_interleave
-        self._direct_kv_requested = direct_kv_enabled
         self._use_mtp = use_mtp
 
         self._global_batch: InputBatch | None = None
@@ -158,27 +153,15 @@ class PCPManager:
         )
 
     @property
-    def direct_kv_enabled(self) -> bool:
-        from vllm.model_executor.layers.attention.pcp_direct_kv import (
-            pcp_direct_kv_active,
-        )
-
-        return self._direct_kv_requested and pcp_direct_kv_active()
-
-    @property
-    def sharded_peer_kv_enabled(self) -> bool:
-        """Whether DCP spans the PCP group with in-place sharded peer views.
+    def dcp_spans_pcp(self) -> bool:
+        """Whether DCP spans the PCP group (DCP-sharded rank-local caches).
 
         Every rank then owns the DCP-interleaved rows of *every* request in
         the global batch rather than a PCP token shard, so per-token cache
         writes that are derived from PCP-sharded activations (the DSpark
         context-KV precompute) must first be restored to the global batch.
         """
-        from vllm.model_executor.layers.attention.pcp_direct_kv import (
-            pcp_sharded_peer_kv_active,
-        )
-
-        return self.dcp_world_size > 1 and pcp_sharded_peer_kv_active()
+        return self.dcp_world_size > 1 and self.dcp_world_size == self.pcp_world_size
 
     def restore_sharded_context(
         self, states: torch.Tensor
@@ -217,21 +200,6 @@ class PCPManager:
             self._global_batch_slot_mappings[:, :num_tokens],
         )
 
-    @property
-    def peer_kv_enabled(self) -> bool:
-        """Whether any PCP peer cache view (replicated or DCP-sharded) is active.
-
-        Unlike ``direct_kv_enabled`` (replicated-to-every-peer only), this is
-        True in DCP-sharded mode as well, so it correctly gates work that must
-        run whenever peer KV is available in any layout (e.g. the DSpark
-        context-KV precompute).
-        """
-        from vllm.model_executor.layers.attention.pcp_direct_kv import (
-            pcp_peer_kv_active,
-        )
-
-        return pcp_peer_kv_active()
-
     @staticmethod
     def validate_config(
         vllm_config: VllmConfig,
@@ -258,18 +226,10 @@ class PCPManager:
         speculative_config = vllm_config.speculative_config
         if speculative_config is not None:
             if speculative_config.use_dspark():
-                # DSpark with PCP always needs the direct/peer KV path: prefill
-                # context KV must be published to (and, under DCP sharding, read
-                # back from) every PCP peer via symmetric memory.  Without it the
-                # DSpark context-KV precompute is skipped and each rank drafts
-                # from an incomplete context.  Require it explicitly rather than
-                # letting a silently-broken config start.
-                if not envs.VLLM_USE_PCP_DIRECT_KV:
-                    raise NotImplementedError(
-                        "DSpark with PCP requires VLLM_USE_PCP_DIRECT_KV=1 so "
-                        "prefill context KV can be published to / read from "
-                        "every PCP peer's draft cache."
-                    )
+                # The DSpark context-KV precompute restores the PCP-sharded
+                # target states to the global batch (all-gather) and each rank
+                # writes the draft cache rows it owns.
+                pass
             elif speculative_config.method == "mtp":
                 if speculative_config.enable_adaptive_verification:
                     raise NotImplementedError(
@@ -281,10 +241,6 @@ class PCPManager:
                 )
         if vllm_config.compilation_config.cudagraph_mode.has_full_cudagraphs():
             raise NotImplementedError("MRV2 PCP supports PIECEWISE CUDA graphs only.")
-
-        if not envs.VLLM_USE_PCP_DIRECT_KV:
-            return
-        _validate_pcp_direct_kv_config(vllm_config)
 
     @staticmethod
     def _reorder_segments(
@@ -834,18 +790,9 @@ class PCPManager:
                 :, : input_batch.num_tokens_after_padding
             ]
             slot_mappings.copy_(global_slot_mappings)
-            if self.direct_kv_enabled and self.pcp_rank != 0:
-                slot_mappings.fill_(PAD_SLOT_ID)
             return block_tables, slot_mappings
 
         slot_mappings = self.prepare_slot_mappings()
-        if self.direct_kv_enabled:
-            slot_mappings = select_pcp_direct_slot_row(
-                slot_mappings,
-                self.pcp_world_size,
-                self.pcp_rank,
-                input_batch.num_tokens_after_padding,
-            )
         return block_tables, slot_mappings
 
     def prepare_slot_mappings(self) -> torch.Tensor:
@@ -865,16 +812,6 @@ class PCPManager:
     def get_dummy_slot_mappings(self, num_tokens: int) -> torch.Tensor:
         assert self._gathered_kv_slot_mappings is not None
         self._gathered_kv_slot_mappings.fill_(PAD_SLOT_ID)
-        if self.direct_kv_enabled:
-            gathered_slot_mappings = self._gathered_kv_slot_mappings[
-                :, : num_tokens * self.pcp_world_size
-            ]
-            return select_pcp_direct_slot_row(
-                gathered_slot_mappings,
-                self.pcp_world_size,
-                self.pcp_rank,
-                num_tokens,
-            )
         return self._gathered_kv_slot_mappings[:, : num_tokens * self.pcp_world_size]
 
     def _convert_to_gathered_slot_mappings(
@@ -920,8 +857,7 @@ class PCPManager:
         shard (the DCP top-k merge all-gathers per row), and attach the index
         maps the indexer op needs to gather queries and keep its own rows."""
         if (
-            not self._direct_kv_requested
-            or self.dcp_world_size <= 1
+            self.dcp_world_size <= 1
             or self.dcp_world_size != self.pcp_world_size
             or self._global_batch is None
             or self._padded_gather_idx is None
@@ -1094,83 +1030,8 @@ def maybe_restore_pcp_for_sampling(
     return manager.restore_for_sampling(hidden_states)
 
 
-def select_pcp_direct_slot_row(
-    gathered_slot_mappings: torch.Tensor,
-    pcp_world_size: int,
-    pcp_rank: int,
-    local_tokens: int,
-) -> torch.Tensor:
-    """Select this producer's destination slots from rank-major gathered slots."""
-    if pcp_world_size <= 1:
-        return gathered_slot_mappings
-    if gathered_slot_mappings.ndim != 2:
-        raise ValueError(
-            "Expected gathered slot mappings with shape "
-            f"[num_groups, pcp_world_size * padded_tokens], "
-            f"got {tuple(gathered_slot_mappings.shape)}"
-        )
-    _, expanded = gathered_slot_mappings.shape
-    if expanded % pcp_world_size != 0:
-        raise ValueError(
-            f"Gathered slot width {expanded} is not divisible by PCP={pcp_world_size}"
-        )
-    padded = expanded // pcp_world_size
-    if local_tokens > padded:
-        raise ValueError(
-            f"Local token count {local_tokens} exceeds padded PCP row {padded}"
-        )
-    return gathered_slot_mappings.view(-1, pcp_world_size, padded)[
-        :, pcp_rank, :local_tokens
-    ]
 
 
-def _is_deepseek_v32_attention(layer: object) -> bool:
-    cls = type(layer)
-    return cls.__name__ == "DeepseekV32Attention" and cls.__module__.startswith(
-        "vllm.models.deepseek_v32"
-    )
-
-
-def _validate_pcp_direct_kv_config(vllm_config: VllmConfig) -> None:
-    parallel_config = vllm_config.parallel_config
-    model_config = vllm_config.model_config
-    if not current_platform.is_cuda():
-        raise NotImplementedError("Direct PCP KV requires CUDA.")
-    model_type = getattr(model_config.hf_text_config, "model_type", None)
-    if model_type not in ("glm_moe_dsa", "deepseek_v32"):
-        raise NotImplementedError(
-            "Direct PCP KV currently supports GLM-5.2 / DeepSeek-V3.2 only "
-            f"(got model_type={model_type!r})."
-        )
-    forward_layers = vllm_config.compilation_config.static_forward_context
-    if forward_layers and not any(
-        _is_deepseek_v32_attention(layer) for layer in forward_layers.values()
-    ):
-        raise NotImplementedError(
-            "Direct PCP KV requires the specialized NVIDIA deepseek_v32 attention path."
-        )
-    dcp_size = parallel_config.decode_context_parallel_size
-    pcp_size = parallel_config.prefill_context_parallel_size
-    tp_size = parallel_config.tensor_parallel_size
-    if dcp_size != 1 and not (tp_size == 1 and dcp_size == pcp_size):
-        raise NotImplementedError(
-            "Direct PCP KV with DCP requires TP1 and DCP spanning the full PCP group."
-        )
-    if parallel_config.data_parallel_size != 1:
-        raise NotImplementedError("Direct PCP KV currently requires DP=1.")
-    if parallel_config.use_ubatching:
-        raise NotImplementedError(
-            "Direct PCP KV does not support dual batch overlap or ubatching."
-        )
-    if vllm_config.scheduler_config.async_scheduling:
-        raise NotImplementedError("Direct PCP KV does not support async scheduling.")
-    cache_config = vllm_config.cache_config
-    if cache_config is None or cache_config.cache_dtype not in ("fp8", "fp8_ds_mla"):
-        raise NotImplementedError(
-            "Direct PCP KV requires --kv-cache-dtype fp8 or fp8_ds_mla."
-        )
-    if getattr(model_config, "enable_sleep_mode", False):
-        raise NotImplementedError("Direct PCP KV does not support sleep mode.")
 
 
 def maybe_build_pcp_manager(
@@ -1184,22 +1045,9 @@ def maybe_build_pcp_manager(
     parallel_config = vllm_config.parallel_config
     pcp_size = parallel_config.prefill_context_parallel_size
     if pcp_size <= 1:
-        if envs.VLLM_USE_PCP_DIRECT_KV:
-            raise ValueError(
-                "VLLM_USE_PCP_DIRECT_KV=1 requires "
-                "--prefill-context-parallel-size greater than 1."
-            )
         return None
 
     cls.validate_config(vllm_config, supports_mm_inputs)
-
-    direct_kv_enabled = bool(envs.VLLM_USE_PCP_DIRECT_KV)
-    if direct_kv_enabled and not all(
-        in_the_same_node_as(get_pcp_group().cpu_group, source_rank=0)
-    ):
-        raise NotImplementedError(
-            "Direct PCP KV currently requires every PCP rank on one host."
-        )
 
     pcp_rank = get_pcp_group().rank_in_group
     dcp_size = parallel_config.decode_context_parallel_size
@@ -1216,7 +1064,6 @@ def maybe_build_pcp_manager(
         dcp_world_size=dcp_size,
         dcp_rank=dcp_rank,
         cp_interleave=parallel_config.cp_kv_cache_interleave_size,
-        direct_kv_enabled=direct_kv_enabled,
         use_mtp=(
             vllm_config.speculative_config is not None
             and vllm_config.speculative_config.method == "mtp"

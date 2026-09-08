@@ -14,7 +14,6 @@ _PrecomputeCall = tuple[
     torch.Tensor,
     torch.Tensor,
     list[torch.Tensor],
-    bool,
 ]
 
 
@@ -35,42 +34,36 @@ class _DraftModel:
         context_states: torch.Tensor,
         positions: torch.Tensor,
         slot_mappings: list[torch.Tensor],
-        *,
-        publish_to_pcp: bool,
     ) -> None:
         self.precompute_call = (
             context_states.clone(),
             positions.clone(),
             [mapping.clone() for mapping in slot_mappings],
-            publish_to_pcp,
         )
 
 
 class _Qwen3Model:
     def __init__(self) -> None:
-        self.publish_to_pcp: bool | None = None
+        self.call: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
 
     def precompute_and_store_context_kv(
         self,
         context_states: torch.Tensor,
         context_positions: torch.Tensor,
         context_slot_mapping: torch.Tensor,
-        *,
-        publish_to_pcp: bool,
     ) -> None:
-        self.publish_to_pcp = publish_to_pcp
+        self.call = (context_states, context_positions, context_slot_mapping)
 
 
-def test_qwen3_dflash_forwards_pcp_publication() -> None:
+def test_qwen3_dflash_forwards_context_kv_precompute() -> None:
     model = SimpleNamespace(model=_Qwen3Model())
+    states = torch.empty(1, 1)
+    positions = torch.zeros(1, dtype=torch.long)
+    slots = torch.zeros(1, dtype=torch.long)
     DFlashQwen3ForCausalLM.precompute_and_store_context_kv(
-        model,
-        torch.empty(1, 1),
-        torch.zeros(1, dtype=torch.long),
-        torch.zeros(1, dtype=torch.long),
-        publish_to_pcp=True,
+        model, states, positions, slots
     )
-    assert model.model.publish_to_pcp is True
+    assert model.model.call == (states, positions, slots)
 
 
 def test_replicated_pcp_regathers_global_block_tables() -> None:
@@ -107,11 +100,10 @@ def test_precompute_pcp_context_kv_uses_local_rows_and_marks_step() -> None:
 
     precompute_call = speculator.model.precompute_call
     assert precompute_call is not None
-    context, positions, mappings, publish = precompute_call
+    context, positions, mappings = precompute_call
     torch.testing.assert_close(context, torch.tensor([[2.0, 4.0], [3.0, 5.0]]))
     assert torch.equal(positions, torch.tensor([7, 8]))
     assert [mapping.tolist() for mapping in mappings] == [[10, 11], [20, 21]]
-    assert publish is True
     assert speculator._pcp_context_kv_precomputed is True
 
     with pytest.raises(RuntimeError, match="already precomputed"):

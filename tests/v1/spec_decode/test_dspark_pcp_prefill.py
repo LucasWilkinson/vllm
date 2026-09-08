@@ -44,7 +44,7 @@ def test_precompute_pcp_context_kv_uses_only_local_rows():
     assert len(args[2]) == 2
     assert torch.equal(args[2][0], torch.tensor([4, 5]))
     assert torch.equal(args[2][1], torch.tensor([8, 9]))
-    assert kwargs == {"publish_to_pcp": True}
+    assert kwargs == {}
     assert speculator._pcp_context_kv_precomputed
 
     with pytest.raises(RuntimeError, match="already precomputed"):

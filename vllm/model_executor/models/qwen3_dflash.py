@@ -594,7 +594,6 @@ class DFlashQwen3Model(nn.Module):
         context_states: torch.Tensor,
         context_positions: torch.Tensor,
         context_slot_mapping: torch.Tensor | list[torch.Tensor | None] | None = None,
-        publish_to_pcp: bool = False,
     ) -> None:
         """Precompute K/V for context states write them into each layer's KV cache.
 
@@ -624,10 +623,7 @@ class DFlashQwen3Model(nn.Module):
         if num_ctx == 0 and context_slot_mapping is not None:
             # A PCP rank can own zero prompt tokens (the FlashMLA sparse
             # builder does not pad the PCP shard, unlike FlashInfer's). There
-            # is nothing to project or store, but the peer-KV publication is
-            # a group-wide epoch handshake that every rank must still join.
-            if publish_to_pcp:
-                self._join_pcp_publication()
+            # is nothing to project or store.
             return
 
         all_k, all_v = self._project_context_kv(context_states, num_ctx, L, nkv, hd)
@@ -653,24 +649,9 @@ class DFlashQwen3Model(nn.Module):
         if context_slot_mapping is None:
             return
 
-        replicate_to_pcp = False
-        if publish_to_pcp:
-            from vllm.model_executor.layers.attention.pcp_direct_kv import (
-                pcp_direct_kv_active,
-                pcp_sharded_peer_kv_active,
-            )
-
-            replicate_to_pcp = pcp_direct_kv_active()
-            if not replicate_to_pcp and not pcp_sharded_peer_kv_active():
-                raise RuntimeError(
-                    "DFlash PCP publication requested without an active PCP peer "
-                    "KV cache"
-                )
-
         # --- Per-layer cache insert ---
         all_k_final = all_k_flat.view(L, num_ctx, nkv, hd)
         per_layer = isinstance(context_slot_mapping, (list, tuple))
-        stored_rows = False
         for i in range(L):
             slot_mapping = (
                 context_slot_mapping[i] if per_layer else context_slot_mapping
@@ -685,53 +666,6 @@ class DFlashQwen3Model(nn.Module):
                 all_v[i],
                 kv_cache,
                 slot_mapping,
-            )
-            stored_rows = True
-            if replicate_to_pcp:
-                from vllm.model_executor.layers.attention.pcp_direct_kv import (
-                    publish_pcp_cache_rows,
-                )
-
-                publish_pcp_cache_rows(
-                    attn.layer_name,
-                    kv_cache,
-                    slot_mapping,
-                    token_dim=2,
-                    segment_dim=1,
-                )
-        if publish_to_pcp:
-            if not stored_rows:
-                raise RuntimeError("DFlash PCP precompute stored no cache rows")
-            if replicate_to_pcp:
-                from vllm.model_executor.layers.attention.pcp_direct_kv import (
-                    publish_pcp_direct_kv,
-                )
-
-                publish_pcp_direct_kv()
-            else:
-                from vllm.model_executor.layers.attention.pcp_direct_kv import (
-                    publish_pcp_sharded_peer_kv,
-                )
-
-                publish_pcp_sharded_peer_kv()
-
-    @staticmethod
-    def _join_pcp_publication() -> None:
-        from vllm.model_executor.layers.attention.pcp_direct_kv import (
-            pcp_direct_kv_active,
-            pcp_sharded_peer_kv_active,
-            publish_pcp_direct_kv,
-            publish_pcp_sharded_peer_kv,
-        )
-
-        if pcp_direct_kv_active():
-            publish_pcp_direct_kv()
-        elif pcp_sharded_peer_kv_active():
-            publish_pcp_sharded_peer_kv()
-        else:
-            raise RuntimeError(
-                "DFlash PCP publication requested without an active PCP peer "
-                "KV cache"
             )
 
     def forward(
@@ -859,14 +793,12 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         context_states: torch.Tensor,
         context_positions: torch.Tensor,
         context_slot_mapping: torch.Tensor | list[torch.Tensor | None] | None = None,
-        publish_to_pcp: bool = False,
     ) -> None:
         """Precompute projected + RoPE'd K/V and write to cache."""
         self.model.precompute_and_store_context_kv(
             context_states,
             context_positions,
             context_slot_mapping,
-            publish_to_pcp=publish_to_pcp,
         )
 
     def combine_hidden_states(

@@ -1281,18 +1281,6 @@ class VllmConfig:
             and self.parallel_config.enable_dbo
             and self.parallel_config.all2all_backend == "deepep_high_throughput"
         )
-        if envs.VLLM_USE_PCP_DIRECT_KV:
-            if self.scheduler_config.async_scheduling is True:
-                raise ValueError(
-                    "VLLM_USE_PCP_DIRECT_KV=1 is incompatible with explicitly "
-                    "enabled async scheduling. Use --no-async-scheduling."
-                )
-            if self.scheduler_config.async_scheduling is None:
-                logger.info_once(
-                    "Disabling async scheduling because PCP direct-KV is enabled."
-                )
-                self.scheduler_config.async_scheduling = False
-
         if self.scheduler_config.async_scheduling:
             # Async scheduling explicitly enabled, hard fail any incompatibilities.
             # Currently, async scheduling only support eagle speculative

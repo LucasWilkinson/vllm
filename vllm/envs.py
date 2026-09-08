@@ -201,9 +201,6 @@ if TYPE_CHECKING:
     VLLM_USE_DIRECT_DCP_A2A: bool | None = None
     VLLM_USE_DIRECT_DCP_Q_GATHER: bool | None = None
     VLLM_USE_DIRECT_DCP_KV_GATHER: bool | None = None
-    VLLM_USE_DIRECT_PCP_TOKEN_SHARDED: bool = False
-    VLLM_PCP_SPARSE_PEER_GATHER: bool = True
-    VLLM_USE_PCP_DIRECT_KV: bool = False
     VLLM_DEEP_GEMM_WARMUP: Literal[
         "skip",
         "full",
@@ -2148,19 +2145,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_USE_DIRECT_DCP_KV_GATHER": lambda: maybe_convert_bool(
         os.getenv("VLLM_USE_DIRECT_DCP_KV_GATHER")
     ),
-    # Route the PCP-spanning DCP token-sharded sparse-MLA prefill collectives
-    # (query row gather, LSE-merge/reduce-scatter) through symmetric-memory
-    # workspaces instead of NCCL. Needs NVLS multicast for the query gather.
-    "VLLM_USE_DIRECT_PCP_TOKEN_SHARDED": lambda: bool(
-        int(os.getenv("VLLM_USE_DIRECT_PCP_TOKEN_SHARDED", "0"))
-    ),
-    # PCP-spanning DCP sparse-MLA prefill (FlashMLA): gather each request's
-    # context KV directly from the DCP peers' caches (symmetric memory, no
-    # collective) into the bf16 prefill workspace and attend locally, instead
-    # of the token-sharded path (query all-gather + LSE merge per chunk).
-    "VLLM_PCP_SPARSE_PEER_GATHER": lambda: bool(
-        int(os.getenv("VLLM_PCP_SPARSE_PEER_GATHER", "1"))
-    ),
     # Whether to enable dual cuda streams for LoRA computation
     # (used by both BaseLinearLayerWithLoRA and FusedMoEWithLoRA to
     # overlap the base layer compute with the LoRA fast path).
@@ -2170,9 +2154,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # If set to 1, use Python spinloop extension to poll in a more efficient
     # way when using the mp backend.
     "VLLM_USE_SPINLOOP_EXT": lambda: bool(int(os.getenv("VLLM_USE_SPINLOOP_EXT", "0"))),
-    "VLLM_USE_PCP_DIRECT_KV": lambda: bool(
-        int(os.getenv("VLLM_USE_PCP_DIRECT_KV", "0"))
-    ),
     # Comma-separated GPU_BDF=NIC_BDF pairs for RDMA NIC selection.
     # Must be set together with VLLM_NIC_SELECTION_VARS.
     "VLLM_GPU_NIC_PCIE_MAPPING": lambda: os.getenv("VLLM_GPU_NIC_PCIE_MAPPING", ""),

@@ -13,12 +13,6 @@ from vllm.distributed.parallel_state import get_pcp_group, get_tp_group
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention import MLAAttention
 from vllm.model_executor.layers.attention.attention import get_attention_context
-from vllm.model_executor.layers.attention.pcp_direct_kv import (
-    get_layer_peer_ptrs,
-    pcp_direct_kv_active,
-    publish_pcp_direct_kv,
-    publish_pcp_sharded_peer_kv,
-)
 from vllm.model_executor.layers.layernorm import LayerNorm, RMSNorm
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -48,7 +42,6 @@ from vllm.v1.attention.ops.pcp import (
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.attention.mla_attention import MLACommonMetadata
-
 
 
 class DeepseekV32Indexer(nn.Module):
@@ -337,8 +330,7 @@ class DeepseekV32Attention(MLAAttention):
         slot_mapping = forward_context.slot_mapping
         assert isinstance(slot_mapping, dict)
         mla_slot = slot_mapping.get(self.layer_name)
-        direct_kv = pcp_direct_kv_active()
-        collect_pcp = self.use_pcp and not direct_kv
+        collect_pcp = self.use_pcp
 
         if self.indexer is not None and not self.skip_topk:
             has_indexer = True
@@ -372,15 +364,6 @@ class DeepseekV32Attention(MLAAttention):
 
         kv_c_out = torch.empty_like(kv_c) if collect_pcp else None
         k_pe_out = torch.empty_like(k_pe) if collect_pcp else None
-        mla_peer_ptrs = None
-        indexer_peer_ptrs = None
-        pcp_world_size = 1
-        if direct_kv and mla_kv_cache is not None:
-            mla_peer_ptrs = get_layer_peer_ptrs(self.layer_name)
-            if has_indexer and self.indexer is not None:
-                indexer_peer_ptrs = get_layer_peer_ptrs(self.indexer.k_cache.prefix)
-            if mla_peer_ptrs is not None:
-                pcp_world_size = int(mla_peer_ptrs.numel())
         q_c = fused_norm_rope(
             positions,
             q_c,
@@ -407,12 +390,7 @@ class DeepseekV32Attention(MLAAttention):
             kv_c_out=kv_c_out,
             k_pe_out=k_pe_out,
             index_k_out=index_k_out,
-            mla_peer_ptrs=mla_peer_ptrs,
-            indexer_peer_ptrs=indexer_peer_ptrs,
-            pcp_world_size=pcp_world_size,
         )
-        if pcp_world_size > 1:
-            publish_pcp_direct_kv()
 
         q = self.q_b_proj(q_c)[0].view(-1, self.num_local_heads, self.qk_head_dim)
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
@@ -525,7 +503,7 @@ class DeepseekV32Attention(MLAAttention):
         if self.indexer is not None and not self.skip_topk:
             assert index_q_fp8 is not None
             assert index_weights_out is not None
-            collect_pcp = self.use_pcp and not pcp_direct_kv_active()
+            collect_pcp = self.use_pcp
             if collect_pcp:
                 assert index_k is not None
             sparse_attn_indexer(
@@ -568,7 +546,7 @@ class DeepseekV32Attention(MLAAttention):
             return
         attn_metadata = cast("MLACommonMetadata", attn_metadata)
 
-        if self.use_pcp and not pcp_direct_kv_active():
+        if self.use_pcp:
             assert kv_c is not None and k_pe is not None
             kv_for_cache, kpe_for_cache, cache_slot_mapping = (
                 maybe_gather_mla_latent_cache_inputs(
@@ -587,42 +565,14 @@ class DeepseekV32Attention(MLAAttention):
                 self.kv_cache_dtype,
                 self._k_scale,
             )
-            # Rank-symmetric peer-cache fence: publish this
-            # rank's sharded DCP KV writes before any peer reads them in
-            # forward_mqa. The dense path fences here unconditionally; the
-            # sparse decode/prefill path must too, otherwise peers race
-            # ahead into the peer-KV gather while this rank is still in
-            # do_kv_cache_update -> device-side deadlock under DCP>1.
-            #
-            # Skip while a breakable-cudagraph capture is ACTIVE: capture
-            # runs this eager-break region via add_eager (segment capture
-            # already ended) but the ranks capture their graph shapes
-            # independently, so the cross-rank fence would spin at mismatched
-            # epochs and PTX-trap (async unspecified launch failure surfacing
-            # at the post-capture reset sync). current() is None during
-            # replay() and real eager inference, so the fence still fires
-            # there -- the eager lambda re-runs this whole region at replay,
-            # in cross-rank lockstep. Mirrors the direct-KV path, whose fence
-            # is recorded-not-executed inside the captured graph.
-            from vllm.compilation.breakable_cudagraph import (
-                BreakableCUDAGraphCapture,
-            )
-            if BreakableCUDAGraphCapture.current() is None:
-                publish_pcp_sharded_peer_kv()
 
         num_actual = attn_metadata.num_actual_tokens  # type: ignore[attr-defined]
-        # FlashMLA peer-gather mode reads the context straight from the DCP
-        # peers and attends locally: no token sharding, no cross-rank merge.
-        pcp_peer_gather = bool(
-            getattr(attn_metadata, "pcp_peer_gather_prefill", False)
-        )
         pcp_token_sharded = (
             self.use_pcp
             and self.impl.dcp_world_size > 1
             and self.impl.dcp_world_size == self.impl.pcp_world_size
             # The global metadata is attached only when the batch has prefill.
             and attn_metadata.num_prefills > 0
-            and not pcp_peer_gather
         )
         if num_actual == 0 and not pcp_token_sharded:
             output.zero_()
@@ -661,13 +611,11 @@ class DeepseekV32Attention(MLAAttention):
             if isinstance(mqa_q_arg, tuple):
                 mqa_q_arg = torch.cat(mqa_q_arg, dim=-1)
             mqa_q_arg = get_tp_group().all_gather(mqa_q_arg, dim=1)
-        if pcp_peer_gather:
-            attn_metadata.pcp_num_padded_rows = output.shape[0]  # type: ignore[attr-defined]
         attn_out, lse = self.impl.forward_mqa(  # type: ignore[attr-defined]
             mqa_q_arg, kv_cache, attn_metadata, self
         )
 
-        if self.use_pcp and self.impl.dcp_world_size > 1 and not pcp_peer_gather:
+        if self.use_pcp and self.impl.dcp_world_size > 1:
             assert lse is not None and self.dcp_manager is not None
             if getattr(attn_metadata, "fp8_use_mixed_batch", False):
                 # Sparse FlashMLA's mixed FP8 path already turns rows with no

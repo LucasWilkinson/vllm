@@ -71,8 +71,6 @@ def _fp8_quant_and_cache_write(
     cache_stride,
     offsets,
     HEAD_DIM: tl.constexpr,
-    peer_ptrs,
-    PCP_WORLD_SIZE: tl.constexpr,
 ):
     k_fp8, scale = _fp8_ue8m0_quantize(vals)
 
@@ -82,14 +80,8 @@ def _fp8_quant_and_cache_write(
     data_off = block_start + block_offset * HEAD_DIM + offsets
     scale_elem_off = (block_start + cache_block_size * HEAD_DIM + block_offset * 4) // 4
 
-    if PCP_WORLD_SIZE == 1:
-        tl.store(kv_cache_ptr + data_off, k_fp8, mask=mask)
-        tl.store(kv_cache_scale_ptr + scale_elem_off, scale)
-        return
-    for peer in tl.static_range(0, PCP_WORLD_SIZE):
-        base = tl.load(peer_ptrs + peer)
-        tl.store(base.to(tl.pointer_type(tl.float8e4nv)) + data_off, k_fp8, mask=mask)
-        tl.store(base.to(tl.pointer_type(tl.float32)) + scale_elem_off, scale)
+    tl.store(kv_cache_ptr + data_off, k_fp8, mask=mask)
+    tl.store(kv_cache_scale_ptr + scale_elem_off, scale)
 
 
 @triton.jit
@@ -163,9 +155,6 @@ def _fused_norm_rope_kernel(
     HAS_INDEXER: tl.constexpr,
     INDEX_ROPE_INTERLEAVE: tl.constexpr,
     USE_PDL: tl.constexpr,
-    mla_peer_ptrs,
-    indexer_peer_ptrs,
-    PCP_WORLD_SIZE: tl.constexpr,
 ):
     tok_idx = tl.program_id(0).to(tl.int64)
     pid = tl.program_id(1)
@@ -275,43 +264,19 @@ def _fused_norm_rope_kernel(
                 kv_c_fp8 = tl.reshape((kv_2d / tile_scale).to(tl.float8e4nv), (KV_DIM,))
                 tile_off = tl.arange(0, MLA_NUM_TILES)
                 tile_scales = tl.reshape(tile_scale, (MLA_NUM_TILES,))
-                if PCP_WORLD_SIZE == 1:
-                    tl.store(mla_cache_ptr + byte_base + kv_block, kv_c_fp8)
-                    tl.store(
-                        mla_cache_ds_scale_ptr
-                        + byte_base // 4
-                        + KV_DIM // 4
-                        + tile_off,
-                        tile_scales,
-                    )
-                    rope_dst = (
-                        mla_cache_ds_rope_ptr + byte_base // 2 + (KV_DIM // 2 + 8)
-                    )
-                    tl.store(rope_dst + dim_off * 2, r1.to(tl.bfloat16))
-                    tl.store(rope_dst + dim_off * 2 + 1, r2.to(tl.bfloat16))
-                else:
-                    for peer in tl.static_range(0, PCP_WORLD_SIZE):
-                        base = tl.load(mla_peer_ptrs + peer)
-                        tl.store(
-                            base.to(tl.pointer_type(tl.float8e4nv))
-                            + byte_base
-                            + kv_block,
-                            kv_c_fp8,
-                        )
-                        tl.store(
-                            base.to(tl.pointer_type(tl.float32))
-                            + byte_base // 4
-                            + KV_DIM // 4
-                            + tile_off,
-                            tile_scales,
-                        )
-                        rope_dst = (
-                            base.to(tl.pointer_type(tl.bfloat16))
-                            + byte_base // 2
-                            + (KV_DIM // 2 + 8)
-                        )
-                        tl.store(rope_dst + dim_off * 2, r1.to(tl.bfloat16))
-                        tl.store(rope_dst + dim_off * 2 + 1, r2.to(tl.bfloat16))
+                tl.store(mla_cache_ptr + byte_base + kv_block, kv_c_fp8)
+                tl.store(
+                    mla_cache_ds_scale_ptr
+                    + byte_base // 4
+                    + KV_DIM // 4
+                    + tile_off,
+                    tile_scales,
+                )
+                rope_dst = (
+                    mla_cache_ds_rope_ptr + byte_base // 2 + (KV_DIM // 2 + 8)
+                )
+                tl.store(rope_dst + dim_off * 2, r1.to(tl.bfloat16))
+                tl.store(rope_dst + dim_off * 2 + 1, r2.to(tl.bfloat16))
                 return
 
             dst_off = (
@@ -327,21 +292,10 @@ def _fused_norm_rope_kernel(
                 kv_c_store = kv_c
                 r1_store = r1
                 r2_store = r2
-            if PCP_WORLD_SIZE == 1:
-                dst = mla_cache_ptr + dst_off
-                tl.store(dst + kv_block, kv_c_store)
-                tl.store(dst + KV_DIM + dim_off * 2, r1_store)
-                tl.store(dst + KV_DIM + dim_off * 2 + 1, r2_store)
-            else:
-                for peer in tl.static_range(0, PCP_WORLD_SIZE):
-                    base = tl.load(mla_peer_ptrs + peer)
-                    if MLA_CACHE_FP8:
-                        dst = base.to(tl.pointer_type(tl.float8e4nv)) + dst_off
-                    else:
-                        dst = base.to(tl.pointer_type(tl.bfloat16)) + dst_off
-                    tl.store(dst + kv_block, kv_c_store)
-                    tl.store(dst + KV_DIM + dim_off * 2, r1_store)
-                    tl.store(dst + KV_DIM + dim_off * 2 + 1, r2_store)
+            dst = mla_cache_ptr + dst_off
+            tl.store(dst + kv_block, kv_c_store)
+            tl.store(dst + KV_DIM + dim_off * 2, r1_store)
+            tl.store(dst + KV_DIM + dim_off * 2 + 1, r2_store)
     elif pid == 0:
         if not HAS_INDEXER:
             # Shared layer: no indexer K to process.
@@ -442,8 +396,6 @@ def _fused_norm_rope_kernel(
                 indexer_cache_stride,
                 index_k_block,
                 INDEX_K_DIM,
-                indexer_peer_ptrs,
-                PCP_WORLD_SIZE,
             )
 
 
@@ -475,9 +427,6 @@ def fused_norm_rope(
     kv_c_out: torch.Tensor | None = None,
     k_pe_out: torch.Tensor | None = None,
     index_k_out: torch.Tensor | None = None,
-    mla_peer_ptrs: torch.Tensor | None = None,
-    indexer_peer_ptrs: torch.Tensor | None = None,
-    pcp_world_size: int = 1,
 ) -> torch.Tensor:
     assert positions.ndim == 1
     assert q_c.ndim == 2
@@ -556,23 +505,6 @@ def fused_norm_rope(
 
     if q_c_out is None:
         q_c_out = torch.empty_like(q_c)
-    if pcp_world_size < 1:
-        raise ValueError(f"pcp_world_size must be >= 1, got {pcp_world_size}")
-    if pcp_world_size > 1:
-        if mla_peer_ptrs is None or mla_peer_ptrs.numel() != pcp_world_size:
-            raise ValueError("mla_peer_ptrs must have one pointer per PCP rank")
-        if (
-            has_indexer
-            and indexer_k_cache is not None
-            and (
-                indexer_peer_ptrs is None or indexer_peer_ptrs.numel() != pcp_world_size
-            )
-        ):
-            raise ValueError("indexer_peer_ptrs must have one pointer per PCP rank")
-    if mla_peer_ptrs is None:
-        mla_peer_ptrs = torch.zeros(1, dtype=torch.int64, device=device)
-    if indexer_peer_ptrs is None:
-        indexer_peer_ptrs = torch.zeros(1, dtype=torch.int64, device=device)
     kv_c_out_stride = 0
     k_pe_out_stride = 0
     index_k_out_stride = 0
@@ -651,9 +583,6 @@ def fused_norm_rope(
         HAS_INDEXER=has_indexer,
         INDEX_ROPE_INTERLEAVE=index_rope_interleave,
         USE_PDL=use_pdl,
-        mla_peer_ptrs=mla_peer_ptrs,
-        indexer_peer_ptrs=indexer_peer_ptrs,
-        PCP_WORLD_SIZE=pcp_world_size,
         launch_pdl=use_pdl,
     )
     return q_c_out

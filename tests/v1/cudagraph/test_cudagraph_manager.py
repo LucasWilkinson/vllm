@@ -115,20 +115,11 @@ def test_full_capture_sets_graph_pool_id_before_cuda_graph(monkeypatch):
     mock_cuda_graph.assert_called_once()
 
 
-@pytest.mark.parametrize(
-    ("direct_kv", "pcp_rank", "expected_width", "expected_storage_offset"),
-    [
-        (False, 0, 112, 0),
-        (True, 1, 56, 56),
-    ],
-)
-def test_piecewise_capture_uses_pcp_dummy_slot_mappings(
-    monkeypatch,
-    direct_kv: bool,
-    pcp_rank: int,
-    expected_width: int,
-    expected_storage_offset: int,
-):
+def test_piecewise_capture_uses_pcp_dummy_slot_mappings():
+    # Every PCP rank captures the full PCP-expanded slot-mapping buffer.
+    pcp_rank = 0
+    expected_width = 112
+    expected_storage_offset = 0
     num_reqs = 32
     num_tokens = 56
     pcp_world_size = 2
@@ -145,11 +136,6 @@ def test_piecewise_capture_uses_pcp_dummy_slot_mappings(
         max_num_reqs=num_reqs,
         max_num_tokens=num_tokens,
         block_tables=pcp_block_tables,
-        direct_kv_enabled=direct_kv,
-    )
-    monkeypatch.setattr(
-        "vllm.model_executor.layers.attention.pcp_direct_kv.pcp_direct_kv_active",
-        lambda: direct_kv,
     )
 
     block_tables = MagicMock()

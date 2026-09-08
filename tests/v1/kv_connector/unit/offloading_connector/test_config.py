@@ -398,8 +398,7 @@ def test_replicated_layout_enabled_for_pure_mla_tp_mp_single_node(
     )
 
 
-def test_replicated_layout_enabled_for_direct_pcp_mixed_attention(monkeypatch):
-    monkeypatch.setenv("VLLM_USE_PCP_DIRECT_KV", "1")
+def test_replicated_layout_enabled_for_pcp_mixed_attention():
     hybrid = _make_hybrid_kv_cache_config()
 
     assert _replicated_layout(
@@ -442,12 +441,10 @@ def test_replicated_layout_enabled_for_direct_pcp_mixed_attention(monkeypatch):
     ],
     ids=["non-attention", "tp2", "pp2", "ray", "multi-node"],
 )
-def test_direct_pcp_replicated_layout_fails_closed(
-    monkeypatch,
+def test_pcp_replicated_layout_fails_closed(
     kv_cache_config: KVCacheConfig,
     kwargs: dict[str, Any],
 ):
-    monkeypatch.setenv("VLLM_USE_PCP_DIRECT_KV", "1")
     parallel_kwargs = {
         "tensor_parallel_size": 1,
         "prefill_context_parallel_size": 8,
