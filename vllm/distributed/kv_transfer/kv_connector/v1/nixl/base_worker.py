@@ -753,9 +753,6 @@ class NixlBaseConnectorWorker:
         self.consumer_notification_counts_by_req = defaultdict[ReqId, int](int)
         self.expected_consumer_notifications_by_req: dict[ReqId, int] = {}
         self.xfer_stats = NixlKVConnectorStats()
-        # Debug bookkeeping: xfer handle -> (remote_rank, num_descs, t0, req_id).
-        self._xfer_info: dict[int, tuple[int, int, float, str]] = {}
-        self._stalled_logged: set[int] = set()
 
         self._physical_blocks_per_logical_kv_block = 1
         self._sync_block_size_with_kernel()
@@ -2181,29 +2178,10 @@ class NixlBaseConnectorWorker:
                 self.src_xfer_handles_by_row_split[engine_id] = (
                     self.nixl_wrapper.prep_xfer_dlist("NIXL_INIT_AGENT", descs)
                 )
-                split_regions = [
-                    i for i, n in enumerate(region_descs_per_block) if n > 1
-                ]
-                # info_once hashes its args: keep them scalar/str.
-                logger.info_once(
-                    "NIXL row-split head-slice reads from engine %s for %d "
-                    "%s regions %s: %d rows/block, local row %d B at head "
-                    "offset %d of remote row %d B (%d local descs).",
-                    str(engine_id),
-                    len(split_regions),
-                    str(self.kv_cache_layout),
-                    str(split_regions[:4]),
-                    region_descs_per_block[split_regions[0]],
-                    self.block_len_per_layer[split_regions[0]]
-                    // region_descs_per_block[split_regions[0]],
-                    plan.rank_offset_factor
-                    * (
-                        self.block_len_per_layer[split_regions[0]]
-                        // region_descs_per_block[split_regions[0]]
-                    ),
-                    nixl_agent_meta.block_lens[split_regions[0]]
-                    // region_descs_per_block[split_regions[0]],
-                    len(local_rows),
+                logger.debug(
+                    "NIXL row-split head-slice reads from engine %s: regions %s",
+                    engine_id,
+                    [i for i, n in enumerate(region_descs_per_block) if n > 1],
                 )
 
         # Register all remote blocks, but only the corresponding kv heads.
@@ -2387,20 +2365,17 @@ class NixlBaseConnectorWorker:
                 else remote_tp_size
             )
             model_replicated = self.transfer_topo.is_kv_replicated(remote_engine_id)
-            logger.info_once(
-                "NIXL handshake plan for %s: remote tp=%s pcp=%s dcp=%s "
-                "(real tp %s), local tp=%s dcp=%s, heads_replicated=%s, "
-                "rank_offset_factor=%s, groups=%s",
+            logger.debug(
+                "NIXL handshake plan for %s: remote tp=%s pcp=%s dcp=%s, "
+                "local tp=%s dcp=%s, heads_replicated=%s, rank_offset_factor=%s",
                 remote_engine_id,
                 remote_tp_size,
                 nixl_agent_meta.pcp_size,
                 remote_dcp_size,
-                remote_real_tp_size,
                 self.world_size,
                 self.dcp_size,
                 plan.remote_heads_replicated,
                 plan.rank_offset_factor,
-                ",".join(t.__name__ for t in self._group_spec_types),
             )
             total_kv_heads = self.transfer_topo.total_num_kv_heads
             local_heads = self.transfer_topo.local_physical_heads
@@ -2866,21 +2841,6 @@ class NixlBaseConnectorWorker:
                         self.nixl_wrapper.release_xfer_handle(handle)
                     elif xfer_state == "PROC":
                         in_progress.append(handle)
-                        info = self._xfer_info.get(handle)
-                        if (
-                            info is not None
-                            and handle not in self._stalled_logged
-                            and time.perf_counter() - info[2] > 20.0
-                        ):
-                            self._stalled_logged.add(handle)
-                            logger.warning(
-                                "NIXL READ STALLED >20s: req=%s remote_rank=%s "
-                                "descs=%d (local rank %s)",
-                                info[3],
-                                info[0],
-                                info[1],
-                                self.tp_rank,
-                            )
                         continue
                     else:
                         self._log_failure(
