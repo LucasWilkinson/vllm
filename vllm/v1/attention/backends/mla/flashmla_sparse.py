@@ -706,6 +706,7 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
         self._ts_direct_resolved = False
         self._ts_stage: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
         self._peer_gather_scale: torch.Tensor | None = None
+        self._ts_stub_meta: tuple[torch.Tensor, torch.Tensor] | None = None
 
         vllm_config = get_current_vllm_config()
         max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
@@ -1028,7 +1029,22 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
         row count. cache_lens and the dummy block table are shape-independent.
         """
         base = attn_metadata.fp8_extra_metadata
-        assert isinstance(base, FlashMLASparseMetadata.FP8KernelMetadata)
+        if isinstance(base, FlashMLASparseMetadata.FP8KernelMetadata):
+            cache_lens, dummy_block_table = base.cache_lens, base.dummy_block_table
+        else:
+            # Separate prefill/decode metadata (peer-gather mode): the fp8
+            # kernel ignores both when `indices` is given; keep shape-valid stubs.
+            if self._ts_stub_meta is None:
+                self._ts_stub_meta = (
+                    torch.full(
+                        (1,),
+                        get_current_vllm_config().model_config.max_model_len,
+                        dtype=torch.int32,
+                        device=device,
+                    ),
+                    torch.empty((1, 1), dtype=torch.int32, device=device),
+                )
+            cache_lens, dummy_block_table = self._ts_stub_meta
         sched = self._token_sharded_sched_meta.get(num_rows)
         if sched is None:
             padded_heads = self.fp8_decode_padded_heads
@@ -1046,8 +1062,8 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
             self._token_sharded_sched_meta[num_rows] = sched
         return FlashMLASparseMetadata.FP8KernelMetadata(
             scheduler_metadata=sched,
-            cache_lens=base.cache_lens,
-            dummy_block_table=base.dummy_block_table,
+            cache_lens=cache_lens,
+            dummy_block_table=dummy_block_table,
         )
 
     def _token_sharded_direct_workspaces(
@@ -1122,10 +1138,10 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
         num_actual = attn_metadata.num_actual_tokens
         assert q.shape[0] >= num_padded_tokens >= num_actual
         assert self.topk_indices_buffer is not None
-        if self.kv_cache_dtype != "fp8_ds_mla" or not attn_metadata.fp8_use_mixed_batch:
+        if self.kv_cache_dtype != "fp8_ds_mla":
             raise NotImplementedError(
                 "FlashMLA sparse token-sharded PCP/DCP attention requires the "
-                "fp8_ds_mla mixed-batch path"
+                "fp8_ds_mla kv-cache"
             )
 
         global_req_id = attn_metadata.pcp_global_req_id

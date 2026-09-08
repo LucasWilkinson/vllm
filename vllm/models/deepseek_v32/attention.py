@@ -669,10 +669,14 @@ class DeepseekV32Attention(MLAAttention):
             mqa_q_arg, kv_cache, attn_metadata, self
         )
 
-        if pcp_peer_gather and os.environ.get("VLLM_PCP_PEER_GATHER_DEBUG") == "1":
+        if (
+            pcp_peer_gather
+            and os.environ.get("VLLM_PCP_PEER_GATHER_DEBUG") == "1"
+            and getattr(attn_metadata, "pcp_gather_idx", None) is not None
+        ):
             # Differential check against the token-sharded path (collective:
-            # every PCP rank takes this branch in a prefill step).
-            if num_actual > 0:
+            # every PCP rank takes this branch in a real prefill step).
+            if True:
                 ref = self.impl.forward_mqa_token_sharded(  # type: ignore[attr-defined]
                     (ql_nope[: output.shape[0]], mqa_q[: output.shape[0]]),
                     kv_cache,
