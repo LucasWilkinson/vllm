@@ -945,6 +945,7 @@ class PCPManager:
                 g
                 for g in groups
                 if g.backend.get_name().startswith("FLASHINFER_MLA_SPARSE")
+                or g.backend.get_name() == "FLASHMLA_SPARSE"
             ]
             for groups in attn_groups
         ]
