@@ -162,15 +162,8 @@ class NixlBaseConnector(KVConnectorBase_V1, SupportsHMA):
     ############################################################
 
     def get_finished_count(self) -> int | None:
-        parallel_config = self._vllm_config.parallel_config
-        if (
-            self.kv_transfer_config.kv_role == "kv_producer"
-            and parallel_config.prefill_context_parallel_size > 1
-        ):
-            producer_ranks = parallel_config.tensor_parallel_size
-            if parallel_config.decode_context_parallel_size > 1:
-                producer_ranks *= parallel_config.prefill_context_parallel_size
-            return producer_ranks * parallel_config.pipeline_parallel_size
+        # Every PCP x TP rank reports. Replicated-PCP ranks that do not issue
+        # transfers report completion through _replicated_pcp_done_sending.
         return None
 
     def get_num_new_matched_tokens(
@@ -253,7 +246,8 @@ class NixlBaseConnector(KVConnectorBase_V1, SupportsHMA):
             and self.connector_worker.pcp_rank > 0
             and not self.connector_worker.pcp_dcp_sharded
         ):
-            done_sending.clear()
+            done_sending = set(self.connector_worker._replicated_pcp_done_sending)
+            self.connector_worker._replicated_pcp_done_sending.clear()
         return done_sending, done_recving
 
     def get_block_ids_with_load_errors(self) -> set[int]:

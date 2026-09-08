@@ -892,9 +892,7 @@ class PCPManager:
             [
                 g
                 for g in groups
-                if g.backend.get_name().startswith(
-                    "FLASHINFER_MLA_SPARSE"
-                )
+                if g.backend.get_name().startswith("FLASHINFER_MLA_SPARSE")
             ]
             for groups in attn_groups
         ]
@@ -1117,19 +1115,6 @@ def _validate_pcp_direct_kv_config(vllm_config: VllmConfig) -> None:
     if cache_config is None or cache_config.cache_dtype not in ("fp8", "fp8_ds_mla"):
         raise NotImplementedError(
             "Direct PCP KV requires --kv-cache-dtype fp8 or fp8_ds_mla."
-        )
-    kv_transfer_config = vllm_config.kv_transfer_config
-    if (
-        kv_transfer_config is not None
-        and kv_transfer_config.kv_connector is not None
-        and not (
-            kv_transfer_config.kv_connector == "NixlConnector"
-            and kv_transfer_config.kv_role == "kv_producer"
-        )
-    ):
-        raise NotImplementedError(
-            "Direct PCP KV supports only the NixlConnector kv_producer "
-            "path; consumers, other connectors, and offloading are unsupported."
         )
     if getattr(model_config, "enable_sleep_mode", False):
         raise NotImplementedError("Direct PCP KV does not support sleep mode.")
