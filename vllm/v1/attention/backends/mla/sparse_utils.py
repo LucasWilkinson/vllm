@@ -119,7 +119,10 @@ def _convert_req_index_to_global_index_kernel(
     # Guard block_table access
     valid_block = (block_id < max_num_blocks_per_req) & (block_id >= 0)
     bt_ptr = block_table_ptr + req * bt_stride0 + block_id * bt_stride1
-    is_invalid_tok |= ~valid_block | is_remote
+    # Workspace-mapped prefill tokens never touch the block table, and under
+    # DCP the (rank-local) table is DCP_SIZE times narrower than the sequence,
+    # so the block bound must not invalidate them.
+    is_invalid_tok |= (~valid_block & ~is_prefill) | is_remote
     base = tl.load(bt_ptr, mask=valid_block & ~is_prefill & ~is_remote, other=0)
     out_val = base * BLOCK_STRIDE_ROWS + inblock_off
 
