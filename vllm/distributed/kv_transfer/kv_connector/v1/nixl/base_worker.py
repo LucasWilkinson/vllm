@@ -123,8 +123,16 @@ class NixlBaseConnectorWorker:
         physical_blocks_per_logical: int,
         region_num_blocks: list[int] | None = None,
         region_group_ids: list[int] | None = None,
+        region_descs_per_block: list[int] | None = None,
     ) -> np.ndarray:
-        """Compute NIXL descriptor IDs for given block IDs."""
+        """Compute NIXL descriptor IDs for given block IDs.
+
+        ``region_descs_per_block`` gives, per region, how many consecutive
+        descriptors describe one block (1 normally; the token rows per block
+        for row-split head-sharded regions, see ``_row_split_descs_per_block``).
+        Desc ids stay region-major, block-major, row-minor on both sides of a
+        transfer, so local and remote lists pair up 1:1.
+        """
         num_ssm_regions = 0
         if self._has_mamba:
             assert self._conv_decomp is not None
@@ -143,8 +151,20 @@ class NixlBaseConnectorWorker:
                 int(count * block_size_ratio) for count in region_num_blocks
             ]
         assert len(region_num_blocks) == self.num_regions
-        region_offsets = np.cumsum([0, *region_num_blocks[:-1]])
-        num_fa_descs = sum(region_num_blocks)
+        row_split = region_descs_per_block is not None and any(
+            n != 1 for n in region_descs_per_block
+        )
+        if row_split:
+            assert num_ssm_regions == 0, "Row-split regions do not support SSM"
+            assert block_size_ratio is None or block_size_ratio == 1
+            descs_per_block = np.asarray(region_descs_per_block, dtype=np.int64)
+            assert len(descs_per_block) == self.num_regions
+            region_desc_counts = np.asarray(region_num_blocks) * descs_per_block
+        else:
+            descs_per_block = None
+            region_desc_counts = np.asarray(region_num_blocks)
+        region_offsets = np.cumsum([0, *region_desc_counts[:-1]])
+        num_fa_descs = int(region_desc_counts.sum())
 
         # All-attention fast path: single vectorized broadcast.
         if num_ssm_regions == 0:
@@ -157,7 +177,14 @@ class NixlBaseConnectorWorker:
                 block_arr = np.concatenate(block_ids)[None, :]
                 if block_arr.size and block_arr.max() >= region_num_blocks_array.min():
                     raise IndexError("KV block ID exceeds its NIXL region capacity")
-                return (region_offsets[:, None] + block_arr).flatten()
+                if descs_per_block is None:
+                    return (region_offsets[:, None] + block_arr).flatten()
+                return self._expand_row_split_desc_ids(
+                    np.arange(self.num_regions),
+                    block_arr[0],
+                    region_offsets,
+                    descs_per_block,
+                )
             desc_ids = []
             for group_id, group in enumerate(block_ids):
                 if not group:
@@ -170,7 +197,19 @@ class NixlBaseConnectorWorker:
                 group_blocks = np.asarray(group)[None, :]
                 if group_blocks.max() >= region_num_blocks_array[region_ids].min():
                     raise IndexError("KV block ID exceeds its NIXL region capacity")
-                desc_ids.append((region_offsets[region_ids] + group_blocks).flatten())
+                if descs_per_block is None:
+                    desc_ids.append(
+                        (region_offsets[region_ids] + group_blocks).flatten()
+                    )
+                else:
+                    desc_ids.append(
+                        self._expand_row_split_desc_ids(
+                            region_ids[:, 0],
+                            group_blocks[0],
+                            region_offsets,
+                            descs_per_block,
+                        )
+                    )
             if not desc_ids:
                 return np.array([], dtype=np.int64)
             return np.concatenate(desc_ids)
@@ -627,6 +666,12 @@ class NixlBaseConnectorWorker:
         # Populated dynamically during handshake based on remote configuration.
         # Per-source split handles, keyed by (tp_ratio, remote_block_size).
         self.src_xfer_handles_by_tp_ratio: dict[tuple[int, int], list[int]] = {}
+        # Per remote engine: local handle whose head-sharded full-attention
+        # regions are described per token row instead of per block (LBNHC
+        # layouts under heterogeneous heads), and the matching per-region
+        # descriptor multiplicity (None when every region is one desc/block).
+        self.src_xfer_handles_by_row_split: dict[EngineId, int] = {}
+        self.dst_region_descs_per_block: dict[EngineId, list[int] | None] = {}
         # Map of engine_id -> {tp_rank: nixl_prepped_dlist_handle (int)}.
         self.dst_xfer_side_handles = defaultdict[EngineId, dict[int, int]](dict)
 
@@ -1568,6 +1613,105 @@ class NixlBaseConnectorWorker:
         return np.concatenate(parts)
 
     @staticmethod
+    def _expand_row_split_desc_ids(
+        region_ids: np.ndarray,
+        blocks: np.ndarray,
+        region_offsets: np.ndarray,
+        descs_per_block: np.ndarray,
+    ) -> np.ndarray:
+        """Region-major desc ids when a region has several descs per block."""
+        blocks = np.asarray(blocks, dtype=np.int64)
+        parts: list[np.ndarray] = []
+        for region_id in region_ids:
+            n = int(descs_per_block[region_id])
+            rows = np.arange(n, dtype=np.int64)[None, :]
+            ids = region_offsets[region_id] + blocks[:, None] * n + rows
+            parts.append(ids.flatten())
+        if not parts:
+            return np.array([], dtype=np.int64)
+        return np.concatenate(parts)
+
+    def _row_split_descs_per_block(
+        self,
+        nixl_agent_meta: NixlAgentMetadata,
+        plan: TPMapping,
+        block_size_ratio: int,
+    ) -> list[int] | None:
+        """Per-region descriptor multiplicity for head-slice reads in LBNHC.
+
+        A head-sharded (non-MLA) region whose remote block holds more heads
+        than the local one is read as a head slice of every block. In a
+        block-contiguous layout (LBHNC) that slice is one contiguous chunk at
+        a head offset, which is what ``_build_fa_remote`` emits. In LBNHC the
+        heads of one token are contiguous but the token rows interleave, so a
+        contiguous chunk of the remote block is a *token* slice with all
+        heads: a Qwen3 DSpark drafter's context KV arrives scrambled and
+        acceptance collapses. Such regions are instead described per token
+        row: ``block_size`` descriptors per block, each covering this rank's
+        heads of one token. Returns None when no region needs it.
+        """
+        layout = KVCacheLayout[self.kv_cache_layout]
+        if layout.is_block_contiguous or self.use_host_buffer:
+            return None
+        descs_per_block = [1] * self.num_regions
+        needed = False
+        for i, local_len in enumerate(self.block_len_per_layer):
+            if self._is_region_replicated(i):
+                continue
+            remote_len = nixl_agent_meta.block_lens[i]
+            if remote_len == local_len:
+                continue
+            if remote_len < local_len:
+                raise NotImplementedError(
+                    "Head-sharded LBNHC regions with more local than remote "
+                    f"heads (region {i}: local {local_len} > remote {remote_len}) "
+                    "need per-row local splits, which are not implemented."
+                )
+            if block_size_ratio != 1 or self._has_mamba:
+                raise NotImplementedError(
+                    "Row-split head-slice reads need equal block sizes and no "
+                    "SSM layers."
+                )
+            rows = self.region_block_sizes[i]
+            if local_len % rows or remote_len % rows or remote_len % local_len:
+                raise ValueError(
+                    f"NIXL region {i} block lengths local={local_len} "
+                    f"remote={remote_len} are not row-divisible for "
+                    f"block_size {rows}"
+                )
+            descs_per_block[i] = rows
+            needed = True
+        if not needed:
+            return None
+        return descs_per_block
+
+    def _build_fa_local_rows(
+        self,
+        base_addresses: list[int],
+        region_descs_per_block: list[int],
+    ) -> np.ndarray:
+        """Local FA descriptors with row-split regions expanded per token row."""
+        device_id = self.device_id
+        parts: list[np.ndarray] = []
+        for i, base_addr in enumerate(base_addresses):
+            block_len = self.block_len_per_layer[i]
+            blocks = np.arange(self.region_num_blocks[i], dtype=np.uint64)
+            rows = region_descs_per_block[i]
+            if rows == 1:
+                addrs = base_addr + blocks * self.region_strides[i]
+                parts.append(self._stack_descs(addrs, block_len, device_id))
+                continue
+            row_len = block_len // rows
+            row_idx = np.arange(rows, dtype=np.uint64)
+            addrs = (
+                base_addr
+                + blocks[:, None] * self.region_strides[i]
+                + row_idx[None, :] * row_len
+            ).flatten()
+            parts.append(self._stack_descs(addrs, row_len, device_id))
+        return np.concatenate(parts)
+
+    @staticmethod
     def _stack_descs(addrs: np.ndarray, length: int, device_id: int) -> np.ndarray:
         out = np.empty((addrs.shape[0], 3), dtype=np.uint64)
         out[:, 0] = addrs
@@ -1609,6 +1753,7 @@ class NixlBaseConnectorWorker:
         nixl_agent_meta: NixlAgentMetadata,
         block_size_ratio: int,
         region_split_ratios: list[int] | None = None,
+        region_descs_per_block: list[int] | None = None,
     ) -> np.ndarray:
         """Build remote FA descriptors for all layers as an Nx3 uint64 array."""
         assert self.transfer_topo is not None
@@ -1644,6 +1789,31 @@ class NixlBaseConnectorWorker:
             region_split_ratio = (
                 1 if not region_split_ratios else region_split_ratios[i]
             )
+            rows = 1 if not region_descs_per_block else region_descs_per_block[i]
+            if rows > 1:
+                # Row-split head slice (LBNHC): this rank's heads of every
+                # token row, at the rank's head offset within the remote row.
+                assert not replicated and region_split_ratio == 1
+                assert block_size_ratio == 1
+                local_len = self.block_len_per_layer[i]
+                remote_len = nixl_agent_meta.block_lens[i]
+                local_row_len = local_len // rows
+                remote_row_len = remote_len // rows
+                head_offset = plan.rank_offset_factor * local_row_len
+                assert head_offset + local_row_len <= remote_row_len, (
+                    f"NIXL row-split region {i}: head offset {head_offset} + "
+                    f"{local_row_len} exceeds remote row {remote_row_len}"
+                )
+                blocks = np.arange(region_num_blocks[i], dtype=np.uint64)
+                row_idx = np.arange(rows, dtype=np.uint64)
+                addrs = (
+                    base_addr
+                    + head_offset
+                    + blocks[:, None] * region_strides[i]
+                    + row_idx[None, :] * remote_row_len
+                ).flatten()
+                parts.append(self._stack_descs(addrs, local_row_len, device_id))
+                continue
             if region_split_ratio > 1:
                 assert replicated and block_size_ratio == 1
                 block_len = nixl_agent_meta.block_lens[i] // region_split_ratio
@@ -1987,12 +2157,61 @@ class NixlBaseConnectorWorker:
         # kv_head dim, of D worker's kv_head size (D>P).
         # Eg. PTP1 DTP2 => P0 KV:[block0-KV_0 | block0-KV_1..].
 
+        ### (Optional) Row-split head-slice reads for LBNHC full-attention
+        ### regions (e.g. a GQA/MHA drafter next to an MLA target): one local
+        ### and one remote descriptor per token row instead of per block.
+        region_descs_per_block = self._row_split_descs_per_block(
+            nixl_agent_meta, plan, block_size_ratio
+        )
+        self.dst_region_descs_per_block[engine_id] = region_descs_per_block
+        if region_descs_per_block is not None:
+            if self._needs_split_local_xfer_handles(tp_ratio, plan):
+                raise NotImplementedError(
+                    "Row-split head-slice reads cannot be combined with "
+                    "per-source local splits (P TP > D TP)."
+                )
+            if engine_id not in self.src_xfer_handles_by_row_split:
+                local_rows = self._build_fa_local_rows(
+                    self.kv_caches_base_addr[self.engine_id][self.tp_rank],
+                    region_descs_per_block,
+                )
+                descs = self.nixl_wrapper.get_xfer_descs(
+                    local_rows, self.nixl_memory_type
+                )
+                self.src_xfer_handles_by_row_split[engine_id] = (
+                    self.nixl_wrapper.prep_xfer_dlist("NIXL_INIT_AGENT", descs)
+                )
+                split_regions = [
+                    i for i, n in enumerate(region_descs_per_block) if n > 1
+                ]
+                logger.info_once(
+                    "NIXL row-split head-slice reads from engine %s for %d "
+                    "%s regions %s: %d rows/block, local row %d B at head "
+                    "offset %d of remote row %d B (%d local descs).",
+                    engine_id,
+                    len(split_regions),
+                    self.kv_cache_layout,
+                    split_regions[:4],
+                    region_descs_per_block[split_regions[0]],
+                    self.block_len_per_layer[split_regions[0]]
+                    // region_descs_per_block[split_regions[0]],
+                    plan.rank_offset_factor
+                    * (
+                        self.block_len_per_layer[split_regions[0]]
+                        // region_descs_per_block[split_regions[0]]
+                    ),
+                    nixl_agent_meta.block_lens[split_regions[0]]
+                    // region_descs_per_block[split_regions[0]],
+                    len(local_rows),
+                )
+
         # Register all remote blocks, but only the corresponding kv heads.
         blocks_data = self._build_fa_remote(
             plan,
             nixl_agent_meta,
             block_size_ratio,
             self.dst_region_split_ratios[engine_id],
+            region_descs_per_block,
         )
         logger.debug(
             "Created %s blocks for dst engine %s with remote rank %s and local rank %s",
@@ -3136,6 +3355,9 @@ class NixlBaseConnectorWorker:
         for handle in self.src_xfer_handles_by_block_size.values():
             self.nixl_wrapper.release_dlist_handle(handle)
         self.src_xfer_handles_by_block_size.clear()
+        for handle in self.src_xfer_handles_by_row_split.values():
+            self.nixl_wrapper.release_dlist_handle(handle)
+        self.src_xfer_handles_by_row_split.clear()
         for handles in self.src_xfer_handles_by_tp_ratio.values():
             for handle in handles:
                 self.nixl_wrapper.release_dlist_handle(handle)
