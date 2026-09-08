@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar
 
@@ -849,6 +850,47 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
                         cache_block_size=kv_c_and_k_pe_cache.shape[1],
                         packed_ds_mla=True,
                     )
+                    if os.environ.get("VLLM_PCP_PEER_GATHER_DEBUG") == "2":
+                        # Race vs mapping: re-gather after a hard cross-rank
+                        # barrier and compare row by row.
+                        import torch.distributed as dist
+
+                        first = chunk_workspace.clone()
+                        torch.cuda.synchronize()
+                        dist.barrier(group=get_pcp_group().device_group)
+                        torch.cuda.synchronize()
+                        gather_pcp_sharded_peer_cache(
+                            cache=kv_c_and_k_pe_cache,
+                            dst=chunk_workspace,
+                            block_table=chunk.block_table,
+                            cu_seq_lens=chunk.cu_seq_lens,
+                            token_to_seq=chunk.token_to_seq,
+                            seq_starts=chunk.seq_starts,
+                            num_tokens=int(chunk.chunk_tot_seqlen),
+                            scale=self._peer_gather_scale,
+                            cache_block_size=kv_c_and_k_pe_cache.shape[1],
+                            packed_ds_mla=True,
+                        )
+                        torch.cuda.synchronize()
+                        row_diff = (first.float() - chunk_workspace.float()).abs().amax(dim=1)
+                        bad = torch.nonzero(row_diff > 1e-3).flatten()
+                        if bad.numel() > 0:
+                            t2s = chunk.token_to_seq[bad]
+                            pos = bad - chunk.cu_seq_lens[t2s]
+                            world = get_pcp_group().world_size
+                            owners = pos % world
+                            logger.warning(
+                                "PEERGATHER-RACE rank=%d tot=%d bad_rows=%d rows[:8]=%s "
+                                "pos[:8]=%s owners_hist=%s first_absmean=%.4f second_absmean=%.4f",
+                                get_pcp_group().rank_in_group,
+                                int(chunk.chunk_tot_seqlen),
+                                int(bad.numel()),
+                                bad[:8].tolist(),
+                                pos[:8].tolist(),
+                                torch.bincount(owners, minlength=world).tolist(),
+                                first[bad].float().abs().mean().item(),
+                                chunk_workspace[bad].float().abs().mean().item(),
+                            )
                 else:
                     ops.cp_gather_and_upconvert_fp8_kv_cache(
                         kv_c_and_k_pe_cache,
