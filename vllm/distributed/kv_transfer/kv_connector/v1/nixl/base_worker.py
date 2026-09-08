@@ -1633,7 +1633,9 @@ class NixlBaseConnectorWorker:
             group_idx = region_group_ids[i]
             split_reads = (
                 1
-                if replicated or group_idx == _SHARED_REGION_GROUP_ID
+                if replicated
+                or group_idx == _SHARED_REGION_GROUP_ID
+                or plan.remote_heads_replicated
                 else len(plan.source_ranks_per_group[group_idx])
             )
             region_split_ratio = (
@@ -1915,6 +1917,7 @@ class NixlBaseConnectorWorker:
             group_spec_types=self._group_spec_types,
             remote_dcp_size=remote_dcp_size,
             attention_group_num_splits=attention_group_num_splits,
+            remote_pcp_size=nixl_agent_meta.pcp_size,
         )
 
         # Keep track of remote agent kv caches base addresses.
@@ -2155,6 +2158,11 @@ class NixlBaseConnectorWorker:
                 "Number of KV layers must match between prefill and decode"
             )
             plan = self.tp_mappings[remote_engine_id]
+            remote_real_tp_size = (
+                remote_tp_size // nixl_agent_meta.pcp_size
+                if nixl_agent_meta.pcp_size > 1 and remote_dcp_size > 1
+                else remote_tp_size
+            )
             model_replicated = self.transfer_topo.is_kv_replicated(remote_engine_id)
             total_kv_heads = self.transfer_topo.total_num_kv_heads
             local_heads = self.transfer_topo.local_physical_heads
@@ -2187,12 +2195,22 @@ class NixlBaseConnectorWorker:
                         f"must equal local {local_len} // splits {num_splits}."
                     )
                 elif tp_ratio > 0:
-                    expected_remote_len = (
-                        local_len * tp_ratio // block_size_ratio
-                        if self.use_mla and has_region_policy
-                        else (local_len * remote_heads // local_heads)
-                        // block_size_ratio
-                    )
+                    if plan.remote_heads_replicated:
+                        # TP1 PCP producer spanned by DCP: each remote shard
+                        # holds every head, so its block is local_tp/remote_tp
+                        # head slices wide.
+                        expected_remote_len = (
+                            local_len
+                            * (self.world_size // remote_real_tp_size)
+                            // block_size_ratio
+                        )
+                    else:
+                        expected_remote_len = (
+                            local_len * tp_ratio // block_size_ratio
+                            if self.use_mla and has_region_policy
+                            else (local_len * remote_heads // local_heads)
+                            // block_size_ratio
+                        )
                     assert remote_len == expected_remote_len, (
                         f"SPLIT region {i}: remote P KV block_len {remote_len} "
                         f"must equal {expected_remote_len} for local block_len "
