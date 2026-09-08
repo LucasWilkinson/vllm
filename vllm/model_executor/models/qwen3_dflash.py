@@ -620,6 +620,12 @@ class DFlashQwen3Model(nn.Module):
         hd = self._head_dim
         nkv = self._num_kv_heads
 
+        if num_ctx == 0 and context_slot_mapping is not None:
+            # A PCP rank can own zero prompt tokens (the FlashMLA sparse
+            # builder does not pad the PCP shard, unlike FlashInfer's). There
+            # is nothing to project or store.
+            return
+
         all_k, all_v = self._project_context_kv(context_states, num_ctx, L, nkv, hd)
         all_k_normed = self._normalize_context_k(all_k)
 
