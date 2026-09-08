@@ -854,8 +854,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     dummy_mm_inputs, mm_budget
                 )
 
+        profile_num_tokens = self.max_num_tokens
+        pcp_size = self.parallel_config.prefill_context_parallel_size
+        if pcp_size > 1:
+            profile_num_tokens = pcp.get_max_num_tokens_for_profile(
+                profile_num_tokens, self.max_num_reqs, pcp_size
+            )
         hidden_states, sample_hidden_states = self._dummy_run(
-            self.max_num_tokens, skip_attn=True, is_profile=True
+            profile_num_tokens, skip_attn=True, is_profile=True
         )
 
         # Only run sampler/pooler on last PP rank (non-last ranks return None).
@@ -1087,7 +1093,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.kv_block_zeroer.zero_block_ids(scheduler_output.new_block_ids_to_zero)
 
         # Apply copy-on-write block copies for partial prefix-cache hits, after
-        # zeroing new blocks and before the forward pass reads them.
+        # zeroing new blocks and before the forward pass reads them. PCP ranks
+        # receive the same scheduler output, so this local copy preserves both
+        # layouts: every rank copies its complete replica when DCP=1, while
+        # DCP=PCP copies the rank-owned shard.
         if scheduler_output.kv_cache_block_copies:
             copy_kv_cache_blocks_inplace(
                 self.kv_caches,
