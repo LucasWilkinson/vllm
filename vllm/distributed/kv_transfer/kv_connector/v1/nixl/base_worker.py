@@ -2184,14 +2184,15 @@ class NixlBaseConnectorWorker:
                 split_regions = [
                     i for i, n in enumerate(region_descs_per_block) if n > 1
                 ]
+                # info_once hashes its args: keep them scalar/str.
                 logger.info_once(
                     "NIXL row-split head-slice reads from engine %s for %d "
                     "%s regions %s: %d rows/block, local row %d B at head "
                     "offset %d of remote row %d B (%d local descs).",
-                    engine_id,
+                    str(engine_id),
                     len(split_regions),
-                    self.kv_cache_layout,
-                    split_regions[:4],
+                    str(self.kv_cache_layout),
+                    str(split_regions[:4]),
                     region_descs_per_block[split_regions[0]],
                     self.block_len_per_layer[split_regions[0]]
                     // region_descs_per_block[split_regions[0]],
