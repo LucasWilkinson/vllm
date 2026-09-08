@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from typing import TYPE_CHECKING, cast
 
 import torch
@@ -11,6 +12,7 @@ from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.distributed.parallel_state import get_pcp_group, get_tp_group
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import MLAAttention
 from vllm.model_executor.layers.attention.attention import get_attention_context
 from vllm.model_executor.layers.attention.pcp_direct_kv import (
@@ -48,6 +50,9 @@ from vllm.v1.attention.ops.pcp import (
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.attention.mla_attention import MLACommonMetadata
+
+
+_dbg_logger = init_logger(__name__)
 
 
 class DeepseekV32Indexer(nn.Module):
@@ -663,6 +668,41 @@ class DeepseekV32Attention(MLAAttention):
         attn_out, lse = self.impl.forward_mqa(  # type: ignore[attr-defined]
             mqa_q_arg, kv_cache, attn_metadata, self
         )
+
+        if pcp_peer_gather and os.environ.get("VLLM_PCP_PEER_GATHER_DEBUG") == "1":
+            # Differential check against the token-sharded path (collective:
+            # every PCP rank takes this branch in a prefill step).
+            if num_actual > 0:
+                ref = self.impl.forward_mqa_token_sharded(  # type: ignore[attr-defined]
+                    (ql_nope[: output.shape[0]], mqa_q[: output.shape[0]]),
+                    kv_cache,
+                    attn_metadata,
+                    self,
+                    get_pcp_group(),
+                    output.shape[0],
+                    self.W_UV,
+                )
+                mine = torch.bmm(
+                    attn_out.view(num_actual, self.num_local_heads, self.kv_lora_rank)
+                    .transpose(0, 1)
+                    .to(self.W_UV.dtype),
+                    self.W_UV,
+                ).transpose(0, 1)
+                diff = (mine.float() - ref.float()).abs()
+                row_max = diff.amax(dim=(1, 2))
+                bad = int((row_max > 1e-1).sum().item())
+                _dbg_logger.warning(
+                    "PEERGATHER-DBG %s rank=%d rows=%d max=%.4f mean=%.5f ref_absmean=%.5f "
+                    "bad_rows=%d first_bad=%s",
+                    self.layer_name,
+                    get_pcp_group().rank_in_group,
+                    num_actual,
+                    diff.max().item(),
+                    diff.mean().item(),
+                    ref.float().abs().mean().item(),
+                    bad,
+                    torch.nonzero(row_max > 1e-1).flatten()[:8].tolist(),
+                )
 
         if self.use_pcp and self.impl.dcp_world_size > 1 and not pcp_peer_gather:
             assert lse is not None and self.dcp_manager is not None
