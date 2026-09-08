@@ -709,6 +709,9 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
         self._ts_stub_meta: tuple[torch.Tensor, torch.Tensor] | None = None
 
         vllm_config = get_current_vllm_config()
+        # Captured here: get_current_vllm_config() is unavailable at forward time.
+        self._max_model_len = vllm_config.model_config.max_model_len
+        self._num_ubatches = max(vllm_config.parallel_config.num_ubatches, 1)
         max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
         q_concat_shape = (max_tokens, num_heads, head_size)
         if is_quantized_kv_cache(kv_cache_dtype):
@@ -1037,10 +1040,7 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
             if self._ts_stub_meta is None:
                 self._ts_stub_meta = (
                     torch.full(
-                        (1,),
-                        get_current_vllm_config().model_config.max_model_len,
-                        dtype=torch.int32,
-                        device=device,
+                        (1,), self._max_model_len, dtype=torch.int32, device=device
                     ),
                     torch.empty((1, 1), dtype=torch.int32, device=device),
                 )
@@ -1086,9 +1086,7 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
         if not envs.VLLM_USE_DIRECT_PCP_TOKEN_SHARDED:
             return None
         rows = self.TOKEN_SHARDED_ROWS_PER_RANK
-        num_ubatches = max(
-            get_current_vllm_config().parallel_config.num_ubatches, 1
-        )
+        num_ubatches = self._num_ubatches
         q_gather = get_direct_dcp_q_gather_workspace(
             cp_group, device, 1, rows * num_heads, q_dim, torch.bfloat16, num_ubatches
         )
