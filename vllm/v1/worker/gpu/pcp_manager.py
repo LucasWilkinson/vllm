@@ -2,12 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Iterator
 from dataclasses import dataclass, replace
+from typing import Any
 
 import numpy as np
 import torch
 
 import vllm.envs as envs
-from vllm.config import VllmConfig
+from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed.parallel_state import (
     get_dcp_group,
     get_pcp_group,
@@ -97,10 +98,12 @@ class PCPManager:
         self._global_batch: InputBatch | None = None
         self._replicated_verification = False
         self._replicated_verification_num_tokens_padded: int | None = None
+        self._num_local_tokens_padded = 0
         self._req_states = req_states
         self._block_tables = block_tables
         self._hidden_restore_idx: torch.Tensor | None = None
         self._padded_gather_idx: torch.Tensor | None = None
+        self._gathered_query_valid_mask: torch.Tensor | None = None
         self._gathered_kv_write_mask: torch.Tensor | None = None
         self._pad_slot_id = torch.tensor(PAD_SLOT_ID, dtype=torch.int64, device=device)
 
@@ -428,6 +431,7 @@ class PCPManager:
             )
         num_expanded_tokens = padded_num_tokens * self.pcp_world_size
         padded_gather_idx = np.zeros(num_expanded_tokens, dtype=np.int64)
+        gathered_query_valid_mask = np.zeros(num_expanded_tokens, dtype=np.bool_)
         gathered_kv_write_mask = np.zeros(num_expanded_tokens, dtype=np.bool_)
         for rank, segments in enumerate(segments_by_rank):
             expanded_rank_offset = rank * padded_num_tokens
@@ -441,6 +445,7 @@ class PCPManager:
                     segment.global_batch_slice.stop,
                     dtype=np.int64,
                 )
+                gathered_query_valid_mask[padded_gathered_slice] = True
                 # Cache insertion pairs one slot entry with each rank's local decode.
                 if not bool(is_prefilling[segment.global_batch_req_idx]) and rank != 0:
                     continue
@@ -456,6 +461,9 @@ class PCPManager:
         )
         self._padded_gather_idx = async_copy_to_gpu(
             padded_gather_idx, device=self.device
+        )
+        self._gathered_query_valid_mask = async_copy_to_gpu(
+            gathered_query_valid_mask, device=self.device
         )
         self._gathered_kv_write_mask = async_copy_to_gpu(
             gathered_kv_write_mask, device=self.device
@@ -643,6 +651,7 @@ class PCPManager:
                 "PCP local token count exceeds the MRV2 input buffer size: "
                 f"{num_local_tokens_padded} > {input_buffers.max_num_tokens}."
             )
+        self._num_local_tokens_padded = num_local_tokens_padded
         rank_token_start = self.pcp_rank * num_local_tokens_padded
         assert self._padded_gather_idx is not None
         local_gather_idx = self._padded_gather_idx[
@@ -903,6 +912,112 @@ class PCPManager:
             out=gathered_kv_slot_mappings,
         )
         return gathered_kv_slot_mappings
+
+    def add_token_sharded_indexer_metadata(
+        self,
+        model_state: Any,
+        input_batch: InputBatch,
+        attn_metadata: dict[str, Any],
+        attn_groups: list[list[Any]],
+        kv_cache_config: Any,
+        dummy_run: bool,
+    ) -> dict[str, Any]:
+        """DCP spanning the PCP group: rebuild the sparse indexer's metadata from
+        the *global* PCP batch so every rank scores identical rows against its K
+        shard (the DCP top-k merge all-gathers per row), and attach the index
+        maps the indexer op needs to gather queries and keep its own rows."""
+        if (
+            not self._direct_kv_requested
+            or self.dcp_world_size <= 1
+            or self.dcp_world_size != self.pcp_world_size
+            or self._global_batch is None
+            or self._padded_gather_idx is None
+            or self._hidden_restore_idx is None
+            or self._gathered_query_valid_mask is None
+            or self._replicated_verification
+            or not input_batch.has_prefill
+        ):
+            return attn_metadata
+        if dummy_run:
+            # Dummy batches are built directly (not partitioned), so there is no
+            # global batch to describe. The sparse paths then run a local-only
+            # simulation with the same shapes/memory and no cross-rank gathers.
+            return attn_metadata
+        indexer_groups = [
+            [g for g in groups if g.backend.get_name() == "DEEPSEEK_V32_INDEXER"]
+            for groups in attn_groups
+        ]
+        sparse_mla_groups = [
+            [
+                g
+                for g in groups
+                if g.backend.get_name().startswith(
+                    "FLASHINFER_MLA_SPARSE"
+                )
+            ]
+            for groups in attn_groups
+        ]
+        if not any(indexer_groups) and not any(sparse_mla_groups):
+            return attn_metadata
+        assert self._block_tables is not None
+        global_batch = self._global_batch
+        block_tables = self._block_tables.gather_block_tables(
+            global_batch.idx_mapping,
+            global_batch.num_reqs_after_padding,
+        )
+        num_global_tokens = self._hidden_restore_idx.shape[0]
+        if dummy_run or self._global_batch_slot_mappings is None:
+            slot_mappings = torch.full(
+                (self._block_tables.num_kv_cache_groups, num_global_tokens),
+                PAD_SLOT_ID,
+                dtype=torch.int64,
+                device=self.device,
+            )
+        else:
+            slot_mappings = self._global_batch_slot_mappings[:, :num_global_tokens]
+
+        global_metadata = model_state.prepare_attn(
+            global_batch,
+            CUDAGraphMode.NONE,
+            block_tables,
+            slot_mappings,
+            indexer_groups,
+            kv_cache_config,
+        )
+        num_padded = self._num_local_tokens_padded
+        # Global request id per gathered (rank-major, padded) row for the sparse
+        # MLA token-sharded attention; padding rows map to request 0 and carry
+        # top-k -1, so they never touch the cache.
+        global_req_id = torch.repeat_interleave(
+            torch.arange(global_batch.num_reqs, device=self.device, dtype=torch.int32),
+            torch.from_numpy(
+                global_batch.num_scheduled_tokens[: global_batch.num_reqs].astype(
+                    np.int64
+                )
+            ).to(self.device, non_blocking=True),
+        )
+        if global_req_id.shape[0] < num_global_tokens:
+            global_req_id = torch.nn.functional.pad(
+                global_req_id, (0, num_global_tokens - global_req_id.shape[0])
+            )
+        for i, groups in enumerate(sparse_mla_groups):
+            for g in groups:
+                for layer_name in g.layer_names:
+                    meta = attn_metadata.get(layer_name)
+                    if meta is None:
+                        continue
+                    meta.pcp_global_req_id = global_req_id
+                    meta.pcp_gather_idx = self._padded_gather_idx
+                    meta.pcp_gather_valid_mask = self._gathered_query_valid_mask
+                    meta.pcp_global_block_table = block_tables[i]
+        if not any(indexer_groups):
+            return attn_metadata
+        for layer_name, meta in global_metadata.items():
+            meta.pcp_num_padded = num_padded
+            meta.pcp_restore_idx = self._hidden_restore_idx
+            meta.pcp_gathered_slot_mapping = attn_metadata[layer_name].slot_mapping
+            attn_metadata[layer_name] = meta
+        return attn_metadata
 
     def restore_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
         assert self._global_batch is not None

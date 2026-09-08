@@ -9,7 +9,7 @@ from transformers import DeepseekV2Config, DeepseekV3Config
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
-from vllm.distributed.parallel_state import get_tp_group
+from vllm.distributed.parallel_state import get_pcp_group, get_tp_group
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention import MLAAttention
 from vllm.model_executor.layers.attention.attention import get_attention_context
@@ -586,7 +586,7 @@ class DeepseekV32Attention(MLAAttention):
                 self.kv_cache_dtype,
                 self._k_scale,
             )
-            # Rank-symmetric peer-cache fence # __DCP4_SPARSE_FENCE_FIX__: publish this
+            # Rank-symmetric peer-cache fence: publish this
             # rank's sharded DCP KV writes before any peer reads them in
             # forward_mqa. The dense path fences here unconditionally; the
             # sparse decode/prefill path must too, otherwise peers race
@@ -610,19 +610,45 @@ class DeepseekV32Attention(MLAAttention):
                 publish_pcp_sharded_peer_kv()
 
         num_actual = attn_metadata.num_actual_tokens  # type: ignore[attr-defined]
-        if num_actual == 0:
+        pcp_token_sharded = (
+            self.use_pcp
+            and self.impl.dcp_world_size > 1
+            and self.impl.dcp_world_size == self.impl.pcp_world_size
+            # The global metadata is attached only when the batch has prefill.
+            and attn_metadata.num_prefills > 0
+        )
+        if num_actual == 0 and not pcp_token_sharded:
             output.zero_()
             return
 
         if self._fp8_kv_needs_view:
             kv_cache = kv_cache.view(torch.float8_e4m3fn)
+        query_rows = output.shape[0] if pcp_token_sharded else num_actual
         if self._fp8_query:
             # FlashInfer sparse: single packed fp8 query.
             mqa_q_arg: torch.Tensor | tuple[torch.Tensor, torch.Tensor] = mqa_q[
-                :num_actual
+                :query_rows
             ]
         else:
-            mqa_q_arg = (ql_nope[:num_actual], mqa_q[:num_actual])
+            mqa_q_arg = (ql_nope[:query_rows], mqa_q[:query_rows])
+
+        if pcp_token_sharded:
+            attn_out = self.impl.forward_mqa_token_sharded(  # type: ignore[attr-defined]
+                mqa_q_arg,
+                kv_cache,
+                attn_metadata,
+                self,
+                get_pcp_group(),
+                query_rows,
+                self.W_UV,
+            )
+            if num_actual > 0:
+                output[:num_actual].view(
+                    num_actual, self.num_local_heads, self.v_head_dim
+                ).copy_(attn_out)
+            if num_actual < output.shape[0]:
+                output[num_actual:].zero_()
+            return
 
         if self.use_pcp and self.impl.dcp_world_size > self.impl.pcp_world_size:
             if isinstance(mqa_q_arg, tuple):
