@@ -201,7 +201,6 @@ if TYPE_CHECKING:
     VLLM_USE_DIRECT_DCP_A2A: bool | None = None
     VLLM_USE_DIRECT_DCP_Q_GATHER: bool | None = None
     VLLM_USE_DIRECT_DCP_KV_GATHER: bool | None = None
-    VLLM_PCP_SPARSE_PEER_GATHER: bool = True
     VLLM_USE_PCP_DIRECT_KV: bool = False
     VLLM_DEEP_GEMM_WARMUP: Literal[
         "skip",
@@ -2146,13 +2145,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_USE_DIRECT_DCP_KV_GATHER": lambda: maybe_convert_bool(
         os.getenv("VLLM_USE_DIRECT_DCP_KV_GATHER")
-    ),
-    # PCP-spanning DCP sparse-MLA prefill (FlashMLA): gather each request's
-    # context KV directly from the DCP peers' caches (symmetric memory, no
-    # collective) into the bf16 prefill workspace and attend locally, instead
-    # of the token-sharded path (query all-gather + LSE merge per chunk).
-    "VLLM_PCP_SPARSE_PEER_GATHER": lambda: bool(
-        int(os.getenv("VLLM_PCP_SPARSE_PEER_GATHER", "1"))
     ),
     # Whether to enable dual cuda streams for LoRA computation
     # (used by both BaseLinearLayerWithLoRA and FusedMoEWithLoRA to

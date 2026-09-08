@@ -6,7 +6,6 @@ from typing import TYPE_CHECKING, ClassVar
 import torch
 
 from vllm import _custom_ops as ops
-from vllm import envs
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.config.cache import CacheDType
 from vllm.distributed.parallel_state import get_pcp_group
@@ -356,17 +355,16 @@ class FlashMLASparseMetadataBuilder(
         self.pcp_peer_gather_prefill = (
             pcp_spans_dcp
             and self.use_fp8_kv_cache
-            and envs.VLLM_PCP_SPARSE_PEER_GATHER
             and should_allocate_pcp_direct_kv(vllm_config)
         )
         self.fp8_use_mixed_batch = self.num_heads < MIN_HEADS_FOR_BF16_PREFILL
         if pcp_spans_dcp and not self.pcp_peer_gather_prefill:
             raise NotImplementedError(
-                "PCP-spanning DCP sparse prefill on FlashMLA (SM90) needs the "
-                "peer-gather path: an fp8 KV cache, direct PCP KV "
-                "(VLLM_USE_PCP_DIRECT_KV=1) and VLLM_PCP_SPARSE_PEER_GATHER=1. "
-                "The token-sharded exchange is only implemented for the "
-                "FlashInfer sparse MLA backend (SM100)."
+                "PCP-spanning DCP sparse prefill on FlashMLA (SM90) reads the "
+                "context KV from the DCP peers' caches and needs an fp8 KV cache "
+                "and direct PCP KV (VLLM_USE_PCP_DIRECT_KV=1). The token-sharded "
+                "exchange is only implemented for the FlashInfer sparse MLA "
+                "backend (SM100)."
             )
         if self.pcp_peer_gather_prefill and self.fp8_use_mixed_batch:
             raise NotImplementedError(
@@ -377,7 +375,7 @@ class FlashMLASparseMetadataBuilder(
         if self.pcp_peer_gather_prefill:
             logger.info_once(
                 "FlashMLA sparse: PCP-spanning DCP prefill gathers context KV "
-                "directly from peer caches (VLLM_PCP_SPARSE_PEER_GATHER=1)."
+                "directly from peer caches."
             )
 
         if dcp_world_size > 1 and not self.pcp_peer_gather_prefill:
