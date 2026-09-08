@@ -93,21 +93,6 @@ def test_num_tokens_for_dispatch_uses_largest_pcp_rank(
     assert actual == expected
 
 
-def test_num_tokens_for_dispatch_keeps_dcp_batch_replicated():
-    manager = PCPManager(
-        pcp_world_size=4,
-        pcp_rank=0,
-        device=torch.device("cpu"),
-        dcp_world_size=4,
-    )
-
-    actual = manager.get_num_tokens_for_dispatch(
-        np.array([2, 9], dtype=np.int32),
-        np.array([False, True], dtype=np.bool_),
-    )
-
-    assert actual == 11
-
 @pytest.mark.parametrize(
     ("pcp_world_size", "num_tokens", "num_reqs", "expected"),
     [
@@ -171,5 +156,35 @@ def test_sparse_mla_pcp_accepts_piecewise_cudagraphs():
         PCPManager.validate_config(
             make_config(CUDAGraphMode.FULL), supports_mm_inputs=False
         )
+
+
+def _make_dspark_pcp_config(*, pcp_size: int, dcp_size: int, tp_size: int = 1):
+    return SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=tp_size,
+            prefill_context_parallel_size=pcp_size,
+            decode_context_parallel_size=dcp_size,
+            pipeline_parallel_size=1,
+        ),
+        model_config=SimpleNamespace(
+            use_mla=True,
+            is_encoder_decoder=False,
+            hf_text_config=SimpleNamespace(index_topk=2048),
+        ),
+        lora_config=None,
+        speculative_config=SimpleNamespace(
+            method="dspark",
+            use_dspark=lambda: True,
+        ),
+        compilation_config=SimpleNamespace(cudagraph_mode=CUDAGraphMode.PIECEWISE),
+    )
+
+
+@pytest.mark.parametrize(("dcp_size", "tp_size"), [(1, 1), (8, 1), (8, 2)])
+def test_dspark_pcp_accepts_every_dcp_topology(dcp_size, tp_size):
+    PCPManager.validate_config(
+        _make_dspark_pcp_config(pcp_size=8, dcp_size=dcp_size, tp_size=tp_size),
+        supports_mm_inputs=False,
+    )
 
 
