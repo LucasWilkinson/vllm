@@ -9,9 +9,14 @@ from vllm import _custom_ops as ops
 from vllm import envs
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.config.cache import CacheDType
-from vllm.distributed.parallel_state import GroupCoordinator
+from vllm.distributed.parallel_state import GroupCoordinator, get_pcp_group
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.mla_attention import MLACommonPrefillMetadata
+from vllm.model_executor.layers.attention.pcp_direct_kv import (
+    gather_pcp_sharded_peer_cache,
+    pcp_sharded_peer_kv_active,
+    should_allocate_pcp_direct_kv,
+)
 from vllm.model_executor.layers.attention.sparse_mla_attention import (
     SparseMLACommonImpl,
     SparseMLACommonMetadataBuilder,
@@ -202,6 +207,12 @@ class FlashMLASparseMetadata(AttentionMetadata):
                 req_start_idx: int
                 workspace_starts: torch.Tensor
                 chunk_tot_seqlen: int
+                # Peer-gather prefill (PCP-spanning DCP): per-chunk row maps
+                # for gather_pcp_sharded_peer_cache. Rows cover [0, seq_len)
+                # of every request, so seq_starts is all zeros.
+                cu_seq_lens: torch.Tensor | None = None
+                token_to_seq: torch.Tensor | None = None
+                seq_starts: torch.Tensor | None = None
 
             chunks: list[Chunk]
 
@@ -225,6 +236,12 @@ class FlashMLASparseMetadata(AttentionMetadata):
     pcp_gather_idx: torch.Tensor | None = None
     pcp_gather_valid_mask: torch.Tensor | None = None
     pcp_global_block_table: torch.Tensor | None = None
+    # PCP-spanning DCP prefill attends locally over context KV gathered from
+    # the DCP peers (pcp_direct_kv) instead of the token-sharded exchange.
+    pcp_peer_gather_prefill: bool = False
+    # Padded local row count of the attention layer (rank-major stride of
+    # pcp_gather_idx); set by the attention layer before forward_mqa.
+    pcp_num_padded_rows: int | None = None
 
 
 def get_prefill_workspace_size(max_model_len: int):
@@ -340,11 +357,32 @@ class FlashMLASparseMetadataBuilder(
         # Unlike ordinary DCP, PCP-spanning DCP does not gather query heads, so
         # the local fp8 decode head envelope remains the kernel envelope.
         pcp_spans_dcp = pcp_world_size > 1 and pcp_world_size == dcp_world_size
-        self.fp8_use_mixed_batch = (
-            self.num_heads < MIN_HEADS_FOR_BF16_PREFILL or pcp_spans_dcp
+        # With direct peer KV views every rank can read the whole context of
+        # its own prefill rows straight from the DCP owners, so the prefill
+        # runs the separate bf16 workspace path locally: no query gather, no
+        # LSE merge. Decode rows are not supported in this mode (prefiller).
+        self.pcp_peer_gather_prefill = (
+            pcp_spans_dcp
+            and self.use_fp8_kv_cache
+            and envs.VLLM_PCP_SPARSE_PEER_GATHER
+            and should_allocate_pcp_direct_kv(vllm_config)
         )
+        self.fp8_use_mixed_batch = self.num_heads < MIN_HEADS_FOR_BF16_PREFILL or (
+            pcp_spans_dcp and not self.pcp_peer_gather_prefill
+        )
+        if self.pcp_peer_gather_prefill and self.fp8_use_mixed_batch:
+            raise NotImplementedError(
+                "PCP peer-gather sparse prefill needs the bf16 prefill workspace "
+                f"path (num_heads >= {MIN_HEADS_FOR_BF16_PREFILL}); got "
+                f"{self.num_heads} heads"
+            )
+        if self.pcp_peer_gather_prefill:
+            logger.info_once(
+                "FlashMLA sparse: PCP-spanning DCP prefill gathers context KV "
+                "directly from peer caches (VLLM_PCP_SPARSE_PEER_GATHER=1)."
+            )
 
-        if dcp_world_size > 1:
+        if dcp_world_size > 1 and not self.pcp_peer_gather_prefill:
             if parallel_config.dcp_comm_backend != "ag_rs":
                 raise NotImplementedError(
                     "DCP for FlashMLA sparse is only validated with the "
@@ -424,6 +462,16 @@ class FlashMLASparseMetadataBuilder(
             metadata.num_decode_tokens,
             num_tokens - metadata.num_decode_tokens,
         )
+        if self.pcp_peer_gather_prefill:
+            # The fp8 decode kernel only sees this rank's KV shard. Under
+            # peer-gather every row (including short, decode-classified
+            # chunked-prefill tails) attends over the gathered full context.
+            num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
+                0,
+                metadata.num_decodes + metadata.num_prefills,
+                0,
+                num_tokens,
+            )
 
         decode_query_len = 0
         active_num_decodes = num_decodes
@@ -516,6 +564,25 @@ class FlashMLASparseMetadataBuilder(
                     num_decodes + chunk_start : num_decodes + chunk_end
                 ]
 
+                chunk_cu_seq_lens = None
+                chunk_token_to_seq = None
+                chunk_seq_starts = None
+                if self.pcp_peer_gather_prefill:
+                    chunk_seq_lens_cpu = prefill_seq_lens_cpu[chunk_start:chunk_end]
+                    cu_cpu = torch.zeros(
+                        chunk_end - chunk_start + 1, dtype=torch.int32
+                    )
+                    cu_cpu[1:] = torch.cumsum(chunk_seq_lens_cpu, dim=0)
+                    t2s_cpu = torch.repeat_interleave(
+                        torch.arange(chunk_end - chunk_start, dtype=torch.int32),
+                        chunk_seq_lens_cpu.to(torch.int64),
+                    )
+                    chunk_cu_seq_lens = cu_cpu.to(self.device, non_blocking=True)
+                    chunk_token_to_seq = t2s_cpu.to(self.device, non_blocking=True)
+                    chunk_seq_starts = torch.zeros(
+                        chunk_end - chunk_start, dtype=torch.int32, device=self.device
+                    )
+
                 prefill_chunks.append(
                     FP8Meta.Prefill.Chunk(
                         tokens_slice=tokens_slice,
@@ -523,6 +590,9 @@ class FlashMLASparseMetadataBuilder(
                         req_start_idx=chunk_start,
                         workspace_starts=chunk_workspace_starts,
                         chunk_tot_seqlen=chunk_tot_seqlen,
+                        cu_seq_lens=chunk_cu_seq_lens,
+                        token_to_seq=chunk_token_to_seq,
+                        seq_starts=chunk_seq_starts,
                     )
                 )
 
@@ -564,6 +634,7 @@ class FlashMLASparseMetadataBuilder(
         metadata.physical_topk_valid_counts = self.physical_topk_valid_counts
 
         metadata.fp8_use_mixed_batch = self.fp8_use_mixed_batch
+        metadata.pcp_peer_gather_prefill = self.pcp_peer_gather_prefill
         if self.use_fp8_kv_cache:
             if self.fp8_use_mixed_batch:
                 metadata.fp8_extra_metadata = self._build_fp8_mixed_decode_prefill(
@@ -637,8 +708,13 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
         ) = None
         self._ts_direct_resolved = False
         self._ts_stage: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
+        self._peer_gather_scale: torch.Tensor | None = None
+        self._ts_stub_meta: tuple[torch.Tensor, torch.Tensor] | None = None
 
         vllm_config = get_current_vllm_config()
+        # Captured here: get_current_vllm_config() is unavailable at forward time.
+        self._max_model_len = vllm_config.model_config.max_model_len
+        self._num_ubatches = max(vllm_config.parallel_config.num_ubatches, 1)
         max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
         q_concat_shape = (max_tokens, num_heads, head_size)
         if is_quantized_kv_cache(kv_cache_dtype):
@@ -751,13 +827,39 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
             assert fp8_metadata.prefill is not None
             for chunk in fp8_metadata.prefill.chunks:
                 chunk_workspace = self.prefill_bf16_workspace[: chunk.chunk_tot_seqlen]
-                ops.cp_gather_and_upconvert_fp8_kv_cache(
-                    kv_c_and_k_pe_cache,
-                    chunk_workspace,
-                    chunk.block_table,
-                    chunk.workspace_starts,
-                    len(chunk.block_table),
-                )
+                if (
+                    attn_metadata.pcp_peer_gather_prefill
+                    and chunk.cu_seq_lens is not None
+                    and pcp_sharded_peer_kv_active()
+                ):
+                    # Rows of every request's context live on the DCP owner of
+                    # each position; read them from the peer caches in place.
+                    assert chunk.token_to_seq is not None
+                    assert chunk.seq_starts is not None
+                    if self._peer_gather_scale is None:
+                        self._peer_gather_scale = torch.ones(
+                            (), dtype=torch.float32, device=q.device
+                        )
+                    gather_pcp_sharded_peer_cache(
+                        cache=kv_c_and_k_pe_cache,
+                        dst=chunk_workspace,
+                        block_table=chunk.block_table,
+                        cu_seq_lens=chunk.cu_seq_lens,
+                        token_to_seq=chunk.token_to_seq,
+                        seq_starts=chunk.seq_starts,
+                        num_tokens=int(chunk.chunk_tot_seqlen),
+                        scale=self._peer_gather_scale,
+                        cache_block_size=kv_c_and_k_pe_cache.shape[1],
+                        packed_ds_mla=True,
+                    )
+                else:
+                    ops.cp_gather_and_upconvert_fp8_kv_cache(
+                        kv_c_and_k_pe_cache,
+                        chunk_workspace,
+                        chunk.block_table,
+                        chunk.workspace_starts,
+                        len(chunk.block_table),
+                    )
 
                 chunk_q = q[chunk.tokens_slice]
                 chunk_topk_indices_workspace = topk_indices[chunk.tokens_slice]
@@ -933,7 +1035,19 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
         row count. cache_lens and the dummy block table are shape-independent.
         """
         base = attn_metadata.fp8_extra_metadata
-        assert isinstance(base, FlashMLASparseMetadata.FP8KernelMetadata)
+        if isinstance(base, FlashMLASparseMetadata.FP8KernelMetadata):
+            cache_lens, dummy_block_table = base.cache_lens, base.dummy_block_table
+        else:
+            # Separate prefill/decode metadata (peer-gather mode): the fp8
+            # kernel ignores both when `indices` is given; keep shape-valid stubs.
+            if self._ts_stub_meta is None:
+                self._ts_stub_meta = (
+                    torch.full(
+                        (1,), self._max_model_len, dtype=torch.int32, device=device
+                    ),
+                    torch.empty((1, 1), dtype=torch.int32, device=device),
+                )
+            cache_lens, dummy_block_table = self._ts_stub_meta
         sched = self._token_sharded_sched_meta.get(num_rows)
         if sched is None:
             padded_heads = self.fp8_decode_padded_heads
@@ -951,8 +1065,8 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
             self._token_sharded_sched_meta[num_rows] = sched
         return FlashMLASparseMetadata.FP8KernelMetadata(
             scheduler_metadata=sched,
-            cache_lens=base.cache_lens,
-            dummy_block_table=base.dummy_block_table,
+            cache_lens=cache_lens,
+            dummy_block_table=dummy_block_table,
         )
 
     def _token_sharded_direct_workspaces(
@@ -975,9 +1089,7 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
         if not envs.VLLM_USE_DIRECT_PCP_TOKEN_SHARDED:
             return None
         rows = self.TOKEN_SHARDED_ROWS_PER_RANK
-        num_ubatches = max(
-            get_current_vllm_config().parallel_config.num_ubatches, 1
-        )
+        num_ubatches = self._num_ubatches
         q_gather = get_direct_dcp_q_gather_workspace(
             cp_group, device, 1, rows * num_heads, q_dim, torch.bfloat16, num_ubatches
         )
@@ -1027,10 +1139,10 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
         num_actual = attn_metadata.num_actual_tokens
         assert q.shape[0] >= num_padded_tokens >= num_actual
         assert self.topk_indices_buffer is not None
-        if self.kv_cache_dtype != "fp8_ds_mla" or not attn_metadata.fp8_use_mixed_batch:
+        if self.kv_cache_dtype != "fp8_ds_mla":
             raise NotImplementedError(
                 "FlashMLA sparse token-sharded PCP/DCP attention requires the "
-                "fp8_ds_mla mixed-batch path"
+                "fp8_ds_mla kv-cache"
             )
 
         global_req_id = attn_metadata.pcp_global_req_id
@@ -1207,7 +1319,25 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
             layer, "indexer", None
         ) is not None and not getattr(layer, "skip_topk", False)
 
-        if self.dcp_world_size > 1:
+        peer_gather = attn_metadata.pcp_peer_gather_prefill
+        if peer_gather and attn_metadata.pcp_gather_idx is not None:
+            # The indexer's token-sharded path scored every rank's rows and
+            # left the merged global top-k in global token order; pick this
+            # rank's rows (rank-major gather index -> global row). The
+            # rank-major stride is the attention layer's padded row count
+            # (pcp_num_padded_rows), exactly as the token-sharded path views it.
+            pcp_group = get_pcp_group()
+            world = pcp_group.world_size
+            rank = pcp_group.rank_in_group
+            padded_rows = getattr(attn_metadata, "pcp_num_padded_rows", None)
+            flat_idx = attn_metadata.pcp_gather_idx
+            if padded_rows is None:
+                padded_rows = flat_idx.numel() // world
+            gather_idx = flat_idx.view(-1)[: world * padded_rows].view(world, padded_rows)
+            local_rows = gather_idx[rank, :num_actual_toks]
+            topk_indices = self.topk_indices_buffer[local_rows]
+
+        if self.dcp_world_size > 1 and not peer_gather:
             topk_length = None
         else:
             assert attn_metadata.physical_topk_indices is not None
