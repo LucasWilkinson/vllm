@@ -385,6 +385,7 @@ def sparse_attn_indexer(
     has_decode = attn_metadata_narrowed.num_decodes > 0
     has_prefill = attn_metadata_narrowed.num_prefills > 0
     num_decode_tokens = attn_metadata_narrowed.num_decode_tokens
+    pcp_token_sharded = use_pcp and attn_metadata_narrowed.pcp_num_padded is not None
 
     # q_scale is required iff the FP4 cache path is enabled; the FP8 path
     # folds the Q scale into `weights` inside fused_indexer_q_rope_quant.
@@ -397,19 +398,28 @@ def sparse_attn_indexer(
     # size while slot_mapping only covers actual tokens. Truncate k to avoid
     # out-of-bounds reads in the kernel.
     # Keep PCP padding so every rank contributes the same all-gather shape.
+    slot_mapping_for_gather = slot_mapping
     if k is not None:
-        k = _narrow_indexer_k_to_slot_layout(
-            k,
-            slot_mapping,
-            use_pcp,
-            get_pcp_group().world_size if use_pcp else 1,
-        )
+        if pcp_token_sharded:
+            assert attn_metadata_narrowed.pcp_num_padded is not None
+            assert attn_metadata_narrowed.pcp_gathered_slot_mapping is not None
+            k = k[: attn_metadata_narrowed.pcp_num_padded]
+            slot_mapping_for_gather = (
+                attn_metadata_narrowed.pcp_gathered_slot_mapping
+            )
+        else:
+            k = _narrow_indexer_k_to_slot_layout(
+                k,
+                slot_mapping,
+                use_pcp,
+                get_pcp_group().world_size if use_pcp else 1,
+            )
 
     if not skip_k_cache_insert:
         assert k is not None
         k, slot_mapping_for_cache = maybe_gather_indexer_k(
             k,
-            slot_mapping,
+            slot_mapping_for_gather,
             num_decode_tokens,
             use_pcp,
         )
@@ -450,13 +460,49 @@ def sparse_attn_indexer(
                 dense_mha_selected and mla_num_decode_tokens == num_decode_tokens
             )
 
+    topk_buffer_rows = hidden_states.shape[0]
+    if pcp_token_sharded:
+        pcp_group = get_pcp_group()
+        num_padded = attn_metadata_narrowed.pcp_num_padded
+        restore_idx = attn_metadata_narrowed.pcp_restore_idx
+        assert num_padded is not None and restore_idx is not None
+
+        # Every DCP rank must score identical query rows against its own KV
+        # shard. Gather uniform PCP-padded Q/weights in rank-major order, then
+        # restore the active rows to global token order before local scoring.
+        q_shape = q_quant.shape[1:]
+        q_bytes = q_quant[:num_padded].reshape(num_padded, -1).view(torch.uint8)
+        w_bytes = weights[:num_padded].contiguous().view(torch.uint8)
+        packed = pcp_group.all_gather(torch.cat((q_bytes, w_bytes), dim=1), dim=0)
+        q_quant = (
+            packed[:, : q_bytes.shape[1]]
+            .contiguous()
+            .view(q_quant.dtype)
+            .view(-1, *q_shape)[restore_idx]
+        )
+        weights = (
+            packed[:, q_bytes.shape[1] :]
+            .contiguous()
+            .view(weights.dtype)
+            .view(-1, weights.shape[1])[restore_idx]
+        )
+        if q_scale is not None:
+            q_scale = pcp_group.all_gather(
+                q_scale[:num_padded].contiguous(), dim=0
+            )[restore_idx]
+        # The shared buffer is sized for the global scheduler token budget.
+        # Reuse it for global scoring instead of allocating another
+        # max_tokens x topk tensor once per sparse layer.
+        topk_buffer_rows = restore_idx.shape[0]
+        assert topk_buffer_rows <= topk_indices_buffer.shape[0]
+
     # The buffer must be pre-filled with -1 (the "no token" sentinel) before the
     # top-k kernels scatter valid indices into it. On the fused deepseek_v32
     # nvidia path, _fused_norm_rope_kernel already cleared the same
     # [:num_tokens, :topk] region earlier in this forward, so skip the redundant
     # fill.
-    if not skip_topk_buffer_clear:
-        topk_indices_buffer[: hidden_states.shape[0]] = -1
+    if pcp_token_sharded or not skip_topk_buffer_clear:
+        topk_indices_buffer[:topk_buffer_rows] = -1
     if has_prefill and not dense_prefill:
         prefill_metadata = attn_metadata_narrowed.prefill
         assert prefill_metadata is not None
@@ -553,6 +599,12 @@ def sparse_attn_indexer(
                 cp_kv_cache_interleave_size,
                 row_starts=chunk.cu_seqlen_ks,
             )
+
+    if pcp_token_sharded:
+        # _merge_dcp_topk_global replicated the exact global rows on every
+        # rank. Keep that representation for sparse attention; compacting to
+        # local PCP rows would only force attention to AllGather it again.
+        return topk_indices_buffer
 
     if has_decode:
         decode_metadata = attn_metadata_narrowed.decode

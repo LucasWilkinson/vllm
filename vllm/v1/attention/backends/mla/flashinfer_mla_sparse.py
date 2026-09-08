@@ -8,8 +8,9 @@ from typing import TYPE_CHECKING, ClassVar
 import torch
 
 from vllm import envs
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.config.cache import CacheDType
+from vllm.distributed.parallel_state import GroupCoordinator
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.mla_attention import MLACommonPrefillMetadata
 from vllm.model_executor.layers.attention.sparse_mla_attention import (
@@ -30,6 +31,11 @@ from vllm.v1.attention.backend import (
 from vllm.v1.attention.backends.mla.sparse_utils import (
     triton_convert_req_index_to_global_index,
     triton_filter_and_convert_dcp_index,
+)
+from vllm.v1.attention.ops.dcp import (
+    CPTritonContext,
+    correct_attn_out,
+    dcp_a2a_lse_reduce_token_sharded,
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
 
@@ -238,6 +244,13 @@ class FlashInferMLASparseMetadata(AttentionMetadata):
     physical_topk_valid_counts: torch.Tensor | None = None
     physical_topk_is_valid: bool = False
 
+    # Rank-major padded query ownership and the global request block table for
+    # PCP-token-sharded DCP attention. None for capture/dummy batches.
+    pcp_global_req_id: torch.Tensor | None = None
+    pcp_gather_idx: torch.Tensor | None = None
+    pcp_gather_valid_mask: torch.Tensor | None = None
+    pcp_global_block_table: torch.Tensor | None = None
+
 
 class FlashInferMLASparseMetadataBuilder(
     SparseMLACommonMetadataBuilder[FlashInferMLASparseMetadata]
@@ -378,11 +391,73 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
         self._workspace_buffer: torch.Tensor | None = None
         self.bmm1_scale: float | None = None
         self.bmm2_scale: float | None = None
+        self.dcp_comm_backend = (
+            get_current_vllm_config().parallel_config.dcp_comm_backend
+        )
 
         # fp8 query quantization is required when using fp8 kv_cache,
         # as the TRTLLM-GEN sparse MLA kernel requires matching dtypes
         # for query and kv_cache (mixed bf16+fp8 is not supported).
         self.supports_quant_query_input = True
+
+    def _run_sparse_mqa_kernel(
+        self,
+        q: torch.Tensor,
+        kv_c_and_k_pe_cache: torch.Tensor,
+        topk_indices_physical: torch.Tensor,
+        seq_lens: torch.Tensor,
+        attn_metadata: FlashInferMLASparseMetadata,
+        layer: AttentionLayer,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if self._workspace_buffer is None:
+            self._workspace_buffer = _get_workspace_buffer(q.device)
+
+        if self.bmm1_scale is None:
+            self.bmm1_scale = self.scale
+            if is_quantized_kv_cache(self.kv_cache_dtype):
+                self.bmm1_scale *= layer._q_scale_float * layer._k_scale_float
+        if self.bmm2_scale is None:
+            self.bmm2_scale = 1.0
+            if is_quantized_kv_cache(self.kv_cache_dtype):
+                self.bmm2_scale *= layer._k_scale_float
+
+        from flashinfer.decode import trtllm_batch_decode_with_kv_cache_mla
+
+        # Sparse attention is fully per-token: each query token carries its
+        # own top-k row, so a singleton request dimension is sufficient.
+        query = q.unsqueeze(1)
+        block_tables = topk_indices_physical.unsqueeze(1)
+
+        kernel_out = trtllm_batch_decode_with_kv_cache_mla(
+            query=query,
+            kv_cache=kv_c_and_k_pe_cache.unsqueeze(1),
+            workspace_buffer=self._workspace_buffer,
+            qk_nope_head_dim=self.qk_nope_head_dim,
+            kv_lora_rank=self.kv_lora_rank,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            max_seq_len=attn_metadata.topk_tokens,
+            bmm1_scale=self.bmm1_scale,
+            bmm2_scale=self.bmm2_scale,
+            sparse_mla_top_k=attn_metadata.topk_tokens,
+            return_lse=self.need_to_return_lse_for_decode,
+        )
+        if self.need_to_return_lse_for_decode:
+            assert isinstance(kernel_out, tuple)
+            o, lse = kernel_out
+        else:
+            assert isinstance(kernel_out, torch.Tensor)
+            o = kernel_out
+            lse = None
+
+        out = o.view(-1, o.shape[-2], o.shape[-1])
+        if lse is not None:
+            lse = self._normalize_lse(lse, out.shape[0], out.shape[1])
+            empty_rows = (topk_indices_physical == -1).all(dim=-1)
+            out.masked_fill_(empty_rows.view(-1, 1, 1), 0.0)
+            lse.masked_fill_(empty_rows.view(-1, 1), float("-inf"))
+        return out, lse
 
     def forward_mqa(
         self,
@@ -437,59 +512,132 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
                 topk_indices_physical = physical_indices
                 seq_lens = valid_counts
 
-        if self._workspace_buffer is None:
-            self._workspace_buffer = _get_workspace_buffer(q.device)
-
-        if self.bmm1_scale is None:
-            self.bmm1_scale = self.scale
-            if is_quantized_kv_cache(self.kv_cache_dtype):
-                self.bmm1_scale *= layer._q_scale_float * layer._k_scale_float
-        if self.bmm2_scale is None:
-            self.bmm2_scale = 1.0
-            if is_quantized_kv_cache(self.kv_cache_dtype):
-                self.bmm2_scale *= layer._k_scale_float
-
-        from flashinfer.decode import trtllm_batch_decode_with_kv_cache_mla
-
-        # Single-token sparse decode. trtllm-gen requires the q_len_per_request
-        # dim, but the sparse attention mask is fully per-token (each query token
-        # carries its own top-k index row), so unsqueeze is sufficient and
-        # correct. The MTP/multi-token q_len grouping is a perf-only layout and is
-        # deferred until MTP is validated end-to-end for this backend.
-        query = q.unsqueeze(1)
-        block_tables = topk_indices_physical.unsqueeze(1)
-        seq_lens_arg = seq_lens
-
-        kernel_out = trtllm_batch_decode_with_kv_cache_mla(
-            query=query,
-            kv_cache=kv_c_and_k_pe_cache.unsqueeze(1),
-            workspace_buffer=self._workspace_buffer,
-            qk_nope_head_dim=self.qk_nope_head_dim,
-            kv_lora_rank=self.kv_lora_rank,
-            qk_rope_head_dim=self.qk_rope_head_dim,
-            block_tables=block_tables,
-            seq_lens=seq_lens_arg,
-            max_seq_len=attn_metadata.topk_tokens,
-            bmm1_scale=self.bmm1_scale,
-            bmm2_scale=self.bmm2_scale,
-            sparse_mla_top_k=attn_metadata.topk_tokens,
-            return_lse=self.need_to_return_lse_for_decode,
+        return self._run_sparse_mqa_kernel(
+            q,
+            kv_c_and_k_pe_cache,
+            topk_indices_physical,
+            seq_lens,
+            attn_metadata,
+            layer,
         )
-        if self.need_to_return_lse_for_decode:
-            assert isinstance(kernel_out, tuple)
-            o, lse = kernel_out
-        else:
-            assert isinstance(kernel_out, torch.Tensor)
-            o = kernel_out
-            lse = None
 
-        out = o.view(-1, o.shape[-2], o.shape[-1])
-        if lse is not None:
-            lse = self._normalize_lse(lse, out.shape[0], out.shape[1])
-            empty_rows = (topk_indices_physical == -1).all(dim=-1)
-            out.masked_fill_(empty_rows.view(-1, 1, 1), 0.0)
-            lse.masked_fill_(empty_rows.view(-1, 1), float("-inf"))
-        return out, lse
+    TOKEN_SHARDED_ROWS_PER_RANK = 256
+
+    def forward_mqa_token_sharded(
+        self,
+        q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        kv_c_and_k_pe_cache: torch.Tensor,
+        attn_metadata: FlashInferMLASparseMetadata,
+        layer: AttentionLayer,
+        cp_group: GroupCoordinator,
+        num_padded_tokens: int,
+        w_uv: torch.Tensor,
+    ) -> torch.Tensor:
+        """Attend gathered PCP query rows to each local DCP KV shard.
+
+        Every rank gathers the same uniform, rank-major query and Top-K rows,
+        computes partial sparse attention against its local KV shard, applies
+        the linear V-up projection, LSE-corrects the partial output, and
+        reduce-scatters token rows back to their PCP owners.
+        """
+        if isinstance(q, tuple):
+            q = torch.cat(q, dim=-1)
+        num_actual = attn_metadata.num_actual_tokens
+        assert q.shape[0] >= num_padded_tokens >= num_actual
+        assert self.topk_indices_buffer is not None
+
+        global_req_id = attn_metadata.pcp_global_req_id
+        gather_idx = attn_metadata.pcp_gather_idx
+        gather_valid_mask = attn_metadata.pcp_gather_valid_mask
+        global_block_table = attn_metadata.pcp_global_block_table
+        if (
+            global_req_id is None
+            or gather_idx is None
+            or gather_valid_mask is None
+            or global_block_table is None
+        ):
+            # Capture/profiling batches have no runtime global PCP maps. Execute
+            # a local shape-equivalent kernel; the eager segment is re-run with
+            # real metadata at replay.
+            if num_actual == 0:
+                return q.new_zeros(
+                    (0, q.shape[1], w_uv.shape[-1]), dtype=torch.bfloat16
+                )
+            out, _ = self.forward_mqa(
+                q[:num_actual], kv_c_and_k_pe_cache, attn_metadata, layer
+            )
+            return torch.bmm(out.transpose(0, 1), w_uv).transpose(0, 1).contiguous()
+
+        world_size = cp_group.world_size
+        num_heads = q.shape[1]
+        topk_global = self.topk_indices_buffer
+        gather_idx = gather_idx.view(world_size, num_padded_tokens)
+        gather_valid_mask = gather_valid_mask.view(world_size, num_padded_tokens)
+        out_chunks: list[torch.Tensor] = []
+        cp_ctx = CPTritonContext()
+
+        for start in range(0, num_padded_tokens, self.TOKEN_SHARDED_ROWS_PER_RANK):
+            stop = min(start + self.TOKEN_SHARDED_ROWS_PER_RANK, num_padded_tokens)
+            rows = stop - start
+            num_all = rows * world_size
+            q_all = cp_group.all_gather(q[start:stop], dim=0)
+            gathered_rows = gather_idx[:, start:stop].flatten()
+            valid_rows = gather_valid_mask[:, start:stop].flatten()
+            physical, valid_counts = triton_filter_and_convert_dcp_index(
+                global_req_id,
+                global_block_table,
+                topk_global[: global_req_id.shape[0]],
+                dcp_size=self.dcp_world_size,
+                dcp_rank=self.dcp_rank,
+                cp_kv_cache_interleave_size=(
+                    attn_metadata.cp_kv_cache_interleave_size
+                ),
+                BLOCK_SIZE=attn_metadata.block_size,
+                NUM_TOPK_TOKENS=topk_global.shape[1],
+                return_valid_counts=True,
+                compact_valid_to_front=True,
+                row_indices=gathered_rows,
+                row_valid_mask=valid_rows,
+            )
+            partial, lse = self._run_sparse_mqa_kernel(
+                q_all,
+                kv_c_and_k_pe_cache,
+                physical,
+                valid_counts,
+                attn_metadata,
+                layer,
+            )
+            assert lse is not None
+            partial = (
+                torch.bmm(partial.transpose(0, 1), w_uv)
+                .transpose(0, 1)
+                .contiguous()
+            )
+            if self.dcp_comm_backend == "a2a":
+                out_chunks.append(
+                    dcp_a2a_lse_reduce_token_sharded(
+                        partial,
+                        lse,
+                        cp_group,
+                        is_lse_base_on_e=self.lse_base_on_e,
+                    )
+                )
+            else:
+                assert self.dcp_comm_backend == "ag_rs"
+                lses = cp_group.all_gather(lse.contiguous(), dim=0).view(
+                    world_size, num_all, num_heads
+                )
+                partial, _ = correct_attn_out(
+                    partial,
+                    lses,
+                    cp_group.rank_in_group,
+                    cp_ctx,
+                    is_lse_base_on_e=self.lse_base_on_e,
+                )
+                out_chunks.append(cp_group.reduce_scatter(partial, dim=0))
+
+        local_out = out_chunks[0] if len(out_chunks) == 1 else torch.cat(out_chunks)
+        return local_out[:num_actual]
 
     @staticmethod
     def _normalize_lse(
