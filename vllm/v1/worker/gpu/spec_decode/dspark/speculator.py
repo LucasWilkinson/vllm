@@ -23,6 +23,7 @@ CUDA graphs (FULL, mirroring DFlash) cover the whole draft step: the parallel
 backbone forward AND the sequential Markov sampling.
 """
 
+from collections.abc import Callable
 from typing import Any
 
 import torch
@@ -125,8 +126,24 @@ class DSparkSpeculator(DFlashSpeculator):
         aux_hidden_states: list[torch.Tensor],
         slot_mappings: dict[str, torch.Tensor],
         retain_for_proposal: bool = True,
+        restore_sharded_context: Callable[
+            [torch.Tensor],
+            tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]],
+        ]
+        | None = None,
     ) -> None:
-        """Build rank-local context KV and publish it to every PCP peer."""
+        """Build the context KV this rank stores and publish it to PCP peers.
+
+        Replicated PCP (DCP=1): project this rank's PCP token shard and copy
+        the rows to every peer. DCP spanning the PCP group
+        (``restore_sharded_context`` given): this rank's draft cache holds the
+        DCP-interleaved rows of every request, not its PCP shard, so the
+        shard's context states are first restored to the global batch and
+        written with the global rank-local slot mapping (``PAD_SLOT_ID`` for
+        rows other ranks own). Without that, only tokens in the intersection
+        of this rank's PCP shard and its DCP slice were stored, and the slots
+        paired with them belonged to PCP rank 0's tokens.
+        """
         if self._pcp_context_kv_precomputed:
             raise RuntimeError("DSpark PCP context KV was already precomputed")
         if not aux_hidden_states:
@@ -134,6 +151,15 @@ class DSparkSpeculator(DFlashSpeculator):
 
         num_tokens = input_batch.num_tokens
         layer_names = self.model.get_draft_kv_cache_layer_names()
+        context_states = self.model.combine_hidden_states(
+            torch.cat(aux_hidden_states, dim=-1)
+        )
+        positions = input_batch.positions
+        if restore_sharded_context is not None:
+            context_states, positions, slot_mappings = restore_sharded_context(
+                context_states
+            )
+            num_tokens = positions.shape[0]
         missing = [name for name in layer_names if name not in slot_mappings]
         if missing:
             raise RuntimeError(
@@ -142,12 +168,9 @@ class DSparkSpeculator(DFlashSpeculator):
         context_slot_mappings = [
             slot_mappings[name][:num_tokens] for name in layer_names
         ]
-        context_states = self.model.combine_hidden_states(
-            torch.cat(aux_hidden_states, dim=-1)
-        )
         self.model.precompute_and_store_context_kv(
             context_states[:num_tokens],
-            input_batch.positions[:num_tokens],
+            positions[:num_tokens],
             context_slot_mappings,
             publish_to_pcp=True,
         )

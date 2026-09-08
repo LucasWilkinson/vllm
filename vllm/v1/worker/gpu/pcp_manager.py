@@ -166,6 +166,58 @@ class PCPManager:
         return self._direct_kv_requested and pcp_direct_kv_active()
 
     @property
+    def sharded_peer_kv_enabled(self) -> bool:
+        """Whether DCP spans the PCP group with in-place sharded peer views.
+
+        Every rank then owns the DCP-interleaved rows of *every* request in
+        the global batch rather than a PCP token shard, so per-token cache
+        writes that are derived from PCP-sharded activations (the DSpark
+        context-KV precompute) must first be restored to the global batch.
+        """
+        from vllm.model_executor.layers.attention.pcp_direct_kv import (
+            pcp_sharded_peer_kv_active,
+        )
+
+        return self.dcp_world_size > 1 and pcp_sharded_peer_kv_active()
+
+    def restore_sharded_context(
+        self, states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Restore PCP-sharded per-token states to the global prefill batch.
+
+        Returns ``(states, positions, slot_mappings)`` in global batch order,
+        trimmed to the active token count. ``slot_mappings`` is the
+        ``[num_kv_cache_groups, num_tokens]`` rank-local mapping produced by
+        :meth:`prepare_slot_mappings` for this step: valid for the
+        DCP-interleaved rows this rank owns and ``PAD_SLOT_ID`` elsewhere, so
+        a cache write over the whole global batch stores exactly this rank's
+        shard of every request.
+        """
+        assert self._global_batch is not None
+        assert self._global_batch_slot_mappings is not None
+        assert self._padded_gather_idx is not None
+        num_tokens = self._global_batch.num_tokens
+        # The all-gather needs every rank to contribute the common padded
+        # shard width; a rank that owns few (or zero) prompt tokens may hold
+        # fewer rows than that.
+        padded = self._padded_gather_idx.shape[0] // self.pcp_world_size
+        if states.shape[0] < padded:
+            states = torch.cat(
+                [states, states.new_zeros(padded - states.shape[0], *states.shape[1:])]
+            )
+        restored = self.restore_hidden_state_buffer(states)
+        if restored.shape[0] < num_tokens:
+            raise RuntimeError(
+                "PCP sharded context restore produced "
+                f"{restored.shape[0]} rows for {num_tokens} global tokens"
+            )
+        return (
+            restored[:num_tokens],
+            self._global_batch.positions[:num_tokens],
+            self._global_batch_slot_mappings[:, :num_tokens],
+        )
+
+    @property
     def peer_kv_enabled(self) -> bool:
         """Whether any PCP peer cache view (replicated or DCP-sharded) is active.
 
