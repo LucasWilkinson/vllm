@@ -198,6 +198,9 @@ def compute_tp_mapping(
             if _is_ssm_spec(t)
             else tuple(replicated_attn_ranks)
             if _is_mla_spec(t)
+            # Every remote token shard holds every head: read all shards.
+            else tuple(sharded_attn_ranks)
+            if remote_heads_replicated
             else tuple(sharded_attn_ranks[: attention_group_num_splits[i]])
             for i, t in enumerate(group_spec_types)
         )

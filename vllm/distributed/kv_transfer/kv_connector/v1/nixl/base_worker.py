@@ -2164,6 +2164,21 @@ class NixlBaseConnectorWorker:
                 else remote_tp_size
             )
             model_replicated = self.transfer_topo.is_kv_replicated(remote_engine_id)
+            logger.info_once(
+                "NIXL handshake plan for %s: remote tp=%s pcp=%s dcp=%s "
+                "(real tp %s), local tp=%s, heads_replicated=%s, "
+                "rank_offset_factor=%s, source_ranks_per_group=%s, groups=%s",
+                remote_engine_id,
+                remote_tp_size,
+                nixl_agent_meta.pcp_size,
+                remote_dcp_size,
+                remote_real_tp_size,
+                self.world_size,
+                plan.remote_heads_replicated,
+                plan.rank_offset_factor,
+                plan.source_ranks_per_group,
+                [t.__name__ for t in self._group_spec_types],
+            )
             total_kv_heads = self.transfer_topo.total_num_kv_heads
             local_heads = self.transfer_topo.local_physical_heads
             remote_heads = max(1, total_kv_heads // remote_tp_size)
