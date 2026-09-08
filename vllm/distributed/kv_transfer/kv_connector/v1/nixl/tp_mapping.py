@@ -225,7 +225,11 @@ def compute_tp_mapping(
     has_sharded_attention = any(
         _is_attention_spec(t) and not _is_mla_spec(t) for t in group_spec_types
     )
-    if remote_heads_replicated and has_sharded_attention:
+    # Head-sharded regions may live in an MLA-typed group (per-region policy,
+    # e.g. a DSpark drafter alongside a sparse-MLA target); the caller signals
+    # that with attention_group_num_splits.
+    has_sharded_regions = has_sharded_attention or attention_group_num_splits is not None
+    if remote_heads_replicated and has_sharded_regions:
         # Head-sharded local groups slice the producer's full-head block.
         rank_offset_factor = tp_rank % (tp_size // remote_real_tp_size)
     elif (
@@ -260,5 +264,5 @@ def compute_tp_mapping(
         rank_to_attention_slot=rank_to_attention_slot,
         rank_offset_factor=rank_offset_factor,
         local_consumers=local_consumers,
-        remote_heads_replicated=remote_heads_replicated and has_sharded_attention,
+        remote_heads_replicated=remote_heads_replicated and has_sharded_regions,
     )

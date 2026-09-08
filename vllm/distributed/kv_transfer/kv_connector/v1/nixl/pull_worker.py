@@ -429,7 +429,6 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         )
 
         assert len(local_block_descs_ids) == len(remote_block_descs_ids)
-
         # Prepare transfer with Nixl.
         handle = None
         try:
@@ -447,6 +446,12 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
 
             # Use handle to check completion in future step().
             self._recving_transfers[request_id].append(handle)
+            self._xfer_info[handle] = (
+                remote_rank,
+                len(local_block_descs_ids),
+                time.perf_counter(),
+                request_id,
+            )
         except Exception as e:
             # mark all (logical) blocks for this request as invalid
             self._log_failure(

@@ -708,6 +708,9 @@ class NixlBaseConnectorWorker:
         self.consumer_notification_counts_by_req = defaultdict[ReqId, int](int)
         self.expected_consumer_notifications_by_req: dict[ReqId, int] = {}
         self.xfer_stats = NixlKVConnectorStats()
+        # Debug bookkeeping: xfer handle -> (remote_rank, num_descs, t0, req_id).
+        self._xfer_info: dict[int, tuple[int, int, float, str]] = {}
+        self._stalled_logged: set[int] = set()
 
         self._physical_blocks_per_logical_kv_block = 1
         self._sync_block_size_with_kernel()
@@ -2166,18 +2169,18 @@ class NixlBaseConnectorWorker:
             model_replicated = self.transfer_topo.is_kv_replicated(remote_engine_id)
             logger.info_once(
                 "NIXL handshake plan for %s: remote tp=%s pcp=%s dcp=%s "
-                "(real tp %s), local tp=%s, heads_replicated=%s, "
-                "rank_offset_factor=%s, source_ranks_per_group=%s, groups=%s",
+                "(real tp %s), local tp=%s dcp=%s, heads_replicated=%s, "
+                "rank_offset_factor=%s, groups=%s",
                 remote_engine_id,
                 remote_tp_size,
                 nixl_agent_meta.pcp_size,
                 remote_dcp_size,
                 remote_real_tp_size,
                 self.world_size,
+                self.dcp_size,
                 plan.remote_heads_replicated,
                 plan.rank_offset_factor,
-                plan.source_ranks_per_group,
-                [t.__name__ for t in self._group_spec_types],
+                ",".join(t.__name__ for t in self._group_spec_types),
             )
             total_kv_heads = self.transfer_topo.total_num_kv_heads
             local_heads = self.transfer_topo.local_physical_heads
@@ -2488,7 +2491,11 @@ class NixlBaseConnectorWorker:
         for req_id in done_recving:
             # clean up metadata for completed requests
             meta = self._recving_metadata.pop(req_id, None)
-            assert meta is not None, f"{req_id} not found in recving_metadata list"
+            if meta is None:
+                logger.warning(
+                    "%s not found in recving_metadata list (already failed?)", req_id
+                )
+                continue
 
             # Skip KV sync and post-processing for failed requests
             if req_id in failed_recv_reqs:
@@ -2639,6 +2646,21 @@ class NixlBaseConnectorWorker:
                         self.nixl_wrapper.release_xfer_handle(handle)
                     elif xfer_state == "PROC":
                         in_progress.append(handle)
+                        info = self._xfer_info.get(handle)
+                        if (
+                            info is not None
+                            and handle not in self._stalled_logged
+                            and time.perf_counter() - info[2] > 20.0
+                        ):
+                            self._stalled_logged.add(handle)
+                            logger.warning(
+                                "NIXL READ STALLED >20s: req=%s remote_rank=%s "
+                                "descs=%d (local rank %s)",
+                                info[3],
+                                info[0],
+                                info[1],
+                                self.tp_rank,
+                            )
                         continue
                     else:
                         self._log_failure(
