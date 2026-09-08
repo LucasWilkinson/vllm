@@ -398,6 +398,68 @@ def test_replicated_layout_enabled_for_pure_mla_tp_mp_single_node(
     )
 
 
+def test_replicated_layout_enabled_for_direct_pcp_mixed_attention(monkeypatch):
+    monkeypatch.setenv("VLLM_USE_PCP_DIRECT_KV", "1")
+    hybrid = _make_hybrid_kv_cache_config()
+
+    assert _replicated_layout(
+        hybrid,
+        tensor_parallel_size=1,
+        prefill_context_parallel_size=8,
+    )
+    wrapped = KVCacheConfig(
+        num_blocks=hybrid.num_blocks,
+        kv_cache_tensors=hybrid.kv_cache_tensors,
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                group.layer_names,
+                UniformTypeKVCacheSpecs(
+                    block_size=group.kv_cache_spec.block_size,
+                    kv_cache_specs={
+                        layer_name: group.kv_cache_spec
+                        for layer_name in group.layer_names
+                    },
+                ),
+            )
+            for group in hybrid.kv_cache_groups
+        ],
+    )
+    assert _replicated_layout(
+        wrapped,
+        tensor_parallel_size=1,
+        prefill_context_parallel_size=8,
+    )
+
+
+@pytest.mark.parametrize(
+    ("kv_cache_config", "kwargs"),
+    [
+        (_make_mamba_hybrid_kv_cache_config(), {}),
+        (_make_hybrid_kv_cache_config(), {"tensor_parallel_size": 2}),
+        (_make_hybrid_kv_cache_config(), {"pipeline_parallel_size": 2}),
+        (_make_hybrid_kv_cache_config(), {"distributed_executor_backend": "ray"}),
+        (_make_hybrid_kv_cache_config(), {"nnodes": 2}),
+    ],
+    ids=["non-attention", "tp2", "pp2", "ray", "multi-node"],
+)
+def test_direct_pcp_replicated_layout_fails_closed(
+    monkeypatch,
+    kv_cache_config: KVCacheConfig,
+    kwargs: dict[str, Any],
+):
+    monkeypatch.setenv("VLLM_USE_PCP_DIRECT_KV", "1")
+    parallel_kwargs = {
+        "tensor_parallel_size": 1,
+        "prefill_context_parallel_size": 8,
+        **kwargs,
+    }
+
+    assert not _replicated_layout(
+        kv_cache_config,
+        **parallel_kwargs,
+    )
+
+
 @pytest.mark.parametrize(
     ("kv_cache_config", "case"),
     [
