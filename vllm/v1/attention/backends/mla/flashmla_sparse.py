@@ -9,7 +9,7 @@ from vllm import _custom_ops as ops
 from vllm import envs
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.config.cache import CacheDType
-from vllm.distributed.parallel_state import GroupCoordinator, get_pcp_group
+from vllm.distributed.parallel_state import get_pcp_group
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.mla_attention import MLACommonPrefillMetadata
 from vllm.model_executor.layers.attention.pcp_direct_kv import (
@@ -42,14 +42,6 @@ from vllm.v1.attention.backends.utils import (
     reshape_attn_output_for_spec_decode,
     reshape_query_for_spec_decode,
     split_prefill_chunks,
-)
-from vllm.v1.attention.ops.dcp import (
-    CPTritonContext,
-    DirectDCPA2AWorkspace,
-    DirectDCPQGatherWorkspace,
-    correct_attn_out,
-    get_direct_dcp_a2a_workspace,
-    get_direct_dcp_q_gather_workspace,
 )
 from vllm.v1.attention.ops.flashmla import (
     FlashMLASchedMeta,
@@ -367,9 +359,15 @@ class FlashMLASparseMetadataBuilder(
             and envs.VLLM_PCP_SPARSE_PEER_GATHER
             and should_allocate_pcp_direct_kv(vllm_config)
         )
-        self.fp8_use_mixed_batch = self.num_heads < MIN_HEADS_FOR_BF16_PREFILL or (
-            pcp_spans_dcp and not self.pcp_peer_gather_prefill
-        )
+        self.fp8_use_mixed_batch = self.num_heads < MIN_HEADS_FOR_BF16_PREFILL
+        if pcp_spans_dcp and not self.pcp_peer_gather_prefill:
+            raise NotImplementedError(
+                "PCP-spanning DCP sparse prefill on FlashMLA (SM90) needs the "
+                "peer-gather path: an fp8 KV cache, direct PCP KV "
+                "(VLLM_USE_PCP_DIRECT_KV=1) and VLLM_PCP_SPARSE_PEER_GATHER=1. "
+                "The token-sharded exchange is only implemented for the "
+                "FlashInfer sparse MLA backend (SM100)."
+            )
         if self.pcp_peer_gather_prefill and self.fp8_use_mixed_batch:
             raise NotImplementedError(
                 "PCP peer-gather sparse prefill needs the bf16 prefill workspace "
@@ -698,23 +696,9 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
             128 if current_platform.is_device_capability_family(100) else 64
         )
         self.fp8_decode_padded_heads = self._compute_fp8_decode_padded_heads(num_heads)
-        # Tile-scheduler metadata for the PCP token-sharded chunks, keyed by
-        # gathered row count (only the full and tail chunk sizes occur).
-        self._token_sharded_sched_meta: dict[int, torch.Tensor] = {}
-        # Direct symmetric-memory workspaces for the token-sharded collectives
-        # (VLLM_USE_DIRECT_PCP_TOKEN_SHARDED); resolved on first use.
-        self._ts_direct: (
-            tuple[DirectDCPQGatherWorkspace, DirectDCPA2AWorkspace] | None
-        ) = None
-        self._ts_direct_resolved = False
-        self._ts_stage: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
         self._peer_gather_scale: torch.Tensor | None = None
-        self._ts_stub_meta: tuple[torch.Tensor, torch.Tensor] | None = None
 
         vllm_config = get_current_vllm_config()
-        # Captured here: get_current_vllm_config() is unavailable at forward time.
-        self._max_model_len = vllm_config.model_config.max_model_len
-        self._num_ubatches = max(vllm_config.parallel_config.num_ubatches, 1)
         max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
         q_concat_shape = (max_tokens, num_heads, head_size)
         if is_quantized_kv_cache(kv_cache_dtype):
@@ -1018,278 +1002,6 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
         output = output[:, :actual_num_heads, :]
         lse = lse[:, :actual_num_heads]
         return output, lse
-
-    TOKEN_SHARDED_ROWS_PER_RANK = 256
-
-    def _token_sharded_kernel_metadata(
-        self,
-        attn_metadata: FlashMLASparseMetadata,
-        num_rows: int,
-        device: torch.device,
-    ) -> FlashMLASparseMetadata.FP8KernelMetadata:
-        """FP8 kernel metadata for a gathered chunk of ``num_rows`` query rows.
-
-        The batch metadata built by the builder is sized for this rank's local
-        token count; the token-sharded path runs the kernel over the PCP-gathered
-        rows of each chunk, so the tile scheduler must be re-planned for that
-        row count. cache_lens and the dummy block table are shape-independent.
-        """
-        base = attn_metadata.fp8_extra_metadata
-        if isinstance(base, FlashMLASparseMetadata.FP8KernelMetadata):
-            cache_lens, dummy_block_table = base.cache_lens, base.dummy_block_table
-        else:
-            # Separate prefill/decode metadata (peer-gather mode): the fp8
-            # kernel ignores both when `indices` is given; keep shape-valid stubs.
-            if self._ts_stub_meta is None:
-                self._ts_stub_meta = (
-                    torch.full(
-                        (1,), self._max_model_len, dtype=torch.int32, device=device
-                    ),
-                    torch.empty((1, 1), dtype=torch.int32, device=device),
-                )
-            cache_lens, dummy_block_table = self._ts_stub_meta
-        sched = self._token_sharded_sched_meta.get(num_rows)
-        if sched is None:
-            padded_heads = self.fp8_decode_padded_heads
-            topk_tensor = torch.full(
-                (1,), attn_metadata.topk_tokens, dtype=torch.int32, device=device
-            )
-            sched, _ = get_mla_metadata(
-                cache_seqlens=topk_tensor,
-                num_q_tokens_per_head_k=num_rows * padded_heads,
-                topk=attn_metadata.topk_tokens,
-                num_heads_q=padded_heads,
-                num_heads_k=1,
-                is_fp8_kvcache=True,
-            )
-            self._token_sharded_sched_meta[num_rows] = sched
-        return FlashMLASparseMetadata.FP8KernelMetadata(
-            scheduler_metadata=sched,
-            cache_lens=cache_lens,
-            dummy_block_table=dummy_block_table,
-        )
-
-    def _token_sharded_direct_workspaces(
-        self,
-        cp_group: GroupCoordinator,
-        device: torch.device,
-        num_heads: int,
-        q_dim: int,
-        v_dim: int,
-    ) -> tuple[DirectDCPQGatherWorkspace, DirectDCPA2AWorkspace] | None:
-        """Symmetric-memory workspaces for one 256-row token-sharded chunk.
-
-        The row gather and the row reduce-scatter reuse the head-axis direct
-        DCP kernels with a single "token" of ``rows * num_heads`` "heads":
-        rank-major head blocks are exactly rank-major row blocks.
-        """
-        if self._ts_direct_resolved:
-            return self._ts_direct
-        self._ts_direct_resolved = True
-        if not envs.VLLM_USE_DIRECT_PCP_TOKEN_SHARDED:
-            return None
-        rows = self.TOKEN_SHARDED_ROWS_PER_RANK
-        num_ubatches = self._num_ubatches
-        q_gather = get_direct_dcp_q_gather_workspace(
-            cp_group, device, 1, rows * num_heads, q_dim, torch.bfloat16, num_ubatches
-        )
-        a2a = get_direct_dcp_a2a_workspace(
-            cp_group, device, 1, rows * num_heads, v_dim, torch.bfloat16, num_ubatches
-        )
-        if q_gather is None or a2a is None:
-            logger.warning_once(
-                "VLLM_USE_DIRECT_PCP_TOKEN_SHARDED=1 but direct symmetric-memory "
-                "DCP workspaces are unavailable (q_gather=%s, a2a=%s); using NCCL.",
-                q_gather is not None,
-                a2a is not None,
-            )
-            return None
-        logger.info_once(
-            "Using direct symmetric-memory collectives for the PCP token-sharded "
-            "sparse MLA prefill (%d rows/rank/chunk).",
-            rows,
-        )
-        self._ts_direct = (q_gather, a2a)
-        return self._ts_direct
-
-    def forward_mqa_token_sharded(
-        self,
-        q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
-        kv_c_and_k_pe_cache: torch.Tensor,
-        attn_metadata: FlashMLASparseMetadata,
-        layer: AttentionLayer,
-        cp_group: GroupCoordinator,
-        num_padded_tokens: int,
-        w_uv: torch.Tensor,
-    ) -> torch.Tensor:
-        """Attend gathered PCP query rows to each local DCP KV shard.
-
-        FlashMLA (SM90) port of the FlashInfer sparse token-sharded path: every
-        rank all-gathers the same uniform, rank-major query rows, runs the fp8
-        sparse kernel against its local KV shard with the Top-K rows filtered
-        to locally owned slots, applies the V-up projection, LSE-corrects the
-        partial output across ranks (ag_rs), and reduce-scatters the rows back
-        to their PCP owners.
-        """
-        if isinstance(q, tuple):
-            ql_nope, q_pe = q
-            q_cat = self.q_concat_buffer[: ql_nope.shape[0]]
-            ops.concat_mla_q(ql_nope, q_pe, q_cat)
-            q = q_cat
-        num_actual = attn_metadata.num_actual_tokens
-        assert q.shape[0] >= num_padded_tokens >= num_actual
-        assert self.topk_indices_buffer is not None
-        if self.kv_cache_dtype != "fp8_ds_mla":
-            raise NotImplementedError(
-                "FlashMLA sparse token-sharded PCP/DCP attention requires the "
-                "fp8_ds_mla kv-cache"
-            )
-
-        global_req_id = attn_metadata.pcp_global_req_id
-        gather_idx = attn_metadata.pcp_gather_idx
-        gather_valid_mask = attn_metadata.pcp_gather_valid_mask
-        global_block_table = attn_metadata.pcp_global_block_table
-        if (
-            global_req_id is None
-            or gather_idx is None
-            or gather_valid_mask is None
-            or global_block_table is None
-        ):
-            # Capture/profiling batches have no runtime global PCP maps. Execute
-            # a local shape-equivalent kernel; the eager segment is re-run with
-            # real metadata at replay.
-            if num_actual == 0:
-                return q.new_zeros(
-                    (0, q.shape[1], w_uv.shape[-1]), dtype=torch.bfloat16
-                )
-            out, _ = self.forward_mqa(
-                q[:num_actual], kv_c_and_k_pe_cache, attn_metadata, layer
-            )
-            return torch.bmm(out.transpose(0, 1), w_uv).transpose(0, 1).contiguous()
-
-        world_size = cp_group.world_size
-        num_heads = q.shape[1]
-        topk_global = self.topk_indices_buffer
-        gather_idx = gather_idx.view(world_size, num_padded_tokens)
-        gather_valid_mask = gather_valid_mask.view(world_size, num_padded_tokens)
-        out_chunks: list[torch.Tensor] = []
-        cp_ctx = CPTritonContext()
-        direct = self._token_sharded_direct_workspaces(
-            cp_group, q.device, num_heads, q.shape[2], w_uv.shape[-1]
-        )
-        chunk_rows = self.TOKEN_SHARDED_ROWS_PER_RANK
-
-        for start in range(0, num_padded_tokens, chunk_rows):
-            stop = min(start + chunk_rows, num_padded_tokens)
-            rows = stop - start
-            if direct is not None:
-                # Fixed-size symmetric workspaces: pad the tail chunk to a full
-                # chunk with invalid rows (dropped after the reduce-scatter).
-                q_chunk = q[start:stop]
-                gathered_rows = gather_idx[:, start:stop]
-                valid_rows = gather_valid_mask[:, start:stop]
-                if rows < chunk_rows:
-                    if self._ts_stage is None:
-                        self._ts_stage = (
-                            torch.zeros(
-                                (chunk_rows, num_heads, q.shape[2]),
-                                dtype=q.dtype,
-                                device=q.device,
-                            ),
-                            torch.zeros(
-                                (world_size, chunk_rows),
-                                dtype=gather_idx.dtype,
-                                device=q.device,
-                            ),
-                            torch.zeros(
-                                (world_size, chunk_rows),
-                                dtype=torch.bool,
-                                device=q.device,
-                            ),
-                        )
-                    q_stage, gidx_stage, valid_stage = self._ts_stage
-                    q_stage[:rows].copy_(q_chunk)
-                    gidx_stage[:, :rows].copy_(gathered_rows)
-                    valid_stage.zero_()
-                    valid_stage[:, :rows].copy_(valid_rows)
-                    q_chunk, gathered_rows, valid_rows = (
-                        q_stage,
-                        gidx_stage,
-                        valid_stage,
-                    )
-                num_all = chunk_rows * world_size
-                q_gather_ws, a2a_ws = direct
-                q_all = q_gather_ws.gather(
-                    q_chunk.view(1, chunk_rows * num_heads, q.shape[2])
-                ).view(num_all, num_heads, q.shape[2])
-                gathered_rows = gathered_rows.flatten()
-                valid_rows = valid_rows.flatten()
-            else:
-                num_all = rows * world_size
-                q_all = cp_group.all_gather(q[start:stop], dim=0)
-                gathered_rows = gather_idx[:, start:stop].flatten()
-                valid_rows = gather_valid_mask[:, start:stop].flatten()
-            physical, valid_counts = triton_filter_and_convert_dcp_index(
-                global_req_id,
-                global_block_table,
-                topk_global[: global_req_id.shape[0]],
-                dcp_size=self.dcp_world_size,
-                dcp_rank=self.dcp_rank,
-                cp_kv_cache_interleave_size=(
-                    attn_metadata.cp_kv_cache_interleave_size
-                ),
-                BLOCK_SIZE=attn_metadata.block_size,
-                NUM_TOPK_TOKENS=topk_global.shape[1],
-                return_valid_counts=True,
-                compact_valid_to_front=True,
-                row_indices=gathered_rows,
-                row_valid_mask=valid_rows,
-            )
-            kernel_metadata = self._token_sharded_kernel_metadata(
-                attn_metadata, num_all, q.device
-            )
-            _out, _lse = self._fp8_flash_mla_kernel(
-                q=q_all.unsqueeze(0),
-                kv_c_and_k_pe_cache=kv_c_and_k_pe_cache,
-                topk_indices=physical.unsqueeze(0),
-                kernel_metadata=kernel_metadata,
-            )
-            partial = _out.squeeze(0)
-            # Kernel LSE is (1, H, T); the merge consumes (T, H).
-            lse = _lse.squeeze(0).transpose(0, 1)
-            # Rows where this rank owns none of the selected tokens have
-            # undefined out/lse; (0, -inf) is the identity of the LSE merge.
-            empty_rows = valid_counts == 0
-            partial = partial.masked_fill(empty_rows.view(-1, 1, 1), 0.0)
-            lse = lse.masked_fill(empty_rows.view(-1, 1), float("-inf"))
-            partial = (
-                torch.bmm(partial.transpose(0, 1), w_uv)
-                .transpose(0, 1)
-                .contiguous()
-            )
-            if direct is not None:
-                v_dim = partial.shape[-1]
-                merged = direct[1].lse_reduce(
-                    partial.view(1, num_all * num_heads, v_dim),
-                    lse.contiguous().view(1, num_all * num_heads),
-                    self.lse_base_on_e,
-                )
-                out_chunks.append(merged.view(chunk_rows, num_heads, v_dim)[:rows])
-                continue
-            lses = cp_group.all_gather(lse.contiguous(), dim=0).view(
-                world_size, num_all, num_heads
-            )
-            partial, _ = correct_attn_out(
-                partial,
-                lses,
-                cp_group.rank_in_group,
-                cp_ctx,
-                is_lse_base_on_e=self.lse_base_on_e,
-            )
-            out_chunks.append(cp_group.reduce_scatter(partial, dim=0))
-
-        local_out = out_chunks[0] if len(out_chunks) == 1 else torch.cat(out_chunks)
-        return local_out[:num_actual]
 
     def forward_mqa(
         self,
