@@ -76,11 +76,10 @@ def test_precompute_pcp_context_kv_uses_local_rows_and_marks_step() -> None:
 
     precompute_call = speculator.model.precompute_call
     assert precompute_call is not None
-    context, positions, mappings, publish = precompute_call
+    context, positions, mappings = precompute_call
     torch.testing.assert_close(context, torch.tensor([[2.0, 4.0], [3.0, 5.0]]))
     assert torch.equal(positions, torch.tensor([7, 8]))
     assert [mapping.tolist() for mapping in mappings] == [[10, 11], [20, 21]]
-    assert publish is True
     assert speculator._pcp_context_kv_precomputed is True
 
     with pytest.raises(RuntimeError, match="already precomputed"):
