@@ -1860,11 +1860,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             output = ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
             return ModelRunnerOutput.with_ec_conn_output(output, ec_connector_output)
 
-        # Pure prefill retains PCP-local target auxiliary states and slot
-        # mappings. Project only this rank's shard and write the draft-cache
-        # rows this rank owns. Mixed/decode batches use the restored
-        # full-context fallback because rejected speculative suffixes must be
-        # filtered first.
+        # Pure prefill retains PCP-local target auxiliary states. The drafter
+        # restores them to the global batch and writes the draft-cache rows
+        # this rank owns. Mixed/decode batches use the restored full-context
+        # fallback because rejected speculative suffixes must be filtered
+        # first.
         kv_transfer_config = self.vllm_config.kv_transfer_config
         is_pcp_kv_producer = bool(
             self.pcp_manager is not None
@@ -1874,40 +1874,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if (
             self.pcp_manager is not None
             and isinstance(self.speculator, DSparkSpeculator)
-            and self.speculative_config is not None
-            and self.speculative_config.method == "dspark"
             and aux_hidden_states is not None
-            and slot_mappings_by_layer is not None
             and input_batch.has_prefill
             and input_batch.is_prefilling_np.all()
         ):
-            # Every PCP layout needs the restore: the drafter projects this
-            # rank's PCP token shard, but the draft cache rows it must fill are
-            # indexed in the global batch (and, when DCP spans the PCP group,
-            # are the DCP-interleaved rows of every request rather than this
-            # rank's shard).
-            pcp_manager = self.pcp_manager
-            kv_cache_config = self.kv_cache_config
-
-            def restore_context(
-                states: torch.Tensor,
-            ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
-                states, positions, slot_mappings = pcp_manager.restore_sharded_context(
-                    states
-                )
-                return (
-                    states,
-                    positions,
-                    build_slot_mappings_by_layer(slot_mappings, kv_cache_config),
-                )
-
             with use_workspace_lane(self._draft_workspace_lane):
                 self.speculator.precompute_pcp_context_kv(
-                    input_batch,
+                    self.pcp_manager,
                     aux_hidden_states,
-                    slot_mappings_by_layer,
                     retain_for_proposal=not is_pcp_kv_producer,
-                    restore_context=restore_context,
                 )
             aux_hidden_states = None
 

@@ -23,18 +23,20 @@ CUDA graphs (FULL, mirroring DFlash) cover the whole draft step: the parallel
 backbone forward AND the sequential Markov sampling.
 """
 
-from collections.abc import Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.logger import init_logger
-from vllm.v1.worker.gpu.input_batch import InputBatch
+from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 from vllm.v1.worker.gpu.spec_decode.dspark.utils import load_dspark_model
+
+if TYPE_CHECKING:
+    from vllm.v1.worker.gpu.pcp_manager import PCPManager
 
 logger = init_logger(__name__)
 
@@ -122,53 +124,43 @@ class DSparkSpeculator(DFlashSpeculator):
     @torch.inference_mode()
     def precompute_pcp_context_kv(
         self,
-        input_batch: InputBatch,
+        pcp_manager: "PCPManager",
         aux_hidden_states: list[torch.Tensor],
-        slot_mappings: dict[str, torch.Tensor],
         retain_for_proposal: bool = True,
-        restore_context: Callable[
-            [torch.Tensor],
-            tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]],
-        ]
-        | None = None,
     ) -> None:
         """Build the draft context KV this rank stores.
 
         Under PCP the target's auxiliary states are token-sharded, while the
         draft cache rows this rank must hold are not: with DCP=1 every rank
         keeps a full replica, and with DCP spanning the PCP group every rank
-        owns the DCP-interleaved rows of every request. ``restore_context``
-        all-gathers the shard's context states to the global batch and returns
-        the global positions and this rank's slot mapping over that batch
-        (``PAD_SLOT_ID`` for rows other ranks own), so a single cache write
-        stores exactly the rows this rank is responsible for.
+        owns the DCP-interleaved rows of every request. So the combined
+        shard states are restored to the global batch and written with this
+        rank's slot mapping over that batch (``PAD_SLOT_ID`` for rows other
+        ranks own), and a single cache write stores exactly the rows this
+        rank is responsible for.
         """
         if self._pcp_context_kv_precomputed:
             raise RuntimeError("DSpark PCP context KV was already precomputed")
         if not aux_hidden_states:
             raise RuntimeError("DSpark PCP precompute requires auxiliary hidden states")
 
-        num_tokens = input_batch.num_tokens
-        layer_names = self.model.get_draft_kv_cache_layer_names()
-        context_states = self.model.combine_hidden_states(
-            torch.cat(aux_hidden_states, dim=-1)
+        context_states, positions, slot_mappings = pcp_manager.restore_sharded_context(
+            self.model.combine_hidden_states(torch.cat(aux_hidden_states, dim=-1))
         )
-        positions = input_batch.positions
-        if restore_context is not None:
-            context_states, positions, slot_mappings = restore_context(context_states)
-            num_tokens = positions.shape[0]
-        missing = [name for name in layer_names if name not in slot_mappings]
+        slot_mappings_by_layer = build_slot_mappings_by_layer(
+            slot_mappings, self.kv_cache_config
+        )
+        num_tokens = positions.shape[0]
+        layer_names = self.model.get_draft_kv_cache_layer_names()
+        missing = [name for name in layer_names if name not in slot_mappings_by_layer]
         if missing:
             raise RuntimeError(
                 "Missing DSpark PCP slot mappings for: " + ", ".join(missing)
             )
-        context_slot_mappings = [
-            slot_mappings[name][:num_tokens] for name in layer_names
-        ]
         self.model.precompute_and_store_context_kv(
             context_states[:num_tokens],
             positions[:num_tokens],
-            context_slot_mappings,
+            [slot_mappings_by_layer[name][:num_tokens] for name in layer_names],
         )
         self._pcp_context_kv_precomputed = retain_for_proposal
 

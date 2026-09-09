@@ -231,42 +231,6 @@ class DFlashSpeculator(DraftModelSpeculator):
                 }
 
     @torch.inference_mode()
-    def precompute_pcp_context_kv(
-        self,
-        input_batch: InputBatch,
-        aux_hidden_states: list[torch.Tensor],
-        slot_mappings: dict[str, torch.Tensor],
-        retain_for_proposal: bool = True,
-    ) -> None:
-        """Build the rank-local draft context KV for this rank's token shard."""
-        if self._pcp_context_kv_precomputed:
-            raise RuntimeError("DSpark PCP context KV was already precomputed")
-        if not aux_hidden_states:
-            raise RuntimeError("DSpark PCP precompute requires auxiliary hidden states")
-        if not hasattr(self.model, "get_draft_kv_cache_layer_names"):
-            raise RuntimeError("DSpark model does not expose draft KV-cache layers")
-
-        num_tokens = input_batch.num_tokens
-        layer_names = self.model.get_draft_kv_cache_layer_names()
-        missing = [name for name in layer_names if name not in slot_mappings]
-        if missing:
-            raise RuntimeError(
-                "Missing DSpark PCP slot mappings for: " + ", ".join(missing)
-            )
-        context_slot_mappings = [
-            slot_mappings[name][:num_tokens] for name in layer_names
-        ]
-        context_states = self.model.combine_hidden_states(
-            torch.cat(aux_hidden_states, dim=-1)
-        )
-        self.model.precompute_and_store_context_kv(
-            context_states[:num_tokens],
-            input_batch.positions[:num_tokens],
-            context_slot_mappings,
-        )
-        self._pcp_context_kv_precomputed = retain_for_proposal
-
-    @torch.inference_mode()
     def _run_model(
         self,
         num_tokens: int,
