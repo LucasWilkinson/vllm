@@ -854,8 +854,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     dummy_mm_inputs, mm_budget
                 )
 
+        profile_num_tokens = self.max_num_tokens
+        pcp_size = self.parallel_config.prefill_context_parallel_size
+        if pcp_size > 1:
+            profile_num_tokens = pcp.get_max_num_tokens_for_profile(
+                profile_num_tokens, self.max_num_reqs, pcp_size
+            )
         hidden_states, sample_hidden_states = self._dummy_run(
-            self.max_num_tokens, skip_attn=True, is_profile=True
+            profile_num_tokens, skip_attn=True, is_profile=True
         )
 
         # Only run sampler/pooler on last PP rank (non-last ranks return None).
@@ -1087,7 +1093,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.kv_block_zeroer.zero_block_ids(scheduler_output.new_block_ids_to_zero)
 
         # Apply copy-on-write block copies for partial prefix-cache hits, after
-        # zeroing new blocks and before the forward pass reads them.
+        # zeroing new blocks and before the forward pass reads them. PCP ranks
+        # receive the same scheduler output, so this local copy preserves both
+        # layouts: every rank copies its complete replica when DCP=1, while
+        # DCP=PCP copies the rank-owned shard.
         if scheduler_output.kv_cache_block_copies:
             copy_kv_cache_blocks_inplace(
                 self.kv_caches,
@@ -1351,6 +1360,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.pcp_manager,
             input_batch,
             padded_num_tokens=batch_desc.num_tokens,
+            adaptive_verification=adaptive_verification is not None,
         )
 
     def prepare_attn(
@@ -1660,6 +1670,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 # indices from the previous real batch.
                 for_capture=dummy_run and batch_desc.cg_mode == CUDAGraphMode.FULL,
             )
+            if self.pcp_manager is not None:
+                attn_metadata = self.pcp_manager.add_token_sharded_indexer_metadata(
+                    self.model_state,
+                    input_batch,
+                    attn_metadata,
+                    attn_groups,
+                    self.kv_cache_config,
+                    dummy_run,
+                )
 
         input_ids = input_batch.input_ids
         inputs_embeds = None
@@ -1843,9 +1862,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             output = ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
             return ModelRunnerOutput.with_ec_conn_output(output, ec_connector_output)
 
-        # Pure prefill still has PCP-local target auxiliary states and slot
-        # mappings here. Project only this rank's DSpark context shard and
-        # write the draft-cache rows this rank owns.
+        # Pure prefill retains PCP-local target auxiliary states and slot
+        # mappings. Project only this rank's shard and write the draft-cache
+        # rows this rank owns. Mixed/decode batches use the restored
+        # full-context fallback because rejected speculative suffixes must be
+        # filtered first.
+        kv_transfer_config = self.vllm_config.kv_transfer_config
+        is_pcp_kv_producer = bool(
+            self.pcp_manager is not None
+            and kv_transfer_config is not None
+            and kv_transfer_config.is_kv_producer
+        )
         if (
             self.pcp_manager is not None
             and isinstance(self.speculator, DSparkSpeculator)
@@ -1856,11 +1883,33 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             and input_batch.has_prefill
             and input_batch.is_prefilling_np.all()
         ):
+            # Every PCP layout needs the restore: the drafter projects this
+            # rank's PCP token shard, but the draft cache rows it must fill are
+            # indexed in the global batch (and, when DCP spans the PCP group,
+            # are the DCP-interleaved rows of every request rather than this
+            # rank's shard).
+            pcp_manager = self.pcp_manager
+            kv_cache_config = self.kv_cache_config
+
+            def restore_context(
+                states: torch.Tensor,
+            ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+                states, positions, slot_mappings = pcp_manager.restore_sharded_context(
+                    states
+                )
+                return (
+                    states,
+                    positions,
+                    build_slot_mappings_by_layer(slot_mappings, kv_cache_config),
+                )
+
             with use_workspace_lane(self._draft_workspace_lane):
                 self.speculator.precompute_pcp_context_kv(
                     input_batch,
                     aux_hidden_states,
                     slot_mappings_by_layer,
+                    retain_for_proposal=not is_pcp_kv_producer,
+                    restore_context=restore_context,
                 )
             aux_hidden_states = None
 
@@ -1919,8 +1968,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             routed_experts=routed_experts,
         )
 
+        skip_pcp_producer_draft = is_pcp_kv_producer
+
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None
-        if self.speculator is not None and self.speculator.supports_mm_inputs:
+        if (
+            self.speculator is not None
+            and not skip_pcp_producer_draft
+            and self.speculator.supports_mm_inputs
+        ):
             # Get cached multimodal embeddings for draft forward.
             # NOTE: This is done here because postprocess updates
             # num_computed_prefill_tokens.
@@ -1944,7 +1999,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_batch.query_start_loc,
         )
 
-        if self.speculator is not None:
+        if self.speculator is not None and not skip_pcp_producer_draft:
             assert self.sampler is not None
             # Let the target override the hidden state fed to the drafter
             # (e.g. DeepSeek V4 MTP needs the pre-hc_head residual). The
@@ -1983,7 +2038,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     self.speculator.draft_token_confidence_probs, input_batch
                 )
 
-        if self.num_speculative_steps > 0:
+        if self.num_speculative_steps > 0 and not skip_pcp_producer_draft:
             # Spec-decode and diffusion LLMs both use draft tokens but the latter does
             # not have a speculator (i.e. self.speculator is None)
             self.draft_tokens_handler.set_draft_tokens(

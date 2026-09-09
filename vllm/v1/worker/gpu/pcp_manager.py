@@ -2,11 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Iterator
 from dataclasses import dataclass, replace
+from typing import Any
 
 import numpy as np
 import torch
 
-from vllm.config import VllmConfig
+from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed.parallel_state import get_dcp_group, get_pcp_group
 from vllm.logger import init_logger
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
@@ -33,6 +34,26 @@ class RankSegment:
     @property
     def num_tokens(self) -> int:
         return self.global_batch_slice.stop - self.global_batch_slice.start
+
+
+def get_max_num_tokens_for_profile(
+    num_tokens: int, num_reqs: int, pcp_world_size: int
+) -> int:
+    """Return the largest rank-local size of an all-prefill profiling batch."""
+    num_reqs = min(num_tokens, num_reqs)
+    tokens_per_req = np.full(num_reqs, num_tokens // num_reqs, dtype=np.int32)
+    tokens_per_req[num_reqs - num_tokens % num_reqs :] += 1
+    num_chunks = 2 * pcp_world_size
+    tokens_per_rank = [0] * pcp_world_size
+    for query_len in tokens_per_req:
+        chunk_size = (int(query_len) + num_chunks - 1) // num_chunks
+        for rank in range(pcp_world_size):
+            for chunk_idx in (rank, num_chunks - 1 - rank):
+                chunk_offset = chunk_idx * chunk_size
+                tokens_per_rank[rank] += max(
+                    0, min(chunk_size, int(query_len) - chunk_offset)
+                )
+    return max(tokens_per_rank)
 
 
 class PCPManager:
@@ -67,12 +88,14 @@ class PCPManager:
         self._use_mtp = use_mtp
 
         self._global_batch: InputBatch | None = None
-        self._replicated_batch = False
-        self._replicated_batch_num_tokens_padded: int | None = None
+        self._replicated_verification = False
+        self._replicated_verification_num_tokens_padded: int | None = None
+        self._num_local_tokens_padded = 0
         self._req_states = req_states
         self._block_tables = block_tables
         self._hidden_restore_idx: torch.Tensor | None = None
         self._padded_gather_idx: torch.Tensor | None = None
+        self._gathered_query_valid_mask: torch.Tensor | None = None
         self._gathered_kv_write_mask: torch.Tensor | None = None
         self._pad_slot_id = torch.tensor(PAD_SLOT_ID, dtype=torch.int64, device=device)
 
@@ -124,6 +147,54 @@ class PCPManager:
             )
             if max_num_tokens is not None and num_kv_cache_groups > 0
             else None
+        )
+
+    @property
+    def dcp_spans_pcp(self) -> bool:
+        """Whether DCP spans the PCP group (DCP-sharded rank-local caches).
+
+        Every rank then owns the DCP-interleaved rows of *every* request in
+        the global batch rather than a PCP token shard, so per-token cache
+        writes derived from PCP-sharded activations (the DSpark context-KV
+        precompute) must first be restored to the global batch.
+        """
+        return self.dcp_world_size > 1 and self.dcp_world_size == self.pcp_world_size
+
+    def restore_sharded_context(
+        self, states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Restore PCP-sharded per-token states to the global prefill batch.
+
+        Returns ``(states, positions, slot_mappings)`` in global batch order,
+        trimmed to the active token count. ``slot_mappings`` is the
+        ``[num_kv_cache_groups, num_tokens]`` rank-local mapping produced by
+        :meth:`prepare_slot_mappings` for this step: valid for the
+        DCP-interleaved rows this rank owns and ``PAD_SLOT_ID`` elsewhere, so
+        a cache write over the whole global batch stores exactly this rank's
+        shard of every request.
+        """
+        assert self._global_batch is not None
+        assert self._global_batch_slot_mappings is not None
+        assert self._padded_gather_idx is not None
+        num_tokens = self._global_batch.num_tokens
+        # The all-gather needs every rank to contribute the common padded
+        # shard width; a rank that owns few (or zero) prompt tokens may hold
+        # fewer rows than that.
+        padded = self._padded_gather_idx.shape[0] // self.pcp_world_size
+        if states.shape[0] < padded:
+            states = torch.cat(
+                [states, states.new_zeros(padded - states.shape[0], *states.shape[1:])]
+            )
+        restored = self.restore_hidden_state_buffer(states)
+        if restored.shape[0] < num_tokens:
+            raise RuntimeError(
+                "PCP sharded context restore produced "
+                f"{restored.shape[0]} rows for {num_tokens} global tokens"
+            )
+        return (
+            restored[:num_tokens],
+            self._global_batch.positions[:num_tokens],
+            self._global_batch_slot_mappings[:, :num_tokens],
         )
 
     @staticmethod
@@ -301,6 +372,7 @@ class PCPManager:
             )
         num_expanded_tokens = padded_num_tokens * self.pcp_world_size
         padded_gather_idx = np.zeros(num_expanded_tokens, dtype=np.int64)
+        gathered_query_valid_mask = np.zeros(num_expanded_tokens, dtype=np.bool_)
         gathered_kv_write_mask = np.zeros(num_expanded_tokens, dtype=np.bool_)
         for rank, segments in enumerate(segments_by_rank):
             expanded_rank_offset = rank * padded_num_tokens
@@ -314,6 +386,7 @@ class PCPManager:
                     segment.global_batch_slice.stop,
                     dtype=np.int64,
                 )
+                gathered_query_valid_mask[padded_gathered_slice] = True
                 # Cache insertion pairs one slot entry with each rank's local decode.
                 if not bool(is_prefilling[segment.global_batch_req_idx]) and rank != 0:
                     continue
@@ -330,6 +403,9 @@ class PCPManager:
         self._padded_gather_idx = async_copy_to_gpu(
             padded_gather_idx, device=self.device
         )
+        self._gathered_query_valid_mask = async_copy_to_gpu(
+            gathered_query_valid_mask, device=self.device
+        )
         self._gathered_kv_write_mask = async_copy_to_gpu(
             gathered_kv_write_mask, device=self.device
         )
@@ -341,8 +417,6 @@ class PCPManager:
         is_prefilling: np.ndarray,
     ) -> int:
         """Return the largest real rank-local batch before graph padding."""
-        if self.dcp_world_size > 1:
-            return int(num_scheduled_tokens.sum())
         return max(
             sum(
                 chunk_len
@@ -358,12 +432,12 @@ class PCPManager:
         assert self._input_buffers is not None
         return self._input_buffers
 
-    def _prepare_replicated_batch(
+    def _prepare_replicated_verification(
         self,
         input_batch: InputBatch,
         padded_num_tokens: int | None,
     ) -> InputBatch:
-        """Keep the target batch replicated in global token order."""
+        """Keep speculative verification replicated in global token order."""
         assert self._input_buffers is not None
         input_buffers = self._input_buffers
         num_tokens = input_batch.num_tokens
@@ -384,24 +458,14 @@ class PCPManager:
         input_buffers.seq_lens[:num_reqs_padded].copy_(input_batch.seq_lens)
 
         dcp_local_seq_lens = None
-        if self.dcp_world_size > 1:
-            prepare_dcp_local_seq_lens(
-                input_buffers.dcp_local_seq_lens,
-                input_buffers.seq_lens,
-                input_batch.num_reqs,
-                self.dcp_world_size,
-                self.dcp_rank,
-                self.cp_interleave,
-            )
-            dcp_local_seq_lens = input_buffers.dcp_local_seq_lens[:num_reqs_padded]
-        elif input_batch.dcp_local_seq_lens is not None:
+        if input_batch.dcp_local_seq_lens is not None:
             input_buffers.dcp_local_seq_lens[:num_reqs_padded].copy_(
                 input_batch.dcp_local_seq_lens
             )
             dcp_local_seq_lens = input_buffers.dcp_local_seq_lens[:num_reqs_padded]
 
-        self._replicated_batch = True
-        self._replicated_batch_num_tokens_padded = num_tokens_padded
+        self._replicated_verification = True
+        self._replicated_verification_num_tokens_padded = num_tokens_padded
         return replace(
             input_batch,
             num_tokens_after_padding=num_tokens_padded,
@@ -417,7 +481,19 @@ class PCPManager:
         self,
         input_batch: InputBatch,
         padded_num_tokens: int | None = None,
+        *,
+        adaptive_verification: bool = False,
     ) -> InputBatch:
+        if (
+            adaptive_verification
+            and input_batch.num_draft_tokens > 0
+            and input_batch.has_prefill
+        ):
+            raise NotImplementedError(
+                "PCP does not yet support adaptive speculative verification in "
+                "a mixed prefill/decode batch; use a disaggregated decoder or "
+                "disable adaptive verification."
+            )
         assert self._req_states is not None
         assert self._input_buffers is not None
         req_states = self._req_states
@@ -425,13 +501,11 @@ class PCPManager:
 
         global_batch = input_batch
         self._global_batch = global_batch
-        self._replicated_batch = False
-        self._replicated_batch_num_tokens_padded = None
+        self._replicated_verification = False
+        self._replicated_verification_num_tokens_padded = None
 
-        if self.dcp_world_size > 1 or (
-            input_batch.num_draft_tokens > 0 and not input_batch.has_prefill
-        ):
-            return self._prepare_replicated_batch(input_batch, padded_num_tokens)
+        if input_batch.num_draft_tokens > 0 and not input_batch.has_prefill:
+            return self._prepare_replicated_verification(input_batch, padded_num_tokens)
 
         num_scheduled_tokens = global_batch.num_scheduled_tokens
         num_computed_tokens = global_batch.num_computed_tokens_np
@@ -518,6 +592,7 @@ class PCPManager:
                 "PCP local token count exceeds the MRV2 input buffer size: "
                 f"{num_local_tokens_padded} > {input_buffers.max_num_tokens}."
             )
+        self._num_local_tokens_padded = num_local_tokens_padded
         rank_token_start = self.pcp_rank * num_local_tokens_padded
         assert self._padded_gather_idx is not None
         local_gather_idx = self._padded_gather_idx[
@@ -689,7 +764,7 @@ class PCPManager:
             out=self._local_block_tables,
             out_ptrs=self._local_block_table_ptrs,
         )
-        if self._replicated_batch:
+        if self._replicated_verification:
             assert self._global_batch_slot_mappings is not None
             assert self._gathered_kv_slot_mappings is not None
             global_slot_mappings = self._block_tables.compute_slot_mappings(
@@ -760,9 +835,114 @@ class PCPManager:
         )
         return gathered_kv_slot_mappings
 
+    def add_token_sharded_indexer_metadata(
+        self,
+        model_state: Any,
+        input_batch: InputBatch,
+        attn_metadata: dict[str, Any],
+        attn_groups: list[list[Any]],
+        kv_cache_config: Any,
+        dummy_run: bool,
+    ) -> dict[str, Any]:
+        """DCP spanning the PCP group: rebuild the sparse indexer's metadata from
+        the *global* PCP batch so every rank scores identical rows against its K
+        shard (the DCP top-k merge all-gathers per row), and attach the index
+        maps the indexer op needs to gather queries and keep its own rows."""
+        if (
+            self.dcp_world_size <= 1
+            or self.dcp_world_size != self.pcp_world_size
+            or self._global_batch is None
+            or self._padded_gather_idx is None
+            or self._hidden_restore_idx is None
+            or self._gathered_query_valid_mask is None
+            or self._replicated_verification
+            or not input_batch.has_prefill
+        ):
+            return attn_metadata
+        if dummy_run:
+            # Dummy batches are built directly (not partitioned), so there is no
+            # global batch to describe. The sparse paths then run a local-only
+            # simulation with the same shapes/memory and no cross-rank gathers.
+            return attn_metadata
+        indexer_groups = [
+            [g for g in groups if g.backend.get_name() == "DEEPSEEK_V32_INDEXER"]
+            for groups in attn_groups
+        ]
+        sparse_mla_groups = [
+            [
+                g
+                for g in groups
+                if g.backend.get_name().startswith(
+                    "FLASHINFER_MLA_SPARSE"
+                )
+            ]
+            for groups in attn_groups
+        ]
+        if not any(indexer_groups) and not any(sparse_mla_groups):
+            return attn_metadata
+        assert self._block_tables is not None
+        global_batch = self._global_batch
+        block_tables = self._block_tables.gather_block_tables(
+            global_batch.idx_mapping,
+            global_batch.num_reqs_after_padding,
+        )
+        num_global_tokens = self._hidden_restore_idx.shape[0]
+        if dummy_run or self._global_batch_slot_mappings is None:
+            slot_mappings = torch.full(
+                (self._block_tables.num_kv_cache_groups, num_global_tokens),
+                PAD_SLOT_ID,
+                dtype=torch.int64,
+                device=self.device,
+            )
+        else:
+            slot_mappings = self._global_batch_slot_mappings[:, :num_global_tokens]
+
+        global_metadata = model_state.prepare_attn(
+            global_batch,
+            CUDAGraphMode.NONE,
+            block_tables,
+            slot_mappings,
+            indexer_groups,
+            kv_cache_config,
+        )
+        num_padded = self._num_local_tokens_padded
+        # Global request id per gathered (rank-major, padded) row for the sparse
+        # MLA token-sharded attention; padding rows map to request 0 and carry
+        # top-k -1, so they never touch the cache.
+        global_req_id = torch.repeat_interleave(
+            torch.arange(global_batch.num_reqs, device=self.device, dtype=torch.int32),
+            torch.from_numpy(
+                global_batch.num_scheduled_tokens[: global_batch.num_reqs].astype(
+                    np.int64
+                )
+            ).to(self.device, non_blocking=True),
+        )
+        if global_req_id.shape[0] < num_global_tokens:
+            global_req_id = torch.nn.functional.pad(
+                global_req_id, (0, num_global_tokens - global_req_id.shape[0])
+            )
+        for i, groups in enumerate(sparse_mla_groups):
+            for g in groups:
+                for layer_name in g.layer_names:
+                    meta = attn_metadata.get(layer_name)
+                    if meta is None:
+                        continue
+                    meta.pcp_global_req_id = global_req_id
+                    meta.pcp_gather_idx = self._padded_gather_idx
+                    meta.pcp_gather_valid_mask = self._gathered_query_valid_mask
+                    meta.pcp_global_block_table = block_tables[i]
+        if not any(indexer_groups):
+            return attn_metadata
+        for layer_name, meta in global_metadata.items():
+            meta.pcp_num_padded = num_padded
+            meta.pcp_restore_idx = self._hidden_restore_idx
+            meta.pcp_gathered_slot_mapping = attn_metadata[layer_name].slot_mapping
+            attn_metadata[layer_name] = meta
+        return attn_metadata
+
     def restore_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
         assert self._global_batch is not None
-        if self._replicated_batch:
+        if self._replicated_verification:
             return hidden_states
         if self._hidden_restore_idx is None:
             return hidden_states
@@ -789,10 +969,10 @@ class PCPManager:
         """Restore a persistent max-token-sized buffer (e.g. the target's
         pre-hc_head residual) by slicing it to the rank-local padded token
         count before the all-gather."""
-        if self._replicated_batch:
+        if self._replicated_verification:
             assert self._global_batch is not None
-            assert self._replicated_batch_num_tokens_padded is not None
-            return hidden_states[: self._replicated_batch_num_tokens_padded]
+            assert self._replicated_verification_num_tokens_padded is not None
+            return hidden_states[: self._replicated_verification_num_tokens_padded]
         assert self._padded_gather_idx is not None
         local_num_tokens_padded = (
             self._padded_gather_idx.shape[0] // self.pcp_world_size
@@ -811,12 +991,14 @@ def maybe_partition_pcp_batch(
     manager: PCPManager | None,
     input_batch: InputBatch,
     padded_num_tokens: int | None = None,
+    adaptive_verification: bool = False,
 ) -> InputBatch:
     if manager is None:
         return input_batch
     return manager.partition_batch(
         input_batch,
         padded_num_tokens=padded_num_tokens,
+        adaptive_verification=adaptive_verification,
     )
 
 

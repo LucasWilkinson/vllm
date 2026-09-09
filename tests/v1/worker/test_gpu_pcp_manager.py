@@ -46,8 +46,51 @@ def test_replicated_decode_piecewise_graph_padding(monkeypatch):
         torch.tensor([0, 1, 2, 0, 0, 1, 2, 0]),
     )
     assert torch.equal(
+        manager._gathered_query_valid_mask,
+        torch.tensor([True, True, True, False, True, True, True, False]),
+    )
+    assert torch.equal(
         manager._gathered_kv_write_mask,
         torch.tensor([True, True, True, False, False, False, False, False]),
+    )
+
+
+def test_mixed_layout_separates_query_rows_from_cache_writers(monkeypatch):
+    manager = PCPManager(
+        pcp_world_size=2,
+        pcp_rank=0,
+        device=torch.device("cpu"),
+        dcp_world_size=2,
+    )
+    monkeypatch.setattr(pcp_manager_module, "async_copy_to_gpu", _copy_to_cpu)
+
+    manager._build_batch_layout(
+        num_scheduled_tokens=np.array([1, 4], dtype=np.int32),
+        num_computed_tokens=np.array([16, 0], dtype=np.int32),
+        is_prefilling=np.array([False, True]),
+        query_start_loc_np=np.array([0, 1, 5], dtype=np.int32),
+        padded_num_tokens=3,
+    )
+
+    # Decode row 0 is replicated and must be a valid query on both ranks so
+    # each rank contributes its DCP KV shard. Only rank 0 writes its cache row.
+    assert torch.equal(
+        manager._gathered_query_valid_mask,
+        torch.tensor([True, True, True, True, True, True]),
+    )
+    assert torch.equal(
+        manager._gathered_kv_write_mask,
+        torch.tensor([True, True, True, False, True, True]),
+    )
+    # Both rank-major copies of the decode row map to global row 0; the
+    # sharded prefill rows cover global rows 1..4 exactly once.
+    assert torch.equal(
+        manager._padded_gather_idx,
+        torch.tensor([0, 4, 1, 0, 2, 3]),
+    )
+    assert torch.equal(
+        manager._hidden_restore_idx,
+        torch.tensor([0, 2, 4, 5, 1]),
     )
 
 
@@ -93,20 +136,23 @@ def test_num_tokens_for_dispatch_uses_largest_pcp_rank(
     assert actual == expected
 
 
-def test_num_tokens_for_dispatch_keeps_dcp_batch_replicated():
-    manager = PCPManager(
-        pcp_world_size=4,
-        pcp_rank=0,
-        device=torch.device("cpu"),
-        dcp_world_size=4,
+@pytest.mark.parametrize(
+    ("pcp_world_size", "num_tokens", "num_reqs", "expected"),
+    [
+        (4, 32768, 256, 8192),
+        (4, 8192, 256, 2048),
+        (4, 9, 1, 3),
+    ],
+)
+def test_max_num_tokens_for_profile_is_rank_local(
+    pcp_world_size, num_tokens, num_reqs, expected
+):
+    assert (
+        pcp_manager_module.get_max_num_tokens_for_profile(
+            num_tokens, num_reqs, pcp_world_size
+        )
+        == expected
     )
-
-    actual = manager.get_num_tokens_for_dispatch(
-        np.array([2, 9], dtype=np.int32),
-        np.array([False, True], dtype=np.bool_),
-    )
-
-    assert actual == 11
 
 
 def test_graph_padding_cannot_be_smaller_than_largest_pcp_rank(monkeypatch):
@@ -155,12 +201,12 @@ def test_sparse_mla_pcp_accepts_piecewise_cudagraphs():
         )
 
 
-@pytest.mark.parametrize("dcp_world_size", [1, 4])
-def test_sparse_mla_pcp_accepts_mtp(dcp_world_size):
-    config = SimpleNamespace(
+def _make_dspark_pcp_config(*, pcp_size: int, dcp_size: int, tp_size: int = 1):
+    return SimpleNamespace(
         parallel_config=SimpleNamespace(
-            prefill_context_parallel_size=4,
-            decode_context_parallel_size=dcp_world_size,
+            tensor_parallel_size=tp_size,
+            prefill_context_parallel_size=pcp_size,
+            decode_context_parallel_size=dcp_size,
             pipeline_parallel_size=1,
         ),
         model_config=SimpleNamespace(
@@ -170,11 +216,18 @@ def test_sparse_mla_pcp_accepts_mtp(dcp_world_size):
         ),
         lora_config=None,
         speculative_config=SimpleNamespace(
-            method="mtp",
-            use_dspark=lambda: False,
-            enable_adaptive_verification=False,
+            method="dspark",
+            use_dspark=lambda: True,
         ),
         compilation_config=SimpleNamespace(cudagraph_mode=CUDAGraphMode.PIECEWISE),
     )
 
-    PCPManager.validate_config(config, supports_mm_inputs=False)
+
+@pytest.mark.parametrize(("dcp_size", "tp_size"), [(1, 1), (8, 1), (8, 2)])
+def test_dspark_pcp_accepts_every_dcp_topology(dcp_size, tp_size):
+    PCPManager.validate_config(
+        _make_dspark_pcp_config(pcp_size=8, dcp_size=dcp_size, tp_size=tp_size),
+        supports_mm_inputs=False,
+    )
+
+

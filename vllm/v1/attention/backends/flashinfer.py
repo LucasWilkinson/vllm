@@ -309,6 +309,7 @@ class BatchDCPPrefillWrapper:
         logits_soft_cap: float | None,
         q_data_type: torch.dtype,
         kv_cache_dtype: torch.dtype,
+        o_data_type: torch.dtype,
         prefill_fixed_split_size: int,
         disable_split_kv: bool,
     ):
@@ -328,6 +329,7 @@ class BatchDCPPrefillWrapper:
             logits_soft_cap=logits_soft_cap,
             q_data_type=q_data_type,
             kv_data_type=kv_cache_dtype,
+            o_data_type=o_data_type,
             fixed_split_size=prefill_fixed_split_size,
             disable_split_kv=disable_split_kv,
         )
@@ -343,6 +345,7 @@ class BatchDCPPrefillWrapper:
             window_left=window_left,
             logits_soft_cap=logits_soft_cap,
             q_data_type=q_data_type,
+            o_data_type=o_data_type,
         )
 
     def run(
@@ -708,6 +711,10 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             self.model_config.max_model_len, self.kv_cache_spec.block_size
         )
         max_num_reqs = vllm_config.scheduler_config.max_num_seqs
+        # PCP DualChunkSwap can expose two rank-local segments per logical
+        # prefill request during the shared attention-metadata preparation.
+        if vllm_config.parallel_config.prefill_context_parallel_size > 1:
+            max_num_reqs *= 2
         self.max_num_reqs = max_num_reqs
         max_num_pages = max_num_reqs * max_num_pages_per_req
         # Persistent uniform masks keep stable addresses for CUDA graphs.
@@ -937,6 +944,12 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         # The user sets --attention-config.disable_flashinfer_q_quantization
         # to 1 explicitly, use model dtype for query.
         if self.vllm_config.attention_config.disable_flashinfer_q_quantization:
+            return self.model_config.dtype
+
+        # Native FlashInfer DCP prefill uses FA2 because the TRTLLM prefill
+        # path is not CP-aware. FA2 can read an FP8 KV cache, but it cannot
+        # consume FP8 tensor-core queries, so retain model-dtype queries.
+        if is_prefill and self.use_dcp and self.cache_dtype.startswith("fp8"):
             return self.model_config.dtype
 
         # self.cache_dtype is resolved per KV-cache group: it is "auto" when
@@ -1585,6 +1598,13 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 assert paged_kv_indptr_prefill_cpu.shape[0] == num_prefills + 1
                 if self.use_dcp:
                     assert isinstance(prefill_wrapper, BatchDCPPrefillWrapper)
+                    # NVFP4 trtllm kernel only supports FP8 output; otherwise
+                    # emit the model dtype (bf16). Mirror the non-DCP prefill
+                    # path so the fa2/fa3 DCP wrappers are not planned with an
+                    # unsupported fp8 output dtype under fp8 KV cache.
+                    o_dtype = (
+                        FP8_DTYPE if self.is_kvcache_nvfp4 else self.model_config.dtype
+                    )
                     prefill_wrapper.plan(
                         qo_indptr_cpu=qo_indptr_prefill_cpu,
                         paged_kv_indptr_cpu=paged_kv_indptr_prefill_cpu,
@@ -1600,6 +1620,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         logits_soft_cap=self.logits_soft_cap,
                         q_data_type=self.q_data_type_prefill,
                         kv_cache_dtype=self.kv_cache_dtype,
+                        o_data_type=o_dtype,
                         prefill_fixed_split_size=self.prefill_fixed_split_size,
                         disable_split_kv=self.disable_split_kv,
                     )
