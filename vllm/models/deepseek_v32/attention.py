@@ -225,14 +225,19 @@ class DeepseekV32Attention(MLAAttention):
         self.topk_indices_buffer = topk_indices_buffer
 
         self.skip_topk = False
-        self.pcp_spans_dcp = (
+        # Distinct from the ``pcp_spans_dcp`` predicates in the sparse-MLA
+        # metadata builder and FlashMLA backend, which require DCP == PCP.
+        # Here any DCP alongside PCP is enough: the sparse MQA top-k merge
+        # assumes matching query rows on every rank, and PCP partitions them
+        # regardless of how the DCP axis is sized.
+        self.pcp_with_dcp = (
             self.use_pcp
             and vllm_config.parallel_config.decode_context_parallel_size > 1
         )
         enable_short_prefill_scoring_skip = (
             not is_mtp_layer
             and not skip_topk
-            and (not self.use_pcp or self.pcp_spans_dcp)
+            and (not self.use_pcp or self.pcp_with_dcp)
             and current_platform.is_cuda()
             and self.supports_dense_mha_prefill
         )
@@ -324,7 +329,7 @@ class DeepseekV32Attention(MLAAttention):
         use_dense_prefill = (
             attn_metadata is not None
             and bool(getattr(prefill_metadata, "use_dense_mha", False))
-            and self.pcp_spans_dcp
+            and self.pcp_with_dcp
         )
 
         slot_mapping = forward_context.slot_mapping
