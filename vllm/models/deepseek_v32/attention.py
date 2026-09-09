@@ -593,7 +593,7 @@ class DeepseekV32Attention(MLAAttention):
             mqa_q_arg = (ql_nope[:query_rows], mqa_q[:query_rows])
 
         if pcp_token_sharded:
-            attn_out = self.impl.forward_mqa_token_sharded(  # type: ignore[attr-defined]
+            attn_out = self.impl.forward_mqa_token_sharded(
                 mqa_q_arg,
                 kv_cache,
                 attn_metadata,

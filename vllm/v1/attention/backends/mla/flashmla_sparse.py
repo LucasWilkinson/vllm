@@ -8,7 +8,6 @@ import torch
 from vllm import _custom_ops as ops
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.config.cache import CacheDType
-from vllm.distributed.parallel_state import GroupCoordinator
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.mla_attention import MLACommonPrefillMetadata
 from vllm.model_executor.layers.attention.sparse_mla_attention import (
@@ -36,10 +35,6 @@ from vllm.v1.attention.backends.utils import (
     reshape_attn_output_for_spec_decode,
     reshape_query_for_spec_decode,
     split_prefill_chunks,
-)
-from vllm.v1.attention.ops.dcp import (
-    CPTritonContext,
-    correct_attn_out,
 )
 from vllm.v1.attention.ops.flashmla import (
     FlashMLASchedMeta,
@@ -905,8 +900,6 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
         lse = lse[:, :actual_num_heads]
         return output, lse
 
-    TOKEN_SHARDED_ROWS_PER_RANK = 256
-
     def _token_sharded_kernel_metadata(
         self,
         attn_metadata: FlashMLASparseMetadata,
@@ -943,129 +936,51 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
             dummy_block_table=base.dummy_block_table,
         )
 
-    def forward_mqa_token_sharded(
+    def _token_sharded_prepare(
         self,
         q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
-        kv_c_and_k_pe_cache: torch.Tensor,
         attn_metadata: FlashMLASparseMetadata,
-        layer: AttentionLayer,
-        cp_group: GroupCoordinator,
-        num_padded_tokens: int,
-        w_uv: torch.Tensor,
     ) -> torch.Tensor:
-        """Attend gathered PCP query rows to each local DCP KV shard.
-
-        FlashMLA (SM90) port of the FlashInfer sparse token-sharded path: every
-        rank all-gathers the same uniform, rank-major query rows, runs the fp8
-        sparse kernel against its local KV shard with the Top-K rows filtered
-        to locally owned slots, applies the V-up projection, LSE-corrects the
-        partial output across ranks (ag_rs), and reduce-scatters the rows back
-        to their PCP owners.
-        """
         if isinstance(q, tuple):
             ql_nope, q_pe = q
             q_cat = self.q_concat_buffer[: ql_nope.shape[0]]
             ops.concat_mla_q(ql_nope, q_pe, q_cat)
             q = q_cat
-        num_actual = attn_metadata.num_actual_tokens
-        assert q.shape[0] >= num_padded_tokens >= num_actual
-        assert self.topk_indices_buffer is not None
         if self.kv_cache_dtype != "fp8_ds_mla" or not attn_metadata.fp8_use_mixed_batch:
             raise NotImplementedError(
                 "FlashMLA sparse token-sharded PCP/DCP attention requires the "
                 "fp8_ds_mla mixed-batch path"
             )
+        return q
 
-        global_req_id = attn_metadata.pcp_global_req_id
-        gather_idx = attn_metadata.pcp_gather_idx
-        gather_valid_mask = attn_metadata.pcp_gather_valid_mask
-        global_block_table = attn_metadata.pcp_global_block_table
-        if (
-            global_req_id is None
-            or gather_idx is None
-            or gather_valid_mask is None
-            or global_block_table is None
-        ):
-            # Capture/profiling batches have no runtime global PCP maps. Execute
-            # a local shape-equivalent kernel; the eager segment is re-run with
-            # real metadata at replay.
-            if num_actual == 0:
-                return q.new_zeros(
-                    (0, q.shape[1], w_uv.shape[-1]), dtype=torch.bfloat16
-                )
-            out, _ = self.forward_mqa(
-                q[:num_actual], kv_c_and_k_pe_cache, attn_metadata, layer
-            )
-            return torch.bmm(out.transpose(0, 1), w_uv).transpose(0, 1).contiguous()
+    def _token_sharded_partial(
+        self,
+        q_all: torch.Tensor,
+        kv_c_and_k_pe_cache: torch.Tensor,
+        topk_physical: torch.Tensor,
+        valid_counts: torch.Tensor,
+        attn_metadata: FlashMLASparseMetadata,
+        layer: AttentionLayer,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        kernel_metadata = self._token_sharded_kernel_metadata(
+            attn_metadata, q_all.shape[0], q_all.device
+        )
+        out, lse = self._fp8_flash_mla_kernel(
+            q=q_all.unsqueeze(0),
+            kv_c_and_k_pe_cache=kv_c_and_k_pe_cache,
+            topk_indices=topk_physical.unsqueeze(0),
+            kernel_metadata=kernel_metadata,
+        )
+        partial = out.squeeze(0)
+        # Kernel LSE is (1, H, T); the merge consumes (T, H).
+        lse = lse.squeeze(0).transpose(0, 1)
+        # Rows where this rank owns none of the selected tokens have
+        # undefined out/lse; (0, -inf) is the identity of the LSE merge.
+        empty_rows = valid_counts == 0
+        partial = partial.masked_fill(empty_rows.view(-1, 1, 1), 0.0)
+        lse = lse.masked_fill(empty_rows.view(-1, 1), float("-inf"))
+        return partial, lse
 
-        world_size = cp_group.world_size
-        num_heads = q.shape[1]
-        topk_global = self.topk_indices_buffer
-        gather_idx = gather_idx.view(world_size, num_padded_tokens)
-        gather_valid_mask = gather_valid_mask.view(world_size, num_padded_tokens)
-        out_chunks: list[torch.Tensor] = []
-        cp_ctx = CPTritonContext()
-        chunk_rows = self.TOKEN_SHARDED_ROWS_PER_RANK
-
-        for start in range(0, num_padded_tokens, chunk_rows):
-            stop = min(start + chunk_rows, num_padded_tokens)
-            rows = stop - start
-            num_all = rows * world_size
-            q_all = cp_group.all_gather(q[start:stop], dim=0)
-            gathered_rows = gather_idx[:, start:stop].flatten()
-            valid_rows = gather_valid_mask[:, start:stop].flatten()
-            physical, valid_counts = triton_filter_and_convert_dcp_index(
-                global_req_id,
-                global_block_table,
-                topk_global[: global_req_id.shape[0]],
-                dcp_size=self.dcp_world_size,
-                dcp_rank=self.dcp_rank,
-                cp_kv_cache_interleave_size=(
-                    attn_metadata.cp_kv_cache_interleave_size
-                ),
-                BLOCK_SIZE=attn_metadata.block_size,
-                NUM_TOPK_TOKENS=topk_global.shape[1],
-                return_valid_counts=True,
-                compact_valid_to_front=True,
-                row_indices=gathered_rows,
-                row_valid_mask=valid_rows,
-            )
-            kernel_metadata = self._token_sharded_kernel_metadata(
-                attn_metadata, num_all, q.device
-            )
-            _out, _lse = self._fp8_flash_mla_kernel(
-                q=q_all.unsqueeze(0),
-                kv_c_and_k_pe_cache=kv_c_and_k_pe_cache,
-                topk_indices=physical.unsqueeze(0),
-                kernel_metadata=kernel_metadata,
-            )
-            partial = _out.squeeze(0)
-            # Kernel LSE is (1, H, T); the merge consumes (T, H).
-            lse = _lse.squeeze(0).transpose(0, 1)
-            # Rows where this rank owns none of the selected tokens have
-            # undefined out/lse; (0, -inf) is the identity of the LSE merge.
-            empty_rows = valid_counts == 0
-            partial = partial.masked_fill(empty_rows.view(-1, 1, 1), 0.0)
-            lse = lse.masked_fill(empty_rows.view(-1, 1), float("-inf"))
-            partial = (
-                torch.bmm(partial.transpose(0, 1), w_uv)
-                .transpose(0, 1)
-                .contiguous()
-            )
-            lses = cp_group.all_gather(lse.contiguous(), dim=0).view(
-                world_size, num_all, num_heads
-            )
-            partial, _ = correct_attn_out(
-                partial,
-                lses,
-                cp_group.rank_in_group,
-                cp_ctx,
-                is_lse_base_on_e=self.lse_base_on_e,
-            )
-            out_chunks.append(cp_group.reduce_scatter(partial, dim=0))
-
-        local_out = out_chunks[0] if len(out_chunks) == 1 else torch.cat(out_chunks)
-        return local_out[:num_actual]
 
     def forward_mqa(
         self,
