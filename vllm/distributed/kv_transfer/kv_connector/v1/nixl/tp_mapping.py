@@ -12,7 +12,13 @@ from vllm.distributed.kv_transfer.kv_connector.utils import (
     BlockIds,
     TransferTopology,
 )
-from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheSpec, MambaSpec
+from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
+    KVCacheSpec,
+    MambaSpec,
+    MLAAttentionSpec,
+    SlidingWindowMLASpec,
+)
 
 # ======================================================================
 # Data structures
@@ -26,6 +32,7 @@ class ReadSpec:
     remote_rank: int
     local_block_ids: BlockIds
     remote_block_ids: BlockIds
+    block_ids_by_region: bool = False
 
 
 def _is_attention_spec(spec_type: type[KVCacheSpec]) -> bool:
@@ -34,6 +41,10 @@ def _is_attention_spec(spec_type: type[KVCacheSpec]) -> bool:
 
 def _is_ssm_spec(spec_type: type[KVCacheSpec]) -> bool:
     return issubclass(spec_type, MambaSpec)
+
+
+def _is_mla_spec(spec_type: type[KVCacheSpec]) -> bool:
+    return issubclass(spec_type, (MLAAttentionSpec, SlidingWindowMLASpec))
 
 
 @dataclass(frozen=True)
@@ -60,6 +71,12 @@ class TPMapping:
     # a request's blocks only once that many notifications have come in.
     local_consumers: int = 1
 
+    # The remote is a TP1 producer whose transfer-TP ranks are PCP token shards
+    # spanned by DCP (every remote rank holds every KV head for its own token
+    # slice). Head-sharded local groups then read their head slice from every
+    # remote shard, at rank_offset_factor, instead of splitting one block.
+    remote_heads_replicated: bool = False
+
 
 # ======================================================================
 # TP mapping computation
@@ -71,6 +88,8 @@ def compute_tp_mapping(
     remote_tp_size: int,
     group_spec_types: tuple[type[KVCacheSpec], ...],
     remote_dcp_size: int = 1,
+    attention_group_num_splits: tuple[int, ...] | None = None,
+    remote_pcp_size: int = 1,
 ) -> TPMapping:
     """Build the complete local-to-remote TP mapping.
 
@@ -83,6 +102,20 @@ def compute_tp_mapping(
     tp_rank = transfer_topology.tp_rank
     tp_size = transfer_topology.tp_size
     total_num_kv_heads = transfer_topology.total_num_kv_heads
+    # A PCP producer whose DCP spans the PCP group reports transfer-TP =
+    # tp * pcp; its real head sharding is tp. With tp == 1 every remote rank
+    # holds every KV head of its token slice.
+    remote_real_tp_size = (
+        remote_tp_size // remote_pcp_size
+        if remote_pcp_size > 1 and remote_dcp_size > 1
+        else remote_tp_size
+    )
+    remote_heads_replicated = (
+        remote_dcp_size > 1
+        and remote_pcp_size > 1
+        and remote_real_tp_size == 1
+        and tp_size > remote_real_tp_size
+    )
     # --- Attention source ranks ---
     if transfer_topology.is_mla or tp_size >= remote_tp_size:
         if transfer_topology.is_mla and remote_dcp_size > 1:
@@ -107,6 +140,40 @@ def compute_tp_mapping(
         _, unique_idx = np.unique(heads, return_index=True)
         attn_ranks = (start + np.sort(unique_idx)).tolist()
 
+    # A model-level MLA flag is insufficient when an ordinary-attention draft
+    # group accompanies an MLA verifier. In that case the draft group must read
+    # every distinct remote shard while MLA still reads one replica.
+    if attention_group_num_splits is not None:
+        assert len(attention_group_num_splits) == len(group_spec_types)
+        if (
+            remote_dcp_size > 1
+            and not remote_heads_replicated
+            and any(
+                _is_attention_spec(t) and not _is_mla_spec(t)
+                for t in group_spec_types
+            )
+        ):
+            raise NotImplementedError(
+                "Mixed MLA and sharded attention is not supported with DCP"
+            )
+        if remote_heads_replicated:
+            # Every remote token shard holds every head: read this rank's head
+            # slice from each shard, exactly like the replicated MLA regions.
+            sharded_attn_ranks = transfer_topology.dcp_source_ranks(
+                remote_tp_size, remote_dcp_size
+            )
+        elif tp_size < remote_tp_size:
+            start = tp_rank * (remote_tp_size // tp_size)
+            max_splits = max(attention_group_num_splits, default=1)
+            sharded_attn_ranks = list(range(start, start + max_splits))
+        else:
+            sharded_attn_ranks = [tp_rank * remote_tp_size // tp_size]
+        replicated_attn_ranks = (
+            transfer_topology.dcp_source_ranks(remote_tp_size, remote_dcp_size)
+            if remote_dcp_size > 1
+            else [tp_rank * remote_tp_size // tp_size]
+        )
+
     # --- SSM source ranks ---
     has_ssm = any(_is_ssm_spec(t) for t in group_spec_types)
     if has_ssm:
@@ -118,27 +185,67 @@ def compute_tp_mapping(
     else:
         ssm_ranks = []
 
-    all_ranks = sorted(set(attn_ranks) | set(ssm_ranks))
-
     # --- Per-group ordered source ranks ---
-    source_ranks_per_group = tuple(
-        tuple(ssm_ranks) if _is_ssm_spec(t) else tuple(attn_ranks)
-        for t in group_spec_types
-    )
+    if attention_group_num_splits is None:
+        source_ranks_per_group = tuple(
+            tuple(ssm_ranks) if _is_ssm_spec(t) else tuple(attn_ranks)
+            for t in group_spec_types
+        )
+        slot_ranks = attn_ranks
+    else:
+        source_ranks_per_group = tuple(
+            tuple(ssm_ranks)
+            if _is_ssm_spec(t)
+            else tuple(replicated_attn_ranks)
+            if _is_mla_spec(t)
+            # Every remote token shard holds every head: read all shards.
+            else tuple(sharded_attn_ranks)
+            if remote_heads_replicated
+            else tuple(sharded_attn_ranks[: attention_group_num_splits[i]])
+            for i, t in enumerate(group_spec_types)
+        )
+        slot_ranks = sharded_attn_ranks
+
+    all_ranks = sorted({rank for ranks in source_ranks_per_group for rank in ranks})
 
     # --- Attention head slots ---
     head_to_slot: dict[int, int] = {}
-    for i, r in enumerate(attn_ranks):
+    for i, r in enumerate(slot_ranks):
         head_to_slot[r * total_num_kv_heads // remote_tp_size] = i
-    rank_to_attention_slot = {
-        r: head_to_slot.get(r * total_num_kv_heads // remote_tp_size, 0)
-        for r in all_ranks
-    }
+    rank_to_attention_slot = {r: i for i, r in enumerate(slot_ranks)}
+    rank_to_attention_slot.update(
+        {
+            r: head_to_slot.get(r * total_num_kv_heads // remote_tp_size, 0)
+            for r in all_ranks
+            if r not in rank_to_attention_slot
+        }
+    )
 
     # --- Rank offset factor ---
-    if transfer_topology.is_mla or tp_size <= remote_tp_size:
+    has_sharded_attention = any(
+        _is_attention_spec(t) and not _is_mla_spec(t) for t in group_spec_types
+    )
+    # Head-sharded regions may live in an MLA-typed group (per-region policy,
+    # e.g. a DSpark drafter alongside a sparse-MLA target); the caller signals
+    # that with attention_group_num_splits.
+    has_sharded_regions = has_sharded_attention or attention_group_num_splits is not None
+    if remote_heads_replicated and has_sharded_regions:
+        # Head-sharded local groups slice the producer's full-head block.
+        rank_offset_factor = tp_rank % (tp_size // remote_real_tp_size)
+    elif (
+        transfer_topology.is_mla
+        and not has_sharded_attention
+        and attention_group_num_splits is None
+    ) or tp_size <= remote_tp_size:
         # We don't index into remote for reading, no offset needed.
         rank_offset_factor = 0
+    elif attention_group_num_splits is not None:
+        # A full-attention draft alongside an MLA verifier has its own TP
+        # sharding. The verifier's (often single) KV-head count cannot be used
+        # to choose the draft shard: each wider decoder TP rank reads the
+        # corresponding slice of the producer's draft block. Replicated MLA
+        # regions ignore this offset when their descriptors are built.
+        rank_offset_factor = tp_rank % (tp_size // remote_tp_size)
     elif tp_size > total_num_kv_heads:
         local_head = tp_rank * total_num_kv_heads // tp_size
         p_start = attn_ranks[0] * total_num_kv_heads // remote_tp_size
@@ -157,4 +264,5 @@ def compute_tp_mapping(
         rank_to_attention_slot=rank_to_attention_slot,
         rank_offset_factor=rank_offset_factor,
         local_consumers=local_consumers,
+        remote_heads_replicated=remote_heads_replicated and has_sharded_regions,
     )

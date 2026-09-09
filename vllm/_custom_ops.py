@@ -208,6 +208,11 @@ def rotary_embedding(
     rope_dim_offset: int = 0,
     inverse: bool = False,
 ) -> None:
+    if positions.numel() == 0:
+        # The launcher derives the hidden size as query.numel() / num_tokens,
+        # which raises SIGFPE on an empty batch. A PCP rank that owns no
+        # prompt tokens reaches here from the DSpark context-KV precompute.
+        return
     if rope_dim_offset == 0 and not inverse:
         torch.ops._C.rotary_embedding(
             positions, query, key, head_size, cos_sin_cache, is_neox
