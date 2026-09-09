@@ -124,10 +124,7 @@ class SparseMLACommonMetadataBuilder(AttentionMetadataBuilder[T]):
             device=device,
         )
         parallel_config = vllm_config.parallel_config
-        self.use_pcp = (
-            parallel_config.prefill_context_parallel_size > 1
-            and not vllm_config.attention_config.disable_pcp
-        )
+        self.use_pcp = vllm_config.use_pcp
         self.pcp_spans_dcp = (
             self.use_pcp
             and parallel_config.decode_context_parallel_size

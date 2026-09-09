@@ -539,11 +539,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         parallel_config = self.vllm_config.parallel_config
         self.dcp_world_size = parallel_config.decode_context_parallel_size
         self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0
-        self.pcp_world_size = (
-            1
-            if self.vllm_config.attention_config.disable_pcp
-            else parallel_config.prefill_context_parallel_size
-        )
+        self.pcp_world_size = self.vllm_config.pcp_world_size
         self.use_pcp = self.pcp_world_size > 1
         self.cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size
         # NOTE(Chen):an estimated max size of flattened_kv. Need to double check.

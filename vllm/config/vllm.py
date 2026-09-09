@@ -610,6 +610,24 @@ class VllmConfig:
         return 0
 
     @property
+    def pcp_world_size(self) -> int:
+        """Prefill context parallel group size, or 1 when PCP is disabled.
+
+        `AttentionConfig.disable_pcp` turns PCP off for the attention layers
+        of one role (the DSpark drafter runs replicated), so consumers must
+        read this rather than `parallel_config.prefill_context_parallel_size`
+        directly, or a disabled layer builds PCP-shaped metadata.
+        """
+        if self.attention_config.disable_pcp:
+            return 1
+        return self.parallel_config.prefill_context_parallel_size
+
+    @property
+    def use_pcp(self) -> bool:
+        """Whether attention layers run prefill context parallelism."""
+        return self.pcp_world_size > 1
+
+    @property
     def num_lookahead_tokens(self) -> int:
         """KV slots to reserve past the tokens the target model is scheduled for.
 
