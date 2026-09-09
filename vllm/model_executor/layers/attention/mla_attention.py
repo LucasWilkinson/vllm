@@ -1491,7 +1491,6 @@ class MLACommonPrefillMetadata:
         max_query_len: int
         cu_seq_lens: torch.Tensor
         starts: torch.Tensor
-        global_starts: torch.Tensor
         max_seq_len: int
         seq_lens: torch.Tensor
         token_to_seq: torch.Tensor
@@ -1984,7 +1983,6 @@ def build_mla_chunked_context_metadata(
             max_query_len=max(query_lens),
             cu_seq_lens=cu_seq_lens[boundary_slice],
             starts=starts[request_slice],
-            global_starts=_flat_int32(plan.starts).to(device, non_blocking=True),
             max_seq_len=max(plan.seq_lens),
             seq_lens=seq_lens_cpu[request_slice],
             token_to_seq=token_to_seq[token_slice],
@@ -3061,6 +3059,9 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
         parallel_config = get_current_vllm_config().parallel_config
         # Avoid requiring an initialized DCP group in tests.
         self.dcp_world_size: int = parallel_config.decode_context_parallel_size
+        self.cp_kv_cache_interleave_size: int = (
+            parallel_config.cp_kv_cache_interleave_size
+        )
 
     @abstractmethod
     def forward_mqa(

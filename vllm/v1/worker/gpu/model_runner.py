@@ -571,9 +571,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 for layer_name in group.layer_names
             } - self.speculator.draft_attn_layer_names
         self.attn_groups, attn_cg_support, self.kernel_block_sizes = init_attn_backend(
-            self.kv_cache_config,
-            self.vllm_config,
-            self.device,
+            self.kv_cache_config, self.vllm_config, self.device
         )
         additional_attn_cg_support = self.model_state.get_additional_cg_support()
         attn_cg_support = attn_cg_support.narrow(*additional_attn_cg_support)
@@ -1968,12 +1966,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             routed_experts=routed_experts,
         )
 
-        skip_pcp_producer_draft = is_pcp_kv_producer
-
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None
         if (
             self.speculator is not None
-            and not skip_pcp_producer_draft
+            and not is_pcp_kv_producer
             and self.speculator.supports_mm_inputs
         ):
             # Get cached multimodal embeddings for draft forward.
@@ -1999,7 +1995,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_batch.query_start_loc,
         )
 
-        if self.speculator is not None and not skip_pcp_producer_draft:
+        if self.speculator is not None and not is_pcp_kv_producer:
             assert self.sampler is not None
             # Let the target override the hidden state fed to the drafter
             # (e.g. DeepSeek V4 MTP needs the pre-hc_head residual). The
@@ -2038,7 +2034,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     self.speculator.draft_token_confidence_probs, input_batch
                 )
 
-        if self.num_speculative_steps > 0 and not skip_pcp_producer_draft:
+        if self.num_speculative_steps > 0 and not is_pcp_kv_producer:
             # Spec-decode and diffusion LLMs both use draft tokens but the latter does
             # not have a speculator (i.e. self.speculator is None)
             self.draft_tokens_handler.set_draft_tokens(

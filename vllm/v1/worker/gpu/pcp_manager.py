@@ -849,8 +849,7 @@ class PCPManager:
         shard (the DCP top-k merge all-gathers per row), and attach the index
         maps the indexer op needs to gather queries and keep its own rows."""
         if (
-            self.dcp_world_size <= 1
-            or self.dcp_world_size != self.pcp_world_size
+            not self.dcp_spans_pcp
             or self._global_batch is None
             or self._padded_gather_idx is None
             or self._hidden_restore_idx is None
@@ -886,7 +885,7 @@ class PCPManager:
             global_batch.num_reqs_after_padding,
         )
         num_global_tokens = self._hidden_restore_idx.shape[0]
-        if dummy_run or self._global_batch_slot_mappings is None:
+        if self._global_batch_slot_mappings is None:
             slot_mappings = torch.full(
                 (self._block_tables.num_kv_cache_groups, num_global_tokens),
                 PAD_SLOT_ID,
