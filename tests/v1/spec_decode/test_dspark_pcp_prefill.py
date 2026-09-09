@@ -63,3 +63,44 @@ def test_precompute_pcp_context_kv_rejects_missing_layer_mapping():
             [torch.ones(1, 1), torch.ones(1, 1)],
             {"draft.0": torch.tensor([0])},
         )
+
+
+def test_precompute_pcp_context_kv_projects_restored_global_context():
+    """The projection is unsharded: ``combine_hidden_states`` runs on the
+    restored global context, not on this rank's shard (PR #54036 removed)."""
+    speculator, model = _make_speculator()
+    input_batch = SimpleNamespace(num_tokens=1, positions=torch.tensor([10]))
+    aux_hidden_states = [torch.tensor([[1.0]]), torch.tensor([[3.0]])]
+    local_slot_mappings = {"draft.0": torch.tensor([4])}
+
+    global_states = torch.tensor([[1.0, 3.0], [5.0, 7.0]])
+    global_positions = torch.tensor([10, 11])
+    global_slot_mappings = {
+        "draft.0": torch.tensor([4, 6]),
+        "draft.1": torch.tensor([8, 12]),
+    }
+
+    seen = []
+
+    def restore_context(states):
+        seen.append(states)
+        return global_states, global_positions, global_slot_mappings
+
+    speculator.precompute_pcp_context_kv(
+        input_batch,
+        aux_hidden_states,
+        local_slot_mappings,
+        restore_context=restore_context,
+    )
+
+    # The restore saw the raw (un-combined) auxiliary states...
+    assert len(seen) == 1
+    assert torch.equal(seen[0], torch.tensor([[1.0, 3.0]]))
+    # ...and the projection ran over the full restored global batch.
+    combine_arg = model.combine_hidden_states.call_args[0][0]
+    assert torch.equal(combine_arg, global_states)
+    args, _ = model.precompute_and_store_context_kv.call_args
+    assert torch.equal(args[0], global_states[:, :2] + 1)
+    assert torch.equal(args[1], global_positions)
+    assert torch.equal(args[2][0], torch.tensor([4, 6]))
+    assert torch.equal(args[2][1], torch.tensor([8, 12]))

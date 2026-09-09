@@ -142,6 +142,15 @@ class DSparkSpeculator(DFlashSpeculator):
         the global positions and this rank's slot mapping over that batch
         (``PAD_SLOT_ID`` for rows other ranks own), so a single cache write
         stores exactly the rows this rank is responsible for.
+
+        NOTE(no-54036): this branch deliberately drops the PR #54036 sharding
+        of the context projection. The raw auxiliary states are restored to
+        the global batch *before* ``combine_hidden_states`` runs, so every PCP
+        rank projects the whole global context instead of only its own token
+        shard. Numerically identical (``combine_hidden_states`` is per-token),
+        but it all-gathers the wider un-combined auxiliary states and repeats
+        the projection ``pcp_world_size`` times. Exists solely to measure what
+        PR #54036 buys.
         """
         if self._pcp_context_kv_precomputed:
             raise RuntimeError("DSpark PCP context KV was already precomputed")
@@ -150,13 +159,12 @@ class DSparkSpeculator(DFlashSpeculator):
 
         num_tokens = input_batch.num_tokens
         layer_names = self.model.get_draft_kv_cache_layer_names()
-        context_states = self.model.combine_hidden_states(
-            torch.cat(aux_hidden_states, dim=-1)
-        )
+        context_states = torch.cat(aux_hidden_states, dim=-1)
         positions = input_batch.positions
         if restore_context is not None:
             context_states, positions, slot_mappings = restore_context(context_states)
             num_tokens = positions.shape[0]
+        context_states = self.model.combine_hidden_states(context_states)
         missing = [name for name in layer_names if name not in slot_mappings]
         if missing:
             raise RuntimeError(
