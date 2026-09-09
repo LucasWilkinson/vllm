@@ -114,12 +114,6 @@ def test_replicated_verification_skips_pcp_restore(monkeypatch):
     manager._local_block_table_ptrs = torch.empty(1, dtype=torch.uint64)
     manager._global_batch_slot_mappings = torch.empty(1, 8, dtype=torch.int64)
     manager._gathered_kv_slot_mappings = torch.empty(1, 32, dtype=torch.int64)
-    monkeypatch.setattr(
-        PCPManager,
-        "direct_kv_enabled",
-        property(lambda _self: True),
-    )
-
     # Graph capture obtains this PCP buffer from get_dummy_slot_mappings().
     captured_slot_mappings = manager.get_dummy_slot_mappings(8)
     captured_ptr = captured_slot_mappings.data_ptr()
