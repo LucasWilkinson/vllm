@@ -688,23 +688,21 @@ def prepare_inputs_to_capture(
     )
     if pcp_manager is not None:
         input_batch = pcp_manager.prepare_inputs_to_capture(input_batch)
-        input_block_tables = pcp_manager.get_dummy_block_tables(num_reqs)
-        slot_mappings = pcp_manager.get_dummy_slot_mappings(num_tokens)
-    else:
-        input_block_tables = block_tables.get_dummy_block_tables(num_reqs)
-        slot_mappings = block_tables.get_dummy_slot_mappings(num_tokens)
-
+    elif block_tables.cp_size > 1:
         # HACK(woosuk): Special handling for DCP.
-        if block_tables.cp_size > 1:
-            prepare_dcp_local_seq_lens(
-                input_buffers.dcp_local_seq_lens,
-                input_batch.seq_lens,
-                num_reqs,
-                block_tables.cp_size,
-                block_tables.cp_rank,
-                block_tables.cp_interleave,
-            )
-            input_batch.dcp_local_seq_lens = input_buffers.dcp_local_seq_lens[:num_reqs]
+        prepare_dcp_local_seq_lens(
+            input_buffers.dcp_local_seq_lens,
+            input_batch.seq_lens,
+            num_reqs,
+            block_tables.cp_size,
+            block_tables.cp_rank,
+            block_tables.cp_interleave,
+        )
+        input_batch.dcp_local_seq_lens = input_buffers.dcp_local_seq_lens[:num_reqs]
+
+    block_table_provider = pcp_manager or block_tables
+    input_block_tables = block_table_provider.get_dummy_block_tables(num_reqs)
+    slot_mappings = block_table_provider.get_dummy_slot_mappings(num_tokens)
     slot_mappings_by_layer = build_slot_mappings_by_layer(
         slot_mappings, kv_cache_config
     )
