@@ -683,19 +683,14 @@ def prepare_inputs_to_capture(
     max_query_len: int | None = None,
     pcp_manager: "PCPManager | None" = None,
 ) -> AttentionState:
+    input_batch = InputBatch.make_dummy(
+        num_reqs, num_tokens, input_buffers, max_query_len=max_query_len
+    )
     if pcp_manager is not None:
-        input_batch, input_block_tables, slot_mappings = (
-            pcp_manager.prepare_inputs_to_capture(
-                num_reqs,
-                num_tokens,
-                max_query_len=max_query_len,
-            )
-        )
-        input_buffers = pcp_manager.input_buffers
+        input_batch = pcp_manager.prepare_inputs_to_capture(input_batch)
+        input_block_tables = pcp_manager.get_dummy_block_tables(num_reqs)
+        slot_mappings = pcp_manager.get_dummy_slot_mappings(num_tokens)
     else:
-        input_batch = InputBatch.make_dummy(
-            num_reqs, num_tokens, input_buffers, max_query_len=max_query_len
-        )
         input_block_tables = block_tables.get_dummy_block_tables(num_reqs)
         slot_mappings = block_tables.get_dummy_slot_mappings(num_tokens)
 
