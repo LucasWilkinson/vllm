@@ -576,19 +576,30 @@ class FakeNixlConnectorWorker(NixlConnectorWorker):
 
 
 class TestNixlHandshake:
-    @pytest.mark.parametrize("pcp_rank", [0, 1])
+    @pytest.mark.parametrize(
+        ("pcp_rank", "dcp_size", "expected_tracked"),
+        [
+            (0, 1, True),
+            (1, 1, False),
+            (0, 2, True),
+            (1, 2, True),
+        ],
+    )
     @patch(
         "vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker.NixlWrapper",
         FakeNixlWrapper,
     )
-    def test_pcp_producer_uses_canonical_replica(
-        self, default_vllm_config, dist_init, pcp_rank
+    def test_pcp_producer_exposes_dcp_shards_or_canonical_replica(
+        self, default_vllm_config, dist_init, pcp_rank, dcp_size, expected_tracked
     ):
-        """Only PCP rank zero publishes, but every rank reports completion."""
+        """Replicated PCP canonicalizes onto rank zero and every rank still
+        reports completion; PCP-DCP publishes every shard and each rank
+        reports only its own transfers."""
         from vllm.v1.attention.backends.flash_attn import FlashAttentionBackend
 
         vllm_config = create_vllm_config(kv_role="kv_producer")
         vllm_config.parallel_config.prefill_context_parallel_size = 2
+        vllm_config.parallel_config.decode_context_parallel_size = dcp_size
         with (
             patch(
                 "vllm.distributed.kv_transfer.kv_connector.v1.nixl."
@@ -610,13 +621,15 @@ class TestNixlHandshake:
         worker = connector.connector_worker
         assert worker is not None
         assert worker.pcp_rank == pcp_rank
+        assert worker.pcp_dcp_sharded is (dcp_size > 1)
+        assert worker.transfer_tp_rank == (pcp_rank if dcp_size > 1 else 0)
+        assert worker.transfer_tp_size == (2 if dcp_size > 1 else 1)
 
         req_id = "req"
         metadata = NixlConnectorMetadata()
         metadata.reqs_in_batch.add(req_id)
         metadata.reqs_to_send[req_id] = time.perf_counter() + 10
         worker.start_load_kv(metadata)
-        expected_tracked = pcp_rank == 0
         assert (req_id in worker._reqs_to_process) == expected_tracked
         assert (req_id in worker._reqs_to_send) == expected_tracked
 
@@ -627,10 +640,19 @@ class TestNixlHandshake:
             side_effect=lambda: {"sent"} if pcp_rank == 0 else set()
         )
 
-        expected_payload = payload if pcp_rank == 0 else None
+        expected_payload = payload if expected_tracked else None
         assert connector.get_handshake_metadata() is expected_payload
         done_sending, done_recving = connector.get_finished(set())
-        assert done_sending == ({"sent"} if pcp_rank == 0 else {req_id})
+        if pcp_rank == 0:
+            assert done_sending == {"sent"}
+        elif dcp_size > 1:
+            # Sharded: this rank really transfers, so it reports nothing until
+            # its own notifications land.
+            assert done_sending == set()
+        else:
+            # Replicated: this rank has nothing to send and self-reports so the
+            # scheduler-side aggregation over world_size (PP x TP x PCP) closes.
+            assert done_sending == {req_id}
         assert done_recving == set()
         if pcp_rank > 0:
             assert connector.get_finished(set()) == (set(), set())

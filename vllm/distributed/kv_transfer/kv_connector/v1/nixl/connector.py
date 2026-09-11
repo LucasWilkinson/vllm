@@ -107,10 +107,18 @@ class NixlBaseConnector(KVConnectorBase_V1, SupportsHMA):
                 "Consumers and kv_both require "
                 "prefill_context_parallel_size=1."
             )
-        if pcp_size > 1 and parallel_config.decode_context_parallel_size > 1:
+        dcp_size = parallel_config.decode_context_parallel_size
+        tp_size = parallel_config.tensor_parallel_size
+        if (
+            pcp_size > 1
+            and dcp_size > 1
+            and not (
+                kv_role == "kv_producer" and tp_size == 1 and dcp_size == pcp_size
+            )
+        ):
             raise NotImplementedError(
-                "NixlConnector PCP producers currently require "
-                "decode_context_parallel_size=1."
+                "NixlConnector PCP+DCP currently supports only kv_producer "
+                "with TP1 and DCP spanning the full PCP group."
             )
         # TODO: Support PCP with bidirectional KV transfer by tracking separate
         # send and receive completion counts.
@@ -156,6 +164,13 @@ class NixlBaseConnector(KVConnectorBase_V1, SupportsHMA):
     ############################################################
 
     def get_finished_count(self) -> int | None:
+        # None means "aggregate over parallel_config.world_size", which is
+        # PP x TP x PCP. Since #53903 every PCP rank reports done_sending -
+        # replicated ranks through _replicated_pcp_done_sending, DCP-sharded
+        # ranks because they really do transfer - so world_size is already the
+        # right expected count for both layouts. #54496 predates #53903 and
+        # overrode this with PP x TP for the replicated case, which now
+        # under-counts; dropped on rebase.
         return None
 
     def get_num_new_matched_tokens(
@@ -311,6 +326,7 @@ class NixlBaseConnector(KVConnectorBase_V1, SupportsHMA):
         if (
             self.kv_transfer_config.kv_role == "kv_producer"
             and self.connector_worker.pcp_rank > 0
+            and not self.connector_worker.pcp_dcp_sharded
         ):
             return None
         return self.connector_worker.xfer_handshake_metadata
