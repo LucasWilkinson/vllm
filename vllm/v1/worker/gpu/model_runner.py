@@ -291,6 +291,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.draft_tokens_handler = DraftTokensHandler(self.device)
 
         self.pcp_manager: pcp.PCPManager | None = None
+        self.pcp_hidden_state_restorer = pcp.maybe_create_pcp_hidden_state_restorer(
+            self.vllm_config, self.device, self.supports_mm_inputs
+        )
 
         # Pooling models.
         self.is_pooling_model = self.model_config.runner_type == "pooling"
@@ -660,6 +663,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.supports_mm_inputs,
             self.block_tables,
             cls=self.pcp_manager_cls,
+            hidden_state_restorer=self.pcp_hidden_state_restorer,
         )
         self.ubatch_runner = maybe_build_ubatch_runner(
             self.vllm_config,
@@ -1473,6 +1477,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         hidden_states: torch.Tensor,
         input_batch: InputBatch,
         grammar_output: GrammarOutput | None,
+        sample_hidden_states: torch.Tensor | None = None,
     ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor]:
         shard_metadata = None
         global_input_batch = input_batch
@@ -1490,7 +1495,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             logits = all_to_all_logits(local_logits, shard_metadata)
             logits = logits[:, : self.vocab_size]
         else:
-            sample_hidden_states = hidden_states[input_batch.logits_indices]
+            if sample_hidden_states is None:
+                sample_hidden_states = hidden_states[input_batch.logits_indices]
             logits = self.model.compute_logits(sample_hidden_states)
 
         if grammar_output is not None:
@@ -1976,8 +1982,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Last rank: sample tokens
         draft_hidden_states = hidden_states
         assert draft_hidden_states is not None
-        hidden_states, input_batch = pcp.maybe_restore_pcp_for_sampling(
-            self.pcp_manager, hidden_states, input_batch
+        hidden_states, sample_hidden_states, input_batch = (
+            pcp.maybe_restore_pcp_for_sampling(
+                self.pcp_manager,
+                hidden_states,
+                input_batch,
+                needs_prompt_hidden_states=(
+                    self.batch_sharder is not None
+                    or self.speculator is not None
+                    or self.prompt_logprobs_worker is None
+                    or self.prompt_logprobs_worker.needs_prompt_hidden_states(
+                        pcp.maybe_get_pcp_global_batch(self.pcp_manager, input_batch),
+                        self.req_states.prompt_len.np,
+                    )
+                ),
+            )
         )
         if self.pcp_manager is not None and aux_hidden_states is not None:
             aux_hidden_states = [
@@ -1986,7 +2005,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             ]
 
         sampler_output, num_sampled, num_rejected = self.sample(
-            hidden_states, input_batch, grammar_output
+            hidden_states, input_batch, grammar_output, sample_hidden_states
         )
 
         if self.pp_handler is not None:
@@ -2163,6 +2182,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def shutdown(self) -> None:
         """Release GPU tensors (model weights, KV caches, workspace) so that
         memory is reclaimable when running in the same process."""
+        if restorer := getattr(self, "pcp_hidden_state_restorer", None):
+            restorer.close()
+            self.pcp_hidden_state_restorer = None
         torch.accelerator.synchronize()
         self.cudagraph_manager = None
         self.fast_prefill = None
