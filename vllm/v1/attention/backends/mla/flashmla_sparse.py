@@ -651,6 +651,19 @@ class FlashMLASparseMetadataBuilder(
 class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
     can_return_lse_for_decode: bool = True
     supports_dcp: bool = True
+    # NIXL P/D with DCP > 1 forces cp_kv_cache_interleave_size to the block
+    # size (64), and cp_utils then refuses any speculative config unless the
+    # impl declares this. Upstream sets it nowhere, so MTP is unreachable in
+    # that topology. The claim, carried over from the frankenstein branch's
+    # ebe6cc2054: the mixed fp8 path processes all scheduled query tokens
+    # together, and its slot mapping and sparse-index conversion both honour
+    # the CP interleave (see the cp_kv_cache_interleave_size arguments threaded
+    # into the conversion calls below).
+    #
+    # UNVERIFIED against #56157's rewritten prefill path. Booting only proves
+    # the assertion is gone; judge this by MTP acceptance rate and output
+    # sanity, not by startup.
+    supports_mtp_with_cp_non_trivial_interleave_size: bool = True
 
     @staticmethod
     def _compute_fp8_decode_padded_heads(num_heads: int) -> int:
