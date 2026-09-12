@@ -40,10 +40,22 @@ class DFlashSpeculator(DraftModelSpeculator):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         parallel_config = vllm_config.parallel_config
         if parallel_config.prefill_context_parallel_size > 1:
+            pcp = parallel_config.prefill_context_parallel_size
+            dcp = parallel_config.decode_context_parallel_size
             vllm_config = copy.copy(vllm_config)
+            # DCP must collapse with PCP, not just alongside it. ParallelConfig
+            # admits dcp in (1, pcp, tp * pcp) while PCP is on, but falls back
+            # to requiring tp % dcp == 0 once pcp == 1. Dropping the PCP axis
+            # while keeping dcp therefore makes the draft config invalid:
+            # tp=1, pcp=8, dcp=8 is legal for the target and raises
+            # "tp_size=1 must be divisible by dcp_size=8" for the draft.
+            # Removing the PCP axis removes a factor of pcp from the KV
+            # sharding, so the draft keeps dcp // pcp: 1 when DCP spanned the
+            # PCP axis, tp when it spanned TP x PCP.
             vllm_config.parallel_config = replace(
                 parallel_config,
                 prefill_context_parallel_size=1,
+                decode_context_parallel_size=max(1, dcp // pcp),
             )
         super().__init__(vllm_config, device)
 
