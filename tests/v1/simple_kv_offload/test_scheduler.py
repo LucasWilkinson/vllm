@@ -1960,6 +1960,7 @@ def test_cp_block_size_scaling(dcp_world_size: int, pcp_world_size: int) -> None
 @pytest.mark.parametrize(
     "dcp_world_size, pcp_world_size",
     [
+        (4, 4),
         (2, 1),
         (1, 2),
     ],
@@ -2036,6 +2037,7 @@ def test_cp_eager_store_and_load_roundtrip(
 @pytest.mark.parametrize(
     "dcp_world_size, pcp_world_size",
     [
+        (4, 4),
         (2, 1),
         (1, 2),
         (2, 2),

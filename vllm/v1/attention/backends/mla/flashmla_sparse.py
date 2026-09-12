@@ -31,6 +31,7 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.attention.backends.mla.sparse_utils import (
     flat_kv_row_view,
+    max_dcp_shard_rows,
     request_row_bounds,
     triton_convert_req_index_to_global_index,
     triton_filter_and_convert_dcp_index,
@@ -177,7 +178,10 @@ class FlashMLASparseBackend(AttentionBackend):
 
 
 def gathered_prefill_shards(
-    row_req_idx: np.ndarray, row_seq_lens: np.ndarray, dcp_world_size: int
+    row_req_idx: np.ndarray,
+    row_seq_lens: np.ndarray,
+    dcp_world_size: int,
+    interleave: int = 1,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Under PCP+DCP, group this rank's prefill rows by request and size each
     request's slice of this rank's KV shard.
@@ -187,14 +191,14 @@ def gathered_prefill_shards(
     whole request's extent on every row, identical on every PCP rank, so the
     all-gather is shaped the same everywhere.
 
-    Returns the request row bounds and, per request, ``ceil(extent / W)``.
+    Returns request row bounds and the largest local shard size per request.
     """
     row_bounds = request_row_bounds(row_req_idx)
     extents = row_seq_lens[row_bounds[:-1]].astype(np.int64)
     assert np.all(extents > 0), (
         f"PCP+DCP prefill got an empty context: {extents.tolist()}"
     )
-    return row_bounds, (extents + dcp_world_size - 1) // dcp_world_size
+    return row_bounds, max_dcp_shard_rows(extents, dcp_world_size, interleave)
 
 
 @dataclass
@@ -522,6 +526,7 @@ class FlashMLASparseMetadataBuilder(
                     row_req_idx[num_decodes:],
                     prefill_seq_lens_cpu.numpy(),
                     self.dcp_world_size,
+                    self.vllm_config.parallel_config.cp_kv_cache_interleave_size,
                 )
                 workspace_rows = torch.from_numpy(rows_per_rank.astype(np.int32))
                 max_prefill_buffer_size //= self.dcp_world_size

@@ -12,6 +12,7 @@ from cutlass import Float32, Int32, Uint32, Uint64
 from quack.compile_utils import make_fake_tensor
 
 from vllm.cute_utils import recast_val
+from vllm.model_executor.kernels.attention.dsa.topk import canonicalize_topk
 from vllm.model_executor.warmup.jit_warmup_cutedsl_helper import (
     CuTeDSLLaunchSpec,
     VllmCuTeDSLJitKernel,
@@ -38,6 +39,9 @@ def stable_topk_from_gathered_candidates_cutedsl(
             device=gathered.device,
         )
     _STABLE_TOPK_FROM_GATHERED_CANDIDATES_KERNEL(gathered, out, topk=topk)
+    # Atomic appends select a stable set but race on its order. Canonicalize it
+    # so attention reductions agree across ranks and repeated executions.
+    canonicalize_topk(out)
     return out
 
 

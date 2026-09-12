@@ -40,6 +40,14 @@ def request_row_bounds(req_idx: np.ndarray) -> np.ndarray:
     return bounds
 
 
+def max_dcp_shard_rows(
+    extents: np.ndarray, world_size: int, interleave: int
+) -> np.ndarray:
+    """Size every gathered shard for rank zero, which owns the longest tail."""
+    rounds, tail = np.divmod(extents, world_size * interleave)
+    return rounds * interleave + np.minimum(tail, interleave)
+
+
 def flat_kv_row_view(
     kv_cache: torch.Tensor,  # [num_blocks, block_size, head_dim]
     block_size: int,

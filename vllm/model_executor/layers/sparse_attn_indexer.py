@@ -20,6 +20,10 @@ from vllm.model_executor.kernels.attention.dsa.candidate_blocks import (
 from vllm.model_executor.kernels.attention.dsa.candidate_blocks import (
     select_candidate_blocks as _select_candidate_blocks,
 )
+from vllm.model_executor.kernels.attention.dsa.topk import (
+    _CANONICALIZE_TOPK_KERNEL,
+    canonicalize_topk,
+)
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     get_fp8_min_max,
 )
@@ -623,7 +627,7 @@ def sparse_attn_indexer(
                     topk_tokens,
                 )
 
-            if deinterleave_idx is None:
+            if deinterleave_idx is None and dcp_world_size > 1:
                 # Under the PCP path the top-k already ran over the whole
                 # context.
                 _merge_dcp_topk_global(
@@ -635,6 +639,9 @@ def sparse_attn_indexer(
                     cp_kv_cache_interleave_size,
                     row_starts=chunk.cu_seqlen_ks,
                 )
+            elif current_platform.is_cuda() and topk_tokens in (512, 1024, 2048):
+                # Global prefill bypasses the DCP merge's ordering.
+                canonicalize_topk(topk_indices)
 
     if has_decode:
         decode_metadata = attn_metadata_narrowed.decode
@@ -812,6 +819,9 @@ def sparse_attn_indexer(
                 cp_kv_cache_interleave_size,
             )
 
+        elif current_platform.is_cuda() and topk_tokens in (512, 1024, 2048):
+            canonicalize_topk(topk_indices)
+
         if decode_metadata.requires_padding:
             # if padded, we need to unpack
             # the topk indices removing padded tokens
@@ -941,6 +951,9 @@ class SparseAttnIndexer(CustomOp):
                 pad_value=0 if use_fp4_cache else -float("inf"),
             )
             _UNPACK_SEQ_TRITON_KERNEL.register_warmup()
+
+            if current_platform.is_cuda():
+                _CANONICALIZE_TOPK_KERNEL.register_warmup()
 
             if self.dcp_world_size > 1 and current_platform.is_cuda() and has_cutedsl():
                 from vllm.model_executor.kernels.attention.dsa.dcp_indexer_cutedsl import (  # noqa: E501

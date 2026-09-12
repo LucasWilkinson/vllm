@@ -34,7 +34,10 @@ from vllm.v1.attention.backend import (
     MultipleOf,
 )
 from vllm.v1.attention.backends.mla.compressor_utils import get_compressed_slot_mapping
-from vllm.v1.attention.backends.mla.sparse_utils import request_row_bounds
+from vllm.v1.attention.backends.mla.sparse_utils import (
+    max_dcp_shard_rows,
+    request_row_bounds,
+)
 from vllm.v1.attention.backends.utils import (
     get_dcp_local_seq_lens,
     split_decodes_and_prefills,
@@ -270,7 +273,7 @@ class PCPGlobalChunkPlan:
     # [num_reqs+1] like row_start_cu, but only a region's FIRST row carries its
     # extent.
     global_cu: torch.Tensor
-    # [num_reqs+1] cumsum of ceil(scheduled_i / W): this rank's padded layout.
+    # [num_reqs+1] cumsum of the largest per-request shard: the padded layout.
     padded_local_cu: torch.Tensor
     padded_local_total: int
     total: int
@@ -283,6 +286,7 @@ def build_pcp_global_chunk_plan(
     scheduled_lens: np.ndarray,
     dcp_world_size: int,
     device: torch.device,
+    interleave: int = 1,
 ) -> PCPGlobalChunkPlan:
     """Plan the PCP packing for one chunk from its scheduled contexts."""
     scheduled = np.ascontiguousarray(scheduled_lens, dtype=np.int64)
@@ -297,7 +301,7 @@ def build_pcp_global_chunk_plan(
     assert np.all(region_extent > 0), (
         f"PCP+DCP prefill got an empty scheduled context: {region_extent.tolist()}"
     )
-    region_padded = (region_extent + dcp_world_size - 1) // dcp_world_size
+    region_padded = max_dcp_shard_rows(region_extent, dcp_world_size, interleave)
     region_start = np.zeros(len(region_first_row) + 1, dtype=np.int64)
     np.cumsum(region_extent, out=region_start[1:])
     region_padded_cu = np.zeros(len(region_first_row) + 1, dtype=np.int64)
@@ -320,9 +324,10 @@ def build_pcp_global_chunk_plan(
         g = int(region_extent[i])
         t = np.arange(g, dtype=np.int64)
         idx[region_start[i] : region_start[i] + g] = (
-            (t % dcp_world_size) * padded_total
+            ((t // interleave) % dcp_world_size) * padded_total
             + region_padded_cu[i]
-            + t // dcp_world_size
+            + (t // (dcp_world_size * interleave)) * interleave
+            + t % interleave
         )
 
     return PCPGlobalChunkPlan(
@@ -757,15 +762,6 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         self.pcp_world_size = parallel_config.prefill_context_parallel_size
         self.use_pcp = self.pcp_world_size > 1
         self.cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size
-        # The DCP sparse-indexer code is parameterized by interleave size, but
-        # interleave > 1 is not yet validated end-to-end (gsm8k parity fails),
-        # so fail closed here rather than silently produce wrong output.
-        if self.dcp_world_size > 1 and self.cp_kv_cache_interleave_size > 1:
-            raise NotImplementedError(
-                "DCP sparse indexer currently supports only "
-                f"cp_kv_cache_interleave_size=1 (got "
-                f"{self.cp_kv_cache_interleave_size})."
-            )
         # NOTE(Chen):an estimated max size of flattened_kv. Need to double check.
         self.max_prefill_buffer_size = get_max_prefill_buffer_size(self.vllm_config)
         self.num_speculative_tokens = (
@@ -1077,7 +1073,14 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         first_rows = row_bounds[:-1]
         world = self.dcp_world_size
         # Each request's context, rounded up to whole DCP shards.
-        seq_lens = -(-row_seq_lens_cpu.numpy()[first_rows] // world) * world
+        seq_lens = (
+            max_dcp_shard_rows(
+                row_seq_lens_cpu.numpy()[first_rows],
+                world,
+                self.cp_kv_cache_interleave_size,
+            )
+            * world
+        )
         # Rank 0 holds the short tail chunk as a request's LAST row; the first
         # row is always a full chunk, so this query length matches on every rank.
         row_query_lens = row_query_lens_cpu.numpy()
@@ -1273,6 +1276,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                         seq_lens_cpu[req_slice].numpy(),
                         self.dcp_world_size,
                         self.device,
+                        self.cp_kv_cache_interleave_size,
                     )
                 metadata = build_prefill_chunk_metadata(
                     req_slice.start,

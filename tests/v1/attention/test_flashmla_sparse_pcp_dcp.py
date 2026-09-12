@@ -29,7 +29,11 @@ def _remapped_row(
 
 
 def _simulate_gathered_kv(
-    extents: list[int], world: int, starts: np.ndarray, rows_per_rank: int
+    extents: list[int],
+    world: int,
+    starts: np.ndarray,
+    rows_per_rank: int,
+    interleave: int = 1,
 ) -> np.ndarray:
     """Build what all_gather(shard, dim=0) holds, value-tagged by global token."""
     PAD = -1
@@ -37,7 +41,7 @@ def _simulate_gathered_kv(
     for rank in range(world):
         for region, extent in enumerate(extents):
             for position in range(extent):
-                owner, local = _shard_of_position(position, world)
+                owner, local = _shard_of_position(position, world, interleave)
                 if owner != rank:
                     continue
                 row = rank * rows_per_rank + int(starts[region]) + local
@@ -46,6 +50,7 @@ def _simulate_gathered_kv(
     return gathered
 
 
+@pytest.mark.parametrize("interleave", [1, 2, 64])
 @pytest.mark.parametrize("world", [2, 4, 8])
 @pytest.mark.parametrize(
     "extents",
@@ -61,35 +66,38 @@ def _simulate_gathered_kv(
         [2730, 256, 63],
     ],
 )
-def test_gathered_workspace_round_trips_every_token(world, extents):
+def test_gathered_workspace_round_trips_every_token(world, extents, interleave):
     """Every global token must be readable back from the gathered buffer."""
     _, rows_per_rank = gathered_prefill_shards(
-        np.arange(len(extents)), np.array(extents, dtype=np.int64), world
+        np.arange(len(extents)), np.array(extents, dtype=np.int64), world, interleave
     )
     # The builder lays entries out back to back, as on the non-DCP path.
     starts = np.concatenate([[0], np.cumsum(rows_per_rank[:-1])])
     shard_rows = int(rows_per_rank.sum())
 
-    gathered = _simulate_gathered_kv(extents, world, starts, shard_rows)
+    gathered = _simulate_gathered_kv(extents, world, starts, shard_rows, interleave)
 
     for region, extent in enumerate(extents):
         for position in range(extent):
-            row = _remapped_row(position, int(starts[region]), shard_rows, world)
+            row = _remapped_row(
+                position, int(starts[region]), shard_rows, world, interleave
+            )
             assert gathered[row] == region * 10**6 + position, (
                 f"region {region} token {position} at world={world} resolved to "
                 f"row {row}, which holds {gathered[row]}"
             )
 
 
+@pytest.mark.parametrize("interleave", [1, 2, 64])
 @pytest.mark.parametrize("world", [2, 3, 8])
 @pytest.mark.parametrize("extent", [1, 63, 64, 65, 127, 128, 129, 1000])
-def test_rows_per_rank_is_the_per_rank_maximum(world, extent):
-    """ceil(extent / W) has to cover the busiest rank, and waste at most a row."""
+def test_rows_per_rank_is_the_per_rank_maximum(world, extent, interleave):
+    """The workspace must cover every local row on the busiest DCP rank."""
     _, rows_per_rank = gathered_prefill_shards(
-        np.arange(1), np.array([extent], dtype=np.int64), world
+        np.arange(1), np.array([extent], dtype=np.int64), world, interleave
     )
     highest_local_slot = max(
-        _shard_of_position(position, world)[1] for position in range(extent)
+        _shard_of_position(position, world, interleave)[1] for position in range(extent)
     )
     assert int(rows_per_rank[0]) == highest_local_slot + 1
 

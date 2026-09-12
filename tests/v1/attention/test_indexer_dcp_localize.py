@@ -54,9 +54,7 @@ def _ref_stable_topk_from_candidates_fp64(
     candidate_token_ids: torch.Tensor,
     k: int,
 ) -> torch.Tensor:
-    """Pure-PyTorch reference for the CuteDSL stable-topk selector order
-    (score desc, then lowest global token id). Selects the same SET as the
-    kernel; only the set is compared in tests."""
+    """Reference selection by descending score, then lowest global token ID."""
     num_rows, num_candidates = candidate_scores.shape
     device = candidate_scores.device
     select_k = min(k, num_candidates)
@@ -563,8 +561,62 @@ def test_cutedsl_dcp_candidate_pack_and_select_matches_reference(
         topk,
     )
 
-    for row in range(rows):
-        assert set(actual[row].cpu().tolist()) == set(expected[row].cpu().tolist())
+    # Attention reductions must see the same order, not just the same set.
+    torch.testing.assert_close(actual, expected.sort(dim=-1).values)
+    reordered = stable_topk_from_gathered_candidates_cutedsl(
+        gathered.flip(1).contiguous(), topk
+    )
+    torch.testing.assert_close(reordered, actual)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda() or not has_cutedsl(),
+    reason="This test requires CUDA and CuteDSL",
+)
+@pytest.mark.parametrize("topk", [512, 1024, 2048])
+@pytest.mark.parametrize("decode", [False, True])
+def test_topk_order_preserves_selection_and_padding(topk, decode):
+    from vllm import _custom_ops as ops
+    from vllm.model_executor.kernels.attention.dsa.topk import (
+        canonicalize_topk,
+    )
+
+    device = torch.device("cuda")
+    width = 2 * topk + 64
+    torch.manual_seed(14)
+    logits = torch.stack([torch.randperm(width, device=device) for _ in range(3)])
+    logits = logits.to(torch.float32)
+    if decode and not current_platform.has_device_capability(90):
+        pytest.skip("cooperative_topk requires SM90+")
+    starts = [0, 0, 0] if decode else [0, 17, 31]
+    ends = [7, topk + 19, 2 * topk + 31]
+    row_starts = torch.tensor(starts, device=device, dtype=torch.int32)
+    row_ends = torch.tensor(ends, device=device, dtype=torch.int32)
+    actual = torch.empty((3, topk), device=device, dtype=torch.int32)
+    expected = torch.full_like(actual, -1)
+    for row, (start, end) in enumerate(zip(starts, ends)):
+        selected = logits[row, start:end].topk(min(topk, end - start)).indices
+        expected[row, : selected.numel()] = selected.sort().values
+
+    workspace = torch.empty(1024 * 1024, dtype=torch.uint8, device=device)
+    for _ in range(2):
+        if decode:
+            torch.ops._C.cooperative_topk(
+                logits, row_ends[:, None], actual, workspace, topk, width
+            )
+        else:
+            ops.top_k_per_row_prefill(
+                logits,
+                row_starts,
+                row_ends,
+                actual,
+                3,
+                logits.stride(0),
+                logits.stride(1),
+                topk,
+            )
+        canonicalize_topk(actual)
+        torch.testing.assert_close(actual, expected)
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
@@ -938,14 +990,13 @@ def test_sparse_decode_dcp_short_context_matches_non_dcp():
     merged_global_topks = _merge_local_topks_global_with_fake_dcp(
         local_logits, local_topks, topk, world, interleave
     )
-    # The radix top-K kernel selects a deterministic SET but writes it in
-    # nondeterministic (atomicAdd) order; the production path is permutation-
-    # invariant (compaction + softmax), so all ranks must agree on the set, not
-    # the array order. (The fp64 fallback happens to return sorted order.)
+    # Padding follows the canonical token order on every rank.
     ref_topk = merged_global_topks[0]
+    positions = torch.arange(topk, device=device, dtype=torch.int32)[None, :]
+    expected_topk = torch.where(positions < seq_lens, positions, -1)
+    torch.testing.assert_close(ref_topk, expected_topk)
     for rank_topk in merged_global_topks[1:]:
-        for row in range(rank_topk.shape[0]):
-            assert set(rank_topk[row].tolist()) == set(ref_topk[row].tolist())
+        torch.testing.assert_close(rank_topk, ref_topk)
 
     local_outs = []
     local_lses = []
@@ -965,16 +1016,25 @@ def test_sparse_decode_dcp_short_context_matches_non_dcp():
     torch.testing.assert_close(dcp_lse, ref_lse, atol=1e-5, rtol=1e-5)
 
 
+@pytest.mark.parametrize("interleave", [1, 2, 64])
 @pytest.mark.parametrize("dcp_world_size", [2, 4, 8])
 @pytest.mark.parametrize("req_lens", [[7], [8, 8], [1, 9], [256, 1, 2730], [5, 0, 6]])
-def test_pcp_plan_deinterleave_restores_global_order(dcp_world_size, req_lens):
+def test_pcp_plan_deinterleave_restores_global_order(
+    dcp_world_size, req_lens, interleave
+):
     """The index gather must undo DCP sharding per request"""
     from vllm.v1.attention.backends.mla.indexer import build_pcp_global_chunk_plan
 
     scheduled = np.array(req_lens, dtype=np.int64)
     rows = np.arange(len(scheduled))
+    if 0 in req_lens:
+        with pytest.raises(AssertionError, match="empty scheduled context"):
+            build_pcp_global_chunk_plan(
+                rows, scheduled, dcp_world_size, torch.device("cpu"), interleave
+            )
+        return
     plan = build_pcp_global_chunk_plan(
-        rows, scheduled, dcp_world_size, torch.device("cpu")
+        rows, scheduled, dcp_world_size, torch.device("cpu"), interleave
     )
 
     starts = np.concatenate([[0], np.cumsum(scheduled)])
@@ -985,8 +1045,13 @@ def test_pcp_plan_deinterleave_restores_global_order(dcp_world_size, req_lens):
     shards = torch.zeros(dcp_world_size, plan.padded_local_total, 1)
     for r in range(dcp_world_size):
         for i, g in enumerate(req_lens):
-            for t in range(r, g, dcp_world_size):
-                shards[r, padded_cu[i] + t // dcp_world_size, 0] = starts[i] + t
+            for t in range(g):
+                if (t // interleave) % dcp_world_size != r:
+                    continue
+                local = (
+                    t // (dcp_world_size * interleave)
+                ) * interleave + t % interleave
+                shards[r, padded_cu[i] + local, 0] = starts[i] + t
 
     gathered = shards.reshape(dcp_world_size * plan.padded_local_total, 1)
     torch.testing.assert_close(gathered[plan.deinterleave_idx], expected)
