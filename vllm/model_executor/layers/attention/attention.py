@@ -270,6 +270,12 @@ class Attention(nn.Module, AttentionLayerBase):
             sliding_window = None
 
         vllm_config = get_current_vllm_config()
+        # A replicated speculative draft is built under a config with no DCP
+        # while the target (and the process group) run DCP > 1; its KV is a
+        # full copy per rank, not a shard.
+        self._dcp_sharded = (
+            vllm_config.parallel_config.decode_context_parallel_size > 1
+        )
         if cache_config is not None:
             kv_cache_dtype = cache_config.cache_dtype
         else:
@@ -667,6 +673,7 @@ class Attention(nn.Module, AttentionLayerBase):
                 head_size_v=self.head_size_v,
                 dtype=self.kv_cache_torch_dtype,
                 kv_quant_mode=quant_mode,
+                dcp_sharded=self._dcp_sharded,
             )
 
 

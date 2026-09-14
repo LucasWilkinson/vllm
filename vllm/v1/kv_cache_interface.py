@@ -482,6 +482,11 @@ class AttentionSpec(KVCacheSpec):
     dtype: torch.dtype
     head_size_v: int = None  # type: ignore[assignment]
     kv_quant_mode: KVQuantMode = KVQuantMode.NONE
+    dcp_sharded: bool = True
+    """Whether this layer's KV is sharded across the DCP group. A layer built
+    under a config with decode_context_parallel_size == 1 - a replicated
+    speculative draft - keeps a full copy per rank even when the process runs
+    DCP > 1, and must not have its block geometry scaled by the DCP size."""
     page_size_padded: int | None = None
     num_head_slots: int | None = None
     """H of the logical ``[B, H, N, C]`` page when packing diverges from one

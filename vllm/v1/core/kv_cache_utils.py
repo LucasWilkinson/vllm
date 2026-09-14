@@ -669,7 +669,8 @@ def resolve_dcp_kv_block_size(spec: KVCacheSpec, dcp_world_size: int) -> int:
     """Return the token span of a cache block under DCP."""
     layer_specs = iter_layer_specs(spec)
     if len(layer_specs) > 0 and all(
-        isinstance(layer_spec, AttentionSpec) for layer_spec in layer_specs
+        isinstance(layer_spec, AttentionSpec) and layer_spec.dcp_sharded
+        for layer_spec in layer_specs
     ):
         return spec.block_size * dcp_world_size
     return spec.block_size
@@ -709,7 +710,7 @@ def dcp_world_size_for_kv_cache_spec(spec: KVCacheSpec, dcp_world_size: int) -> 
     inner = spec
     if isinstance(spec, UniformTypeKVCacheSpecs):
         inner = next(iter(spec.kv_cache_specs.values()))
-    if isinstance(inner, FullAttentionSpec):
+    if isinstance(inner, FullAttentionSpec) and inner.dcp_sharded:
         return dcp_world_size
     return 1
 

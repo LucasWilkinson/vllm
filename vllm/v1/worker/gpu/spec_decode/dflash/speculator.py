@@ -6,7 +6,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-from vllm.config import VllmConfig, replace
+from vllm.config import ParallelConfig, VllmConfig, replace
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
@@ -32,6 +32,29 @@ from vllm.v1.worker.utils import AttentionGroup
 logger = init_logger(__name__)
 
 
+def draft_parallel_config(parallel_config: ParallelConfig) -> ParallelConfig:
+    """Derive the draft's ParallelConfig from the target's.
+
+    The draft does not run PCP, so the PCP axis is collapsed. DCP has to
+    collapse with it: ParallelConfig admits ``dcp in (1, pcp, tp * pcp)`` while
+    PCP is on but requires ``tp % dcp == 0`` once ``pcp == 1``, so a target at
+    tp=1/pcp=8/dcp=8 is valid and the draft is rejected with "tp_size=1 must
+    be divisible by dcp_size=8" if only ``pcp`` is reset. Removing the PCP axis
+    removes a factor of ``pcp`` from the KV sharding, so the draft keeps
+    ``dcp // pcp``: 1 where DCP spanned the PCP axis, ``tp`` where it spanned
+    TP x PCP.
+    """
+    pcp = parallel_config.prefill_context_parallel_size
+    if pcp <= 1:
+        return parallel_config
+    dcp = parallel_config.decode_context_parallel_size
+    return replace(
+        parallel_config,
+        prefill_context_parallel_size=1,
+        decode_context_parallel_size=max(1, dcp // pcp),
+    )
+
+
 class DFlashSpeculator(DraftModelSpeculator):
     _speculator_name = "DFlash"  # For logging, so we can share methods with subclasses
 
@@ -39,10 +62,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         parallel_config = vllm_config.parallel_config
         if parallel_config.prefill_context_parallel_size > 1:
             vllm_config = copy.copy(vllm_config)
-            vllm_config.parallel_config = replace(
-                parallel_config,
-                prefill_context_parallel_size=1,
-            )
+            vllm_config.parallel_config = draft_parallel_config(parallel_config)
         super().__init__(vllm_config, device)
 
         self.hidden_states = torch.zeros(

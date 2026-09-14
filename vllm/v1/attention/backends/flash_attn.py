@@ -680,6 +680,11 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             # DCP might not be initialized in testing
             self.dcp_world_size = 1
             self.dcp_rank = 0
+        # Same rule as AttentionImpl: a replicated draft's builder is given a
+        # config with no DCP and must not build DCP-partitioned metadata.
+        if vllm_config.parallel_config.decode_context_parallel_size <= 1:
+            self.dcp_world_size = 1
+            self.dcp_rank = 0
 
         # Fused draft decode reuses the captured metadata object across draft
         # steps. For DCP, build-time host-side decisions such as

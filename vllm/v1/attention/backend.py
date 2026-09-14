@@ -15,6 +15,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kFp8StaticTensorSym,
     kNvfp4Dynamic,
 )
+from vllm.config import get_current_vllm_config_or_none
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -840,6 +841,13 @@ class AttentionImplBase(ABC, Generic[T]):
             self.dcp_rank = get_dcp_group().rank_in_group
         except AssertionError:
             # DCP might not be initialized in testing
+            self.dcp_world_size = 1
+            self.dcp_rank = 0
+        # A replicated speculative draft is built under a config with no DCP
+        # while the process group has DCP > 1. Its KV is a full copy per rank,
+        # so it must not take the DCP forward path.
+        cfg = get_current_vllm_config_or_none()
+        if cfg is not None and cfg.parallel_config.decode_context_parallel_size <= 1:
             self.dcp_world_size = 1
             self.dcp_rank = 0
         try:
