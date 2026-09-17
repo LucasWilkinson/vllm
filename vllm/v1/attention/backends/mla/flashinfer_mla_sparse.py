@@ -494,75 +494,6 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
                 q = torch.cat(q, dim=-1)
 
         self._prepare_mqa_kernel(layer, q.device)
-        return self._run_mqa_kernel(q, kv_cache, topk_indices, valid_counts)
-
-    def _prepare_mqa_kernel(
-        self,
-        layer: AttentionLayer,
-        device: torch.device,
-    ) -> None:
-        if self._workspace_buffer is None:
-            self._workspace_buffer = _get_workspace_buffer(device)
-
-        if self.bmm1_scale is None:
-            self.bmm1_scale = self.scale
-            if is_quantized_kv_cache(self.kv_cache_dtype):
-                self.bmm1_scale *= layer._q_scale_float * layer._k_scale_float
-        if self.bmm2_scale is None:
-            self.bmm2_scale = 1.0
-            if is_quantized_kv_cache(self.kv_cache_dtype):
-                self.bmm2_scale *= layer._k_scale_float
-
-    def autotune_hisparse_decode(self, layer: AttentionLayer) -> None:
-        """Autotune the largest legal HiSparse decode batch."""
-        assert isinstance(self.index_group, HiSparseMLAIndexGroup)
-        cache = self.index_group.cache(self.index_group_index)
-        assert self.topk_indices_buffer is not None
-
-        runtime = cache.runtime
-        kv_cache = runtime.hot.attention_cache
-        num_tokens = runtime.max_num_reqs
-        topk_tokens = self.topk_indices_buffer.shape[1]
-        self._prepare_mqa_kernel(layer, kv_cache.device)
-
-        q_dtype = (
-            current_platform.fp8_dtype()
-            if is_quantized_kv_cache(self.kv_cache_dtype)
-            else kv_cache.dtype
-        )
-        q = torch.zeros(
-            (
-                num_tokens,
-                self.num_heads,
-                self.kv_lora_rank + self.qk_rope_head_dim,
-            ),
-            dtype=q_dtype,
-            device=kv_cache.device,
-        )
-        topk_indices = (
-            torch.arange(
-                topk_tokens,
-                dtype=torch.int32,
-                device=kv_cache.device,
-            )
-            .expand(num_tokens, -1)
-            .contiguous()
-        )
-        seq_lens = torch.full(
-            (num_tokens,),
-            topk_tokens,
-            dtype=torch.int32,
-            device=kv_cache.device,
-        )
-        self._run_mqa_kernel(q, kv_cache, topk_indices, seq_lens)
-
-    def _run_mqa_kernel(
-        self,
-        q: torch.Tensor,
-        kv_cache: torch.Tensor,
-        topk_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         assert self._workspace_buffer is not None
         assert self.bmm1_scale is not None
         assert self.bmm2_scale is not None
@@ -578,7 +509,7 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
         # deferred until MTP is validated end-to-end for this backend.
         query = q.unsqueeze(1)
         block_tables = topk_indices.unsqueeze(1)
-        seq_lens_arg = seq_lens
+        seq_lens_arg = valid_counts
 
         # page_table width = topk buffer width, which kpool widens past
         # index_topk (topk_tokens) and rounds up to a multiple of 128. The
@@ -599,9 +530,9 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
             # the launch. ``triton_convert_req_index_to_global_index`` packs the
             # valid indices into a contiguous prefix, which is what the kernel
             # requires of the page table.
-            empty_rows = seq_lens == 0
+            empty_rows = valid_counts == 0
             topk_indices[:, 0] = topk_indices[:, 0].masked_fill(empty_rows, 0)
-            extra_kwargs["sparse_mla_top_k_lens"] = seq_lens.clamp(min=1)
+            extra_kwargs["sparse_mla_top_k_lens"] = valid_counts.clamp(min=1)
 
         kernel_out = trtllm_batch_decode_with_kv_cache_mla(
             query=query,
@@ -637,6 +568,73 @@ class FlashInferMLASparseImpl(SparseMLACommonImpl[FlashInferMLASparseMetadata]):
             if lse is not None:
                 lse.masked_fill_(empty_rows.view(-1, 1), float("-inf"))
         return out, lse
+
+    def _prepare_mqa_kernel(
+        self,
+        layer: AttentionLayer,
+        device: torch.device,
+    ) -> None:
+        if self._workspace_buffer is None:
+            self._workspace_buffer = _get_workspace_buffer(device)
+
+        if self.bmm1_scale is None:
+            self.bmm1_scale = self.scale
+            if is_quantized_kv_cache(self.kv_cache_dtype):
+                self.bmm1_scale *= layer._q_scale_float * layer._k_scale_float
+        if self.bmm2_scale is None:
+            self.bmm2_scale = 1.0
+            if is_quantized_kv_cache(self.kv_cache_dtype):
+                self.bmm2_scale *= layer._k_scale_float
+
+    def autotune_hisparse_decode(self, layer: AttentionLayer) -> None:
+        """Autotune the largest legal HiSparse decode batch."""
+        assert isinstance(self.index_group, HiSparseMLAIndexGroup)
+        cache = self.index_group.cache(self.index_group_index)
+        assert self.topk_indices_buffer is not None
+
+        runtime = cache.runtime
+        kv_cache = runtime.hot.attention_cache
+        num_tokens = runtime.max_num_reqs
+        topk_tokens = self.topk_indices_buffer.shape[1]
+
+        q_dtype = (
+            current_platform.fp8_dtype()
+            if is_quantized_kv_cache(self.kv_cache_dtype)
+            else kv_cache.dtype
+        )
+        q = torch.zeros(
+            (
+                num_tokens,
+                self.num_heads,
+                self.kv_lora_rank + self.qk_rope_head_dim,
+            ),
+            dtype=q_dtype,
+            device=kv_cache.device,
+        )
+        topk_indices = (
+            torch.arange(
+                topk_tokens,
+                dtype=torch.int32,
+                device=kv_cache.device,
+            )
+            .expand(num_tokens, -1)
+            .contiguous()
+        )
+        seq_lens = torch.full(
+            (num_tokens,),
+            topk_tokens,
+            dtype=torch.int32,
+            device=kv_cache.device,
+        )
+        self._forward_mqa_kernel(
+            q,
+            kv_cache,
+            topk_indices,
+            seq_lens,
+            layer=layer,
+            block_size=runtime.hot.block_size,
+            is_decode=True,
+        )
 
     @staticmethod
     def _normalize_lse(

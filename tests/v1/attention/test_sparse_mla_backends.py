@@ -3138,10 +3138,7 @@ def test_flashinfer_hisparse_decode_runs_batched_attention():
     def convert_decode(self, *args, **kwargs):  # noqa: ARG001
         return physical_topk, valid_counts
 
-    def prepare_kernel(self, *args, **kwargs):  # noqa: ARG001
-        pass
-
-    def run_kernel(self, q, cache, indices, counts):  # noqa: ARG001
+    def run_kernel(self, q, cache, indices, counts, **kwargs):  # noqa: ARG001
         kernel_shapes.append(q.shape)
         return q[..., :1], None
 
@@ -3160,8 +3157,7 @@ def test_flashinfer_hisparse_decode_runs_batched_attention():
     impl.dcp_world_size = 1
     impl.index_group = index_group
     impl.index_group_index = 0
-    impl._prepare_mqa_kernel = MethodType(prepare_kernel, impl)
-    impl._run_mqa_kernel = MethodType(run_kernel, impl)
+    impl._forward_mqa_kernel = MethodType(run_kernel, impl)
     metadata = SimpleNamespace(num_decode_tokens=num_tokens, block_size=64)
 
     output, lse = FlashInferMLASparseImpl.forward_mqa(
@@ -3196,7 +3192,7 @@ def test_flashattn_hisparse_decode_uses_index_group():
     impl.dcp_world_size = 1
     impl.index_group = index_group
     impl.index_group_index = 0
-    impl._run_mqa_kernel = MagicMock(return_value=q_nope[..., :1])
+    impl._forward_mqa_kernel = MagicMock(return_value=(q_nope[..., :1], None))
     metadata = SimpleNamespace(num_decode_tokens=num_tokens, block_size=64)
 
     output, lse = FlashAttnMLASparseImpl.forward_mqa(
@@ -3210,7 +3206,7 @@ def test_flashattn_hisparse_decode_uses_index_group():
     assert output.shape == (num_tokens, 2, 1)
     assert lse is None
     index_group.convert_decode_logical_to_physical_topk.assert_called_once()
-    impl._run_mqa_kernel.assert_called_once()
+    impl._forward_mqa_kernel.assert_called_once()
 
 
 def test_flashinfer_sm120_hisparse_decode_uses_index_group():
@@ -3735,7 +3731,7 @@ def test_sparse_mqa_consumes_decode_before_prefill_reuses_indices(monkeypatch, b
         sparse_mla, "triton_convert_req_index_to_global_index", convert_prefill
     )
 
-    def run_kernel(q, cache, indices, counts):
+    def run_kernel(q, cache, indices, counts, **kwargs):
         out = indices[:, :1].clone().view(-1, 1, 1).expand(-1, 16, 512)
         return out, None
 
@@ -3752,13 +3748,7 @@ def test_sparse_mqa_consumes_decode_before_prefill_reuses_indices(monkeypatch, b
         impl.index_group = group
         impl.index_group_index = 0
         impl.dcp_world_size = 1
-        if backend == "fa3":
-            impl._run_mqa_kernel = lambda q_nope, q_rope, cache, indices, counts, bs: (
-                run_kernel(q_nope, cache, indices, counts)[0]
-            )
-        else:
-            impl._prepare_mqa_kernel = MagicMock()
-            impl._run_mqa_kernel = run_kernel
+        impl._forward_mqa_kernel = run_kernel
 
     out, lse = impl.forward_mqa(
         (inputs.ql_nope, inputs.q_pe), inputs.kv_cache, inputs.metadata, None

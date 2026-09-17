@@ -203,19 +203,6 @@ class FlashAttnMLASparseImpl(SparseMLACommonImpl[FlashAttnMLASparseMetadata]):
                 "FlashAttnMLASparseImpl expects split (q_nope, q_rope) input."
             )
         q_nope, q_rope = q
-        return self._run_mqa_kernel(
-            q_nope, q_rope, kv_cache, topk_indices, valid_counts, block_size
-        ), None
-
-    def _run_mqa_kernel(
-        self,
-        q_nope: torch.Tensor,
-        q_rope: torch.Tensor,
-        kv_cache: torch.Tensor,
-        topk_indices: torch.Tensor,
-        valid_counts: torch.Tensor,
-        block_size: int,
-    ) -> torch.Tensor:
         kv_rows, _ = flat_kv_row_view(kv_cache, block_size)
 
         cu_seqlens_q = torch.arange(
@@ -238,7 +225,7 @@ class FlashAttnMLASparseImpl(SparseMLACommonImpl[FlashAttnMLASparseMetadata]):
             causal=True,
             fa_version=3,
         )
-        return out
+        return out, None
 
 
 def _fa4_cute_mla_available() -> str | None:
