@@ -32,6 +32,7 @@ from vllm.v1.attention.backend import (
     AttentionLayer,
     CommonAttentionMetadata,
     MultipleOf,
+    max_decode_query_len,
 )
 from vllm.v1.attention.backends.mla.index_group import HiSparseMLAIndexGroup
 from vllm.v1.attention.backends.mla.sparse_utils import (
@@ -52,7 +53,7 @@ from vllm.v1.attention.ops.flashmla import (
     flash_mla_with_kvcache,
     get_mla_metadata,
 )
-from vllm.v1.kv_cache_interface import AttentionSpec
+from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheSpec
 from vllm.v1.worker.workspace import current_workspace_manager
 
 if TYPE_CHECKING:
@@ -259,7 +260,12 @@ class FlashMLASparseMetadata(SparseMLACommonMetadata):
         class Decode:
             seq_lens: torch.Tensor
             kernel_metadata: "FlashMLASparseMetadata.FP8KernelMetadata"
-            decode_query_len: int  # needed for reshape in spec decode
+            # Per-request query length for the spec-decode reshape; with
+            # `flatten`, only an upper bound on it.
+            decode_query_len: int
+            # Run the decode rows as one batch of single-token rows (see
+            # flashmla_sparse_flattens_decodes).
+            flatten: bool = False
 
         @dataclass
         class Prefill:
@@ -302,6 +308,26 @@ class FlashMLASparseMetadata(SparseMLACommonMetadata):
     fp8_use_mixed_batch: bool = False
 
 
+def flashmla_sparse_flattens_decodes(vllm_config: VllmConfig) -> bool:
+    """Whether FlashMLA sparse runs decode rows as one flat batch of
+    single-token rows, so FULL decode graphs replay ragged verification.
+
+    The sparse kernels take causality from each row's top-k indices, not from
+    the batch layout, so only the (num_decodes, decode_query_len) reshape of the
+    separate FP8 decode path and the HiSparse swap-in need a uniform layout.
+    Adaptive verification trims queries on device, so it flattens them. PCP and
+    DCP keep their own decode layouts and are not covered.
+    """
+    speculative_config = vllm_config.speculative_config
+    parallel_config = vllm_config.parallel_config
+    return (
+        speculative_config is not None
+        and bool(speculative_config.enable_adaptive_verification)
+        and parallel_config.decode_context_parallel_size == 1
+        and parallel_config.prefill_context_parallel_size == 1
+    )
+
+
 def get_prefill_workspace_size(max_model_len: int):
     # NOTE(Lucas): 5 is a magic number for controlling the prefill buffer size.
     # May be tuned later.
@@ -319,6 +345,23 @@ class FlashMLASparseMetadataBuilder(
     require_uniform_decodes: ClassVar[bool] = True
     hisparse_supports_multi_token_decode: ClassVar[bool] = True
     metadata_cls = FlashMLASparseMetadata
+
+    @classmethod
+    def get_varlen_cudagraph_max_query_len(
+        cls,
+        vllm_config: VllmConfig,
+        kv_cache_spec: KVCacheSpec,
+    ) -> int | None:
+        if (
+            cls.get_cudagraph_support(vllm_config, kv_cache_spec)
+            != AttentionCGSupport.UNIFORM_BATCH
+        ):
+            return None
+        if not flashmla_sparse_flattens_decodes(vllm_config):
+            return None
+        # The reorder threshold is at least this wide, so every verification
+        # request lands in the flattened decode rows.
+        return max_decode_query_len(vllm_config)
 
     def __init__(
         self,
@@ -341,6 +384,11 @@ class FlashMLASparseMetadataBuilder(
         self.use_hisparse = vllm_config.attention_config.hisparse_config is not None
         if self.use_hisparse:
             threshold = 1
+        # Flattened decode rows need no common query length (the base build
+        # drops the uniform split under decode_varlen). PCP and DCP keep the
+        # uniform layout they are validated with.
+        self.flatten_decodes = flashmla_sparse_flattens_decodes(vllm_config)
+        self.decode_varlen = self.flatten_decodes
         # Varlen decodes are safe under DCP: causality comes from the
         # indexer's top-k indices, not from the kernel metadata.
         self._init_reorder_batch_threshold(
@@ -492,7 +540,11 @@ class FlashMLASparseMetadataBuilder(
 
         decode_query_len = 0
         active_num_decodes = num_decodes
-        if num_decodes > 0:
+        if num_decodes > 0 and self.flatten_decodes:
+            # Only bounds the rows per request; the device query_start_loc maps
+            # rows to requests.
+            decode_query_len = metadata.decode_max_query_len
+        elif num_decodes > 0:
             query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
             decode_query_len = (query_start_loc_cpu[1] - query_start_loc_cpu[0]).item()
             assert decode_query_len > 0
@@ -635,9 +687,10 @@ class FlashMLASparseMetadataBuilder(
             )
 
         if num_decodes > 0:
-            if self.pcp_dcp_kv_gather:
-                # Decode rows take the mixed-batch kernel call, which returns
-                # the LSE the DCP merge needs.
+            if self.pcp_dcp_kv_gather or self.flatten_decodes:
+                # Decode rows take the mixed-batch kernel call: one batch of
+                # single-token rows, which also returns the LSE the DCP merge
+                # needs.
                 kernel_meta = self._build_fp8_mixed_decode_prefill()
             else:
                 # Use padded head count since that's what the kernel will see
@@ -652,6 +705,7 @@ class FlashMLASparseMetadataBuilder(
                 seq_lens=common_attn_metadata.seq_lens[:active_num_decodes],
                 kernel_metadata=kernel_meta,
                 decode_query_len=decode_query_len,
+                flatten=self.flatten_decodes,
             )
 
         return fp8_metadata
@@ -1028,7 +1082,17 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
                     fp8_metadata.decode.kernel_metadata,
                     num_decodes,
                     fp8_metadata.decode.decode_query_len,
+                    flatten=fp8_metadata.decode.flatten,
                 )
+            if fp8_metadata.decode.flatten:
+                # (T, H, D) -> (1, T, H, D): every row carries its own top-k.
+                attn_out, _ = self._fp8_flash_mla_kernel(
+                    q=q.unsqueeze(0),
+                    kv_c_and_k_pe_cache=kv_c_and_k_pe_cache,
+                    topk_indices=topk_indices.unsqueeze(0),
+                    kernel_metadata=fp8_metadata.decode.kernel_metadata,
+                )
+                return attn_out.squeeze(0)
             # Reshape q: (num_decode_tokens, num_heads, head_dim)
             #         -> (num_decodes, seq_len, num_heads, head_dim)
             q = reshape_query_for_spec_decode(q, num_decodes)
@@ -1268,6 +1332,7 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
         kernel_metadata: FlashMLASparseMetadata.FP8KernelMetadata,
         num_decodes: int,
         decode_query_len: int,
+        flatten: bool = False,
     ) -> torch.Tensor:
         assert isinstance(self.index_group, HiSparseMLAIndexGroup)
         physical_topk = self.index_group.convert_decode_logical_to_physical_topk(
@@ -1277,8 +1342,19 @@ class FlashMLASparseImpl(SparseMLACommonImpl[FlashMLASparseMetadata]):
             return_valid_counts=False,
             num_decodes=num_decodes,
             decode_query_len=decode_query_len,
+            varlen=flatten or None,
         )
         assert isinstance(physical_topk, torch.Tensor)
+        if flatten:
+            output, _ = self._fp8_flash_mla_kernel(
+                q=q.unsqueeze(0),
+                kv_c_and_k_pe_cache=self.index_group.physical_kv_cache(
+                    self.index_group_index
+                ),
+                topk_indices=physical_topk.unsqueeze(0),
+                kernel_metadata=kernel_metadata,
+            )
+            return output.squeeze(0)
         q = reshape_query_for_spec_decode(q, num_decodes)
         physical_topk = physical_topk.view(num_decodes, q.shape[1], -1)
         output, _ = self._fp8_flash_mla_kernel(

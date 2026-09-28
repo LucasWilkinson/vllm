@@ -270,12 +270,24 @@ class HiSparseMLAIndexGroup(SparseMLAIndexGroup):
         return_valid_counts: bool,
         num_decodes: int | None = None,
         decode_query_len: int | None = None,
+        varlen: bool | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """Swap in and convert decode top-k rows.
+
+        With ``varlen`` (default: ``attn_metadata.decode_varlen``) the rows are
+        mapped to requests from the device ``query_start_loc`` and
+        ``decode_query_len`` only bounds the per-request query length, so a
+        cudagraph captured here replays any mix of 1..decode_query_len tokens
+        per request. Rows no request covers (cudagraph token padding) come out
+        as -1 with a valid count of 0.
+        """
         num_tokens = logical_topk_indices.shape[0]
         if num_decodes is None:
             num_decodes = attn_metadata.num_decodes
         if decode_query_len is None:
             decode_query_len = attn_metadata.decode_max_query_len
+        if varlen is None:
+            varlen = bool(getattr(attn_metadata, "decode_varlen", False))
         if decode_query_len == 1:
             return self.convert_logical_to_physical_topk(
                 layer_index,
@@ -286,7 +298,10 @@ class HiSparseMLAIndexGroup(SparseMLAIndexGroup):
                 req_id_per_token=self.request_ids[:num_decodes],
             )
 
-        if num_tokens != num_decodes * decode_query_len:
+        # A uniform-looking shape is not a uniform batch when the device may
+        # have trimmed queries, and a graph captured on the uniform path would
+        # bake that layout in.
+        if varlen or num_tokens != num_decodes * decode_query_len:
             query_start_loc = attn_metadata.query_start_loc[: num_decodes + 1]
             physical_topk_indices = self.physical_topk_indices[: num_tokens + 1]
             valid_topk_counts = self.valid_topk_counts[: num_tokens + 1]
@@ -294,6 +309,11 @@ class HiSparseMLAIndexGroup(SparseMLAIndexGroup):
             cache = self.cache(layer_index)
             source_block_table = cache.source_block_table
             assert source_block_table is not None
+            if layer_index == 0:
+                # Rows past the device's last query (token padding) are never
+                # written below; keep them inert instead of stale or garbage.
+                physical_topk_indices.fill_(-1)
+                valid_topk_counts.zero_()
             for step in range(decode_query_len):
                 token_indices = query_start_loc[:-1] + step
                 active = (token_indices < query_start_loc[1:]) & (
