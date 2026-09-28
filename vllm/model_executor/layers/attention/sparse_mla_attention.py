@@ -36,7 +36,7 @@ from vllm.utils.torch_utils import (
     is_quantized_kv_cache,
     np_to_pinned_tensor,
 )
-from vllm.v1.attention.backend import AttentionMetadataBuilder
+from vllm.v1.attention.backend import AttentionMetadataBuilder, max_decode_query_len
 from vllm.v1.attention.backends.fa_utils import get_flash_attn_version
 from vllm.v1.attention.backends.mla.index_group import (
     SparseMLAIndexGroup,
@@ -154,6 +154,11 @@ class SparseMLACommonMetadata(MLACommonMetadata[MLACommonDecodeMetadata]):
     num_prefills: int = 0
     num_decode_tokens: int = 0
     decode_max_query_len: int = 0
+    # Adaptive verification trims verification queries on device, so decode
+    # rows may be ragged and the host query split is not the device one. Decode
+    # consumers must then map tokens to requests from the device
+    # query_start_loc, bounded by decode_max_query_len.
+    decode_varlen: bool = False
     prefill_max_seq_len: int = 0
     prefill: SparseMLAPrefillMetadata | None = None
     cp_kv_cache_interleave_size: int = 1
@@ -180,6 +185,11 @@ class SparseMLACommonMetadataBuilder(AttentionMetadataBuilder[T]):
         self.model_config = vllm_config.model_config
         self.mla_dims = get_mla_dims(self.model_config)
         self.topk_tokens: int = vllm_config.model_config.hf_text_config.index_topk
+        speculative_config = vllm_config.speculative_config
+        self.decode_varlen = bool(
+            speculative_config is not None
+            and speculative_config.enable_adaptive_verification
+        )
         self.req_id_per_token_buffer = torch.empty(
             (vllm_config.scheduler_config.max_num_batched_tokens,),
             dtype=torch.int32,
@@ -340,7 +350,9 @@ class SparseMLACommonMetadataBuilder(AttentionMetadataBuilder[T]):
             common_attn_metadata,
             decode_threshold=self.reorder_batch_threshold or 1,
             treat_short_extends_as_decodes=not self.use_pcp,
-            require_uniform=self.require_uniform_decodes,
+            # Under decode_varlen the host query lengths are not the device
+            # ones, so a split on their uniformity would be meaningless.
+            require_uniform=self.require_uniform_decodes and not self.decode_varlen,
         )
         (
             prefill_query_start_loc,
@@ -358,6 +370,13 @@ class SparseMLACommonMetadataBuilder(AttentionMetadataBuilder[T]):
                     common_attn_metadata.query_start_loc_cpu[: num_decodes + 1]
                 )
                 decode_max_query_len = int(decode_query_lens_cpu.max().item())
+            if self.decode_varlen:
+                # The host split spreads the draft budget evenly, so its decode
+                # lengths do not bound the device ones; verification rows are
+                # bounded by the decode width instead.
+                decode_max_query_len = max(
+                    decode_max_query_len, max_decode_query_len(self.vllm_config)
+                )
 
         prefill_max_seq_len = 0
         prefill: SparseMLAPrefillMetadata | None = None
@@ -430,6 +449,7 @@ class SparseMLACommonMetadataBuilder(AttentionMetadataBuilder[T]):
             num_prefills=num_prefills,
             num_decode_tokens=num_decode_tokens,
             decode_max_query_len=decode_max_query_len,
+            decode_varlen=self.decode_varlen,
             prefill_max_seq_len=prefill_max_seq_len,
             prefill=prefill,
             cp_kv_cache_interleave_size=self.cp_kv_cache_interleave_size,
