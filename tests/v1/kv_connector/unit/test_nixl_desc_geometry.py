@@ -122,13 +122,18 @@ def test_local_descriptors_follow_each_region_pool_capacity():
 
 
 def _register_overlaid_mla_worker(
-    *, push_pp: bool = False, tail_bytes: int = 0, page_covers_view: bool = True
+    *,
+    push_pp: bool = False,
+    tail_bytes: int = 0,
+    page_covers_view: bool = True,
+    draft_kv_heads: int | None = None,
 ):
     """Register two MLA layers overlaid on one allocation.
 
     ``tail_bytes`` leaves spare bytes past the last block, the way an allocation
     rounded up to a page boundary does. Clearing ``page_covers_view`` narrows
     each layer's view below its page, leaving the block interior non-contiguous.
+    ``draft_kv_heads`` makes the second layer a head-sharded GQA draft layer.
     """
     from vllm.distributed.kv_transfer.kv_connector.v1.nixl import base_worker as bw
     from vllm.distributed.kv_transfer.kv_connector.v1.nixl.push_worker import (
@@ -138,6 +143,7 @@ def _register_overlaid_mla_worker(
         NixlConnectorWorker,
     )
     from vllm.v1.kv_cache_interface import (
+        FullAttentionSpec,
         KVCacheConfig,
         KVCacheGroupSpec,
         KVCacheTensor,
@@ -153,14 +159,24 @@ def _register_overlaid_mla_worker(
     )
     page_size = spec.page_size_bytes
     block_stride = 2 * page_size
-    view_size = page_size if page_covers_view else page_size - 8
+    specs = {"layer.0": spec, "layer.1": spec}
+    if draft_kv_heads is not None:
+        # A page twice the MLA one, which fills the block.
+        specs["layer.1"] = FullAttentionSpec(
+            block_size=4, num_kv_heads=1, head_size=8, dtype=torch.uint8
+        )
     allocation = torch.zeros(num_blocks * block_stride + tail_bytes, dtype=torch.uint8)
     backing = allocation[: num_blocks * block_stride].view(num_blocks, block_stride)
     caches = {
-        "layer.0": backing[:, :view_size],
-        "layer.1": backing[:, :view_size],
+        name: backing[
+            :,
+            : layer_spec.page_size_bytes if page_covers_view else page_size - 8,
+        ]
+        for name, layer_spec in specs.items()
     }
-    groups = [KVCacheGroupSpec([layer_name], spec) for layer_name in caches]
+    groups = [
+        KVCacheGroupSpec([name], layer_spec) for name, layer_spec in specs.items()
+    ]
 
     worker_cls = NixlPushConnectorWorker if push_pp else NixlConnectorWorker
     worker = object.__new__(worker_cls)
@@ -182,6 +198,7 @@ def _register_overlaid_mla_worker(
     worker.attn_backends = []
     worker._has_mamba = False
     worker._is_csa_linear = False
+    worker._head_sharded_draft_kv_heads = draft_kv_heads
     worker.vllm_config = MagicMock()
     worker.backend_name = "FLASHMLA"
     worker.num_blocks = num_blocks
@@ -224,14 +241,14 @@ def _register_overlaid_mla_worker(
     worker.dcp_size = 1
     worker.pcp_size = 1
     worker.kv_buffer_device = "cuda"
-    worker._layer_specs = {name: spec for name in caches}
+    worker._layer_specs = specs
     worker.kv_cache_config = KVCacheConfig(
         num_blocks=num_blocks,
         kv_cache_tensors=[
             KVCacheTensor(
                 size=allocation.nbytes,
                 layers=[name],
-                layer_stride=page_size,
+                layer_stride=specs[name].page_size_bytes,
                 block_stride=block_stride,
             )
             for name in caches
@@ -293,6 +310,29 @@ def test_overlaid_transfer_groups_share_region_geometry(push_pp):
     assert metadata.region_num_blocks == [num_blocks]
     assert metadata.region_members == ([["layer.0", "layer.1"]] if push_pp else [])
     assert worker._block_ids_by_region(([0], [2]), worker.region_group_ids) == [[0, 2]]
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("draft_kv_heads", [None, 8])
+def test_head_sharded_draft_does_not_share_an_aliased_mla_region(draft_kv_heads):
+    """Block-outer groups alias from byte 0 of each block, so the first layer
+    of a GQA draft group starts where the first MLA layer does. Under an MLA
+    target the draft is head-sharded and needs a region of its own."""
+    registered = _register_overlaid_mla_worker(draft_kv_heads=draft_kv_heads)
+    worker = registered.worker
+    base = registered.allocation.data_ptr()
+
+    if draft_kv_heads is None:
+        assert worker.region_group_ids == [-1]
+        assert worker._region_is_mla == [True]
+        return
+    mla_page = registered.block_stride // 2
+    assert worker.kv_caches_base_addr[worker.engine_id][0] == [base, base]
+    assert worker.region_group_ids == [0, 1]
+    assert worker._region_is_mla == [True, False]
+    assert worker.block_len_per_layer == [mla_page, registered.block_stride]
+    assert worker.block_stride_per_layer == [registered.block_stride] * 2
+    assert worker._has_head_sharded_draft_regions()
 
 
 def _descriptor_geometry(registered) -> dict:
