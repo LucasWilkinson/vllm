@@ -133,7 +133,9 @@ duplicate mapping.
 Speculative decoding resolves and consumes each verification step in order.
 Each step receives distinct replayable plan rows while sharing the request's
 hot-cache state, so a later step cannot reuse a hot row before an earlier step
-has consumed it.
+has consumed it. Draft layers write their rows after the target forward, so
+their host mirror runs in `wait_for_save`, after the drafter, and the step's
+page transfers are submitted behind it.
 
 ## P/D import target
 
