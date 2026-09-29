@@ -33,6 +33,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.hisparse import debug_stats as hisparse_debug
 from vllm.v1.hisparse.coordinator import get_hisparse_coordinator
 from vllm.v1.hisparse.types import SparseKVOffloadCommand, SparseKVRowMirror
 from vllm.v1.outputs import KVConnectorOutput
@@ -106,7 +107,11 @@ class HiSparseConnectorScheduler:
         # HiSparse rebinds worker state every step, so the load must start
         # before the forward rather than being deferred to post-forward.
         scheduler_output.has_sync_kv_loads = True
+        if hisparse_debug.ENABLED:
+            hisparse_debug.maybe_log_scheduler(self.coordinator)
         recovered_host_block_id = self.coordinator.recover_host_page()
+        if hisparse_debug.ENABLED and recovered_host_block_id is not None:
+            hisparse_debug.SCHED["host_page_recovered"] += 1
         scheduler_output.block_table_updates = (
             self.coordinator.take_block_table_updates() or None
         )

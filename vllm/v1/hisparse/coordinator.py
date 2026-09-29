@@ -19,6 +19,7 @@ from vllm.v1.core.single_type_kv_cache_manager import (
     HiSparseSourceManager,
     SingleTypeKVCacheManager,
 )
+from vllm.v1.hisparse import debug_stats as hisparse_debug
 from vllm.v1.hisparse.types import (
     SparseKVOffloadCommand,
     SparseKVPageTransfer,
@@ -67,6 +68,8 @@ class _HiSparseRequestState:
     unpinned_pages: set[int] = field(default_factory=set)
     missing_host_pages: deque[int] = field(default_factory=deque)
     num_computed_pages: int = 0
+    # Debug-only (VLLM_HISPARSE_DEBUG_STATS): pages landed by a host import.
+    debug_import_pages: int = 0
 
 
 @dataclass
@@ -355,6 +358,8 @@ class HiSparseCoordinator:
             manager.block_pool.unpin_blocks([block], self._on_block_reused)
         state.pinned_clean.discard(page_idx)
         state.unpinned_pages.add(page_idx)
+        if hisparse_debug.ENABLED:
+            hisparse_debug.SCHED["unpin"] += 1
         return True
 
     def _unpin_clean_pages(self, request_id: str, state: _HiSparseRequestState) -> None:
@@ -372,7 +377,12 @@ class HiSparseCoordinator:
         host_hash = self._copy_by_block.get(block.block_id)
         if host_hash is not None:
             self._drop_copy(host_hash)
-        for request_id, page_idx in self._owners.pop(block.block_id, ()):
+        owners = self._owners.pop(block.block_id, ())
+        if hisparse_debug.ENABLED:
+            hisparse_debug.SCHED["reuse"] += 1
+            hisparse_debug.SCHED["reuse_copy_dropped"] += host_hash is not None
+            hisparse_debug.SCHED["reuse_owned"] += bool(owners)
+        for request_id, page_idx in owners:
             self._lose_page(request_id, page_idx)
 
     def _lose_page(self, request_id: str, page_idx: int) -> None:
@@ -390,6 +400,14 @@ class HiSparseCoordinator:
                 owners.discard((request_id, page_idx))
         state.unpinned_pages.discard(page_idx)
         self.block_table_updates.add(request_id)
+        if hisparse_debug.ENABLED:
+            hisparse_debug.SCHED["lose_page"] += 1
+            hisparse_debug.SCHED["lose_page_imported"] += (
+                page_idx < state.debug_import_pages
+            )
+            hisparse_debug.SCHED["lose_page_no_host_copy"] += (
+                page_idx not in state.valid_pages
+            )
         for hot_manager in self.hot_managers:
             hot_manager.require_hot(request_id)
 
@@ -408,6 +426,8 @@ class HiSparseCoordinator:
             assert self.gpu_pool is not None
             if self.gpu_pool.get_num_free_blocks() >= self.transition_watermark:
                 return
+            if hisparse_debug.ENABLED:
+                hisparse_debug.SCHED["require_hot_watermark"] += 1
             for manager in self.hot_managers:
                 manager.require_hot(request_id)
             return
@@ -420,6 +440,8 @@ class HiSparseCoordinator:
     def record_missing_host_pages(self, request_id: str, pages: range) -> None:
         if not pages or not self.resident_managers:
             return
+        if hisparse_debug.ENABLED:
+            hisparse_debug.SCHED["missing_host_pages"] += len(pages)
         self._get_request_state(request_id).missing_host_pages.extend(pages)
         self._host_recovery_requests[request_id] = None
 
@@ -563,6 +585,10 @@ class HiSparseCoordinator:
         state = self._get_request_state(request_id)
         state.valid_pages = set(range(num_pages))
         state.ready_prefix_pages = num_pages
+        if hisparse_debug.ENABLED:
+            state.debug_import_pages = num_pages
+            hisparse_debug.SCHED["import_reqs"] += 1
+            hisparse_debug.SCHED["import_pages"] += num_pages
         if num_computed_tokens:
             self._plan_page_transfer(
                 request_id,
@@ -622,6 +648,9 @@ class HiSparseCoordinator:
         )
         state.pending_pages[page_idx] = spill_id
         self.spills_to_send.append(plan)
+        if hisparse_debug.ENABLED:
+            kind = "restore" if restore else "copy" if require_copy_to_host else "seal"
+            hisparse_debug.SCHED[f"transfer_planned_{kind}"] += 1
         return True
 
     # ------------------------------------------------------------------
@@ -773,6 +802,8 @@ class HiSparseCoordinator:
             and pending.worker_completions >= pending.expected_worker_completions
         ]
         completed_request_ids: set[str] = set()
+        if hisparse_debug.ENABLED:
+            hisparse_debug.SCHED["transfer_completed"] += len(completed)
         for pending in completed:
             self.pending_spills.pop(pending.transfer_id, None)
             request_id, page_idx = pending.page
@@ -815,6 +846,8 @@ class HiSparseCoordinator:
                     page_idx in state.valid_pages
                     and page_idx not in state.pending_pages
                 ):
+                    if hisparse_debug.ENABLED:
+                        hisparse_debug.SCHED["free_unpin"] += 1
                     manager.block_pool.unpin_blocks([block], self._on_block_reused)
                 else:
                     continue
