@@ -22,6 +22,7 @@ from vllm.platforms import current_platform
 from vllm.utils.math_utils import round_up
 from vllm.utils.torch_utils import current_stream
 from vllm.v1.attention.backend import max_decode_query_len
+from vllm.v1.hisparse import debug_stats as hisparse_debug
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
 from vllm.v1.simple_kv_offload.cuda_mem_ops import pin_tensor
 
@@ -937,6 +938,10 @@ class HiSparseRuntime:
             else 0,
             0,
         )
+        if hisparse_debug.ENABLED:
+            hisparse_debug.record_resolve_launch(
+                group, req_id_per_token[:num_tokens], request_state_indices
+            )
 
     def _swap_rows(self, shared_rows: slice) -> None:
         hot = self.hot
@@ -1075,6 +1080,10 @@ class HiSparseCacheHandle:
         self.mirror_staging_slots: torch.Tensor | None = None
         self.submit_layer_mirror: Callable[[], None] | None = None
         self.index_group_caches: list[HiSparseCacheHandle] = [self]
+        # Debug-only (VLLM_HISPARSE_DEBUG_STATS): owning sparse index group
+        # and the last metadata this handle was prepared with.
+        self.mla_index_group: HiSparseMLAIndexGroup | None = None
+        self.debug_attn_metadata: Any | None = None
 
     def prepare_group_for_batch(self, attn_metadata: Any | None) -> None:
         assert self.runtime.is_group_leader
@@ -1083,6 +1092,8 @@ class HiSparseCacheHandle:
 
     def _prepare_for_batch(self, attn_metadata: Any | None) -> None:
         self.dummy_batch = attn_metadata is None
+        if hisparse_debug.ENABLED:
+            self.debug_attn_metadata = attn_metadata
         self.runtime.begin_forward()
         self.num_actual_tokens = (
             attn_metadata.num_actual_tokens if attn_metadata is not None else 0
@@ -1271,6 +1282,7 @@ def create_hisparse_cache_handle(
         max_num_reqs,
     )
     handle = HiSparseCacheHandle(runtime)
+    handle.mla_index_group = index_group
     speculative_config = vllm_config.speculative_config
     handle.mirror_from_resident = bool(
         vllm_config.scheduler_config.async_scheduling

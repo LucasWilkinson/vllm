@@ -22,9 +22,11 @@ from vllm.distributed.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tp_group,
 )
+from vllm.logger import init_logger
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 from vllm.utils.torch_utils import current_stream
 from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
+from vllm.v1.hisparse import debug_stats as hisparse_debug
 from vllm.v1.hisparse.layout import HISPARSE_HOT_SUFFIX
 from vllm.v1.hisparse.runtime import HiSparseCacheHandle, release_pinned_state
 from vllm.v1.hisparse.types import SparseKVPageTransfer, SparseKVRowMirror
@@ -39,6 +41,9 @@ if TYPE_CHECKING:
         HiSparseConnectorMetadata,
     )
     from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
+
+
+logger = init_logger(__name__)
 
 
 class _DMADescriptors(NamedTuple):
@@ -347,6 +352,25 @@ class HiSparseConnectorWorker:
                 handle.submit_layer_mirror = partial(
                     self._enqueue_layer_mirror, layer_index
                 )
+        self._draft_remirror_layers: tuple[int, ...] = ()
+        if hisparse_debug.REMIRROR_DRAFT and self.is_host_writer:
+            self._draft_remirror_layers = tuple(
+                hisparse_debug.draft_layer_indices(
+                    self.vllm_config, cache_layer_names, cache_handles
+                )
+            )
+            logger.warning(
+                "HISPARSE_DBG VLLM_HISPARSE_DEBUG_REMIRROR_DRAFT=1: re-mirroring "
+                "draft layers %s at each step start.",
+                [cache_layer_names[i] for i in self._draft_remirror_layers],
+            )
+        if hisparse_debug.ENABLED:
+            hisparse_debug.WORKER = hisparse_debug.WorkerDebugStats(
+                self.vllm_config,
+                cache_layer_names,
+                cache_handles,
+                is_rank0=get_tensor_model_parallel_rank() == 0,
+            )
         self._initialized = True
 
     def set_request_state_indices(self, indices: torch.Tensor) -> None:
@@ -396,6 +420,21 @@ class HiSparseConnectorWorker:
         request_ids: list[str] | None = None,
         num_tokens: int = 0,
     ) -> None:
+        remirror_layers = getattr(self, "_draft_remirror_layers", ())
+        if remirror_layers and self._row_mirror_num_rows:
+            # The previous step's drafter has now written these rows; the next
+            # forward waits on host_write_event below.
+            if hisparse_debug.ENABLED and hisparse_debug.WORKER is not None:
+                hisparse_debug.WORKER.count_mirror_dma(
+                    "remirror", remirror_layers, self._row_mirror_num_rows
+                )
+            self._enqueue_row_dma(remirror_layers)
+        if hisparse_debug.ENABLED and hisparse_debug.WORKER is not None:
+            hisparse_debug.WORKER.on_step_start(
+                request_state_indices.numel()
+                if request_state_indices is not None
+                else len(request_ids or ())
+            )
         self._stage_row_mirror_mapping(num_tokens)
         previous_host_write_event = self.host_write_event
         self.host_write_event = self.host_write_events[self._next_host_write_event]
@@ -709,6 +748,10 @@ class HiSparseConnectorWorker:
         pending_layers = tuple(
             sorted(self._per_layer_mirrored - self._submitted_mirror_layers)
         )
+        if hisparse_debug.ENABLED and hisparse_debug.WORKER is not None:
+            hisparse_debug.WORKER.count_mirror_dma(
+                "layer", pending_layers, self._row_mirror_num_rows
+            )
         self._enqueue_row_dma(
             pending_layers,
             ready_event=ready_event,
@@ -759,6 +802,15 @@ class HiSparseConnectorWorker:
         self._record_transfer_completion(transfers, stream=current_stream())
 
     def _submit_transfers(self, transfers: list[SparseKVPageTransfer]) -> None:
+        if hisparse_debug.ENABLED and hisparse_debug.WORKER is not None and transfers:
+            # With eager mirroring only recovery pages are page-copied; the
+            # rest are declared clean on the strength of the row mirrors.
+            eager = self.cache_handles[0].runtime.eager_host_mirror
+            copied = sum(1 for t in transfers if t.require_copy_to_host or not eager)
+            hisparse_debug.WORKER.dma_rows["pages_copied"] += copied
+            hisparse_debug.WORKER.dma_rows["pages_marked_clean_nocopy"] += (
+                len(transfers) - copied
+            )
         if self.cache_handles[0].runtime.eager_host_mirror:
             # Recovered destinations did not exist when their rows were computed.
             self._enqueue_transfers([t for t in transfers if t.require_copy_to_host])
@@ -864,6 +916,10 @@ class HiSparseConnectorWorker:
                 sorted(expected_layers - self._submitted_mirror_layers)
             )
             if pending_layers:
+                if hisparse_debug.ENABLED and hisparse_debug.WORKER is not None:
+                    hisparse_debug.WORKER.count_mirror_dma(
+                        "bulk", pending_layers, self._row_mirror_num_rows
+                    )
                 self._enqueue_row_dma(pending_layers, ready_event=ready_event)
                 self._submitted_mirror_layers.update(pending_layers)
         assert cache.req_id_per_token is not None
@@ -885,6 +941,8 @@ class HiSparseConnectorWorker:
         self._clear_forward_mirror_state()
 
     def finish_forward(self) -> None:
+        if hisparse_debug.ENABLED and hisparse_debug.WORKER is not None:
+            hisparse_debug.WORKER.on_target_forward_done(self.cache_handles)
         compute_stream = current_stream()
         self._forward_ready_event.record()
         self._finish_mirror_phase(self._forward_ready_event)

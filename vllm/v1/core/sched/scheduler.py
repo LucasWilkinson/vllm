@@ -54,6 +54,7 @@ from vllm.v1.core.sched.request_queue import (
 )
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
+from vllm.v1.hisparse import debug_stats as hisparse_debug
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     MambaSpec,
@@ -754,6 +755,8 @@ class Scheduler(SchedulerInterface):
                         self.connector is not None
                         and self.connector.has_pending_block_frees()
                     ):
+                        if hisparse_debug.ENABLED:
+                            hisparse_debug.SCHED["sched_defer_pending_frees"] += 1
                         break
 
                     # The request cannot be scheduled.
@@ -810,6 +813,8 @@ class Scheduler(SchedulerInterface):
 
             if new_blocks is None:
                 # Cannot schedule this request.
+                if hisparse_debug.ENABLED:
+                    hisparse_debug.SCHED["sched_running_alloc_fail"] += 1
                 break
 
             # Schedule the request.
@@ -1227,6 +1232,8 @@ class Scheduler(SchedulerInterface):
 
                 if new_blocks is None:
                     # The request cannot be scheduled.
+                    if hisparse_debug.ENABLED:
+                        hisparse_debug.SCHED["sched_waiting_alloc_fail"] += 1
 
                     # NOTE: we need to untouch the request from the encode cache
                     # manager
@@ -1552,6 +1559,8 @@ class Scheduler(SchedulerInterface):
         assert request.status == RequestStatus.RUNNING, (
             "Only running requests can be preempted"
         )
+        if hisparse_debug.ENABLED:
+            hisparse_debug.SCHED["sched_preempt"] += 1
         if self.aux_output_connector is not None:
             self.aux_output_connector.request_finished(request)
         self._free_request_blocks(request)

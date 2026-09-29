@@ -10,6 +10,7 @@ from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
+from vllm.v1.hisparse import debug_stats as hisparse_debug
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.block_table import BlockTables
@@ -320,6 +321,9 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
                 cudagraph_runtime_mode=prefill_batch_desc.cg_mode,
                 mm_inputs=mm_inputs,
             )
+        if hisparse_debug.ENABLED and not dummy_run:
+            # Before on_prefill_end: MTP top-k compaction overwrites the rows.
+            hisparse_debug.on_draft_forward("draft_prefill", attn_metadata, num_reqs)
         self.on_prefill_end(num_reqs)
 
         if self.num_speculative_steps == 1:
@@ -380,6 +384,8 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             num_tokens_across_dp,
             input_batch.seq_lens_cpu_upper_bound,
         )
+        if hisparse_debug.ENABLED and not dummy_run:
+            hisparse_debug.on_draft_forward("draft_decode", None, num_reqs)
         self.on_multi_step_decode_end(num_reqs)
 
         return self.draft_tokens[:num_reqs]
