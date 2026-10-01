@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import math
 import mmap
+import os
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -30,6 +31,18 @@ logger = init_logger(__name__)
 
 HOST_REGISTER_CHUNK_BYTES = 256 * 2**30
 
+# Experimental: pre-stage follower-layer gathers for all-decode batches with
+# multiple query tokens per request (MTP verification), not only when every
+# request has exactly one query token.
+PRESTAGE_MULTI_TOKEN_DECODE = os.environ.get(
+    "VLLM_HISPARSE_PRESTAGE_MULTI_TOKEN", "0"
+) not in ("", "0")
+# Experimental: interleave the shared host pool across NUMA nodes instead of
+# first-touch placing all of it on the creator rank's node.
+NUMA_INTERLEAVE_HOST_POOL = os.environ.get(
+    "VLLM_HISPARSE_NUMA_INTERLEAVE", "0"
+) not in ("", "0")
+
 if TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.index_group import HiSparseMLAIndexGroup
     from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -45,6 +58,15 @@ def is_hisparse_decode_batch(attn_metadata: Any | None) -> bool:
         and attn_metadata.num_decode_tokens == attn_metadata.num_actual_tokens
         and attn_metadata.max_query_len == 1
         and attn_metadata.num_reqs == attn_metadata.num_actual_tokens
+    )
+
+
+def is_hisparse_all_decode_batch(attn_metadata: Any | None) -> bool:
+    """Every token is a decode token (speculative verification included)."""
+    return (
+        attn_metadata is not None
+        and attn_metadata.num_actual_tokens > 0
+        and attn_metadata.num_decode_tokens == attn_metadata.num_actual_tokens
     )
 
 
@@ -377,6 +399,7 @@ def allocate_hisparse_host_pools(
         barrier=get_tp_group().barrier,
         creator_memory_check=check_hisparse_host_memory,
         populate_only_on_creator=True,
+        numa_interleave=NUMA_INTERLEAVE_HOST_POOL,
     )
     try:
         for start, end in _hisparse_registration_ranges(
@@ -1030,7 +1053,7 @@ class HiSparseRuntime:
                 valid_counts_out=valid_counts_out,
             )
             runtimes = [self]
-            if resident.decode_batch:
+            if resident.prestage_followers:
                 runtimes.extend(group.followers)
             for runtime in runtimes:
                 runtime._swap_rows(shared_rows)
@@ -1115,6 +1138,8 @@ class HiSparseCacheHandle:
         self.runtime = runtime
         self.dummy_batch = False
         self.decode_batch = False
+        # Followers' gathers are issued at the leader (off the critical path).
+        self.prestage_followers = False
         self.all_context_pages_resident = True
         self.num_actual_tokens = 0
         self.num_decode_tokens = 0
@@ -1147,6 +1172,9 @@ class HiSparseCacheHandle:
             attn_metadata.req_id_per_token if attn_metadata is not None else None
         )
         self.decode_batch = is_hisparse_decode_batch(attn_metadata)
+        self.prestage_followers = self.decode_batch or (
+            PRESTAGE_MULTI_TOKEN_DECODE and is_hisparse_all_decode_batch(attn_metadata)
+        )
         self.host_mirror_required = attn_metadata is not None and (
             not self.decode_batch or self.runtime.eager_host_mirror
         )
