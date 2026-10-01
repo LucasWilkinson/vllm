@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import contextlib
+import ctypes
 import errno
 import mmap
 import os
@@ -20,6 +21,69 @@ logger = init_logger(__name__)
 
 # MADV_POPULATE_WRITE was added in Linux 5.14 (value 23).
 _MADV_POPULATE_WRITE = getattr(mmap, "MADV_POPULATE_WRITE", 23)
+
+
+_MPOL_INTERLEAVE = 3
+_SYS_MBIND = {"x86_64": 237, "aarch64": 235}.get(os.uname().machine)
+
+
+def _online_numa_nodes() -> list[int]:
+    try:
+        with open("/sys/devices/system/node/online") as f:
+            spec = f.read().strip()
+    except OSError:
+        return []
+    nodes: list[int] = []
+    for part in spec.split(","):
+        lo, _, hi = part.partition("-")
+        nodes.extend(range(int(lo), int(hi or lo) + 1))
+    return nodes
+
+
+def _mbind_interleave(mmap_obj: mmap.mmap, length: int) -> bool:
+    """Interleave a not-yet-faulted shared mapping across all NUMA nodes.
+
+    Every TP rank reads the whole shared pool, so first-touch placement on the
+    creator's node makes the other socket's ranks read across the
+    interconnect while the creator's ranks stay local.
+    """
+    nodes = _online_numa_nodes()
+    if len(nodes) < 2 or _SYS_MBIND is None:
+        return False
+    num_words = max(nodes) // 64 + 1
+    mask = (ctypes.c_ulong * num_words)()
+    for node in nodes:
+        mask[node // 64] |= 1 << (node % 64)
+    anchor = ctypes.c_char.from_buffer(mmap_obj)
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        ret = libc.syscall(
+            ctypes.c_long(_SYS_MBIND),
+            ctypes.c_void_p(ctypes.addressof(anchor)),
+            ctypes.c_ulong(length),
+            ctypes.c_int(_MPOL_INTERLEAVE),
+            mask,
+            ctypes.c_ulong(num_words * 64),
+            ctypes.c_uint(0),
+        )
+    finally:
+        del anchor
+    if ret != 0:
+        logger.warning(
+            "mbind(MPOL_INTERLEAVE) failed: %s", os.strerror(ctypes.get_errno())
+        )
+        return False
+    logger.info("Interleaving shared host region across NUMA nodes %s.", nodes)
+    return True
+
+
+def _log_numa_placement(path: str) -> None:
+    """Log per-node page counts of a mapping from /proc/self/numa_maps."""
+    with contextlib.suppress(OSError), open("/proc/self/numa_maps") as f:
+        for line in f:
+            if path in line:
+                counts = [t for t in line.split() if t[:1] == "N" and "=" in t]
+                logger.info("NUMA placement of %s: %s", path, " ".join(counts))
 
 
 def _wait_for_file_size(fd: int, expected_size: int, timeout: float = 30.0) -> None:
@@ -97,6 +161,7 @@ class SharedOffloadRegion:
         *,
         creator_memory_check: Callable[[int], None] | None = None,
         populate_only_on_creator: bool = False,
+        numa_interleave: bool = False,
     ) -> None:
         if populate_only_on_creator and barrier is None:
             raise ValueError("Creator-only population requires a barrier.")
@@ -153,8 +218,11 @@ class SharedOffloadRegion:
             )
 
             if populate_only_on_creator and self._creator:
+                if numa_interleave:
+                    _mbind_interleave(self.mmap_obj, self.total_size_bytes)
                 populate_write_fn = _get_populate_write_fn(self.mmap_obj)
                 populate_write_fn(self.mmap_obj, 0, self.total_size_bytes)
+                _log_numa_placement(self.mmap_path)
         except Exception:
             if self._creator:
                 with contextlib.suppress(FileNotFoundError):
