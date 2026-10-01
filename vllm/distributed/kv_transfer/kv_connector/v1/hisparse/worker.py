@@ -444,6 +444,7 @@ class HiSparseConnectorWorker:
         self._submitted_mirror_layers.clear()
         for handle in self.cache_handles:
             handle.decode_batch = False
+            handle.prestage_followers = False
             handle.host_mirror_required = False
             handle.num_actual_tokens = 0
             handle.num_decode_tokens = 0
