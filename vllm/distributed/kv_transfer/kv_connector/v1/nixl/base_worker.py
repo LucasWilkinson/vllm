@@ -391,11 +391,23 @@ class NixlBaseConnectorWorker:
         n_regions = len(self.block_len_per_layer)
         if n_regions == 0 or self.num_regions == 0:
             return [False] * num_fa_descs
-        nblk = num_fa_descs // self.num_regions
         flags: list[bool] = []
-        for i in range(n_regions):
-            replicated = self._is_region_replicated(i)
-            flags.extend([replicated] * nblk)
+        region_indices = self._transfer_layer_region_indices or range(n_regions)
+        region_blocks = [self.region_num_blocks[i] for i in region_indices]
+        total_blocks = sum(region_blocks)
+        if len(self.region_num_blocks) == n_regions and total_blocks > 0:
+            # Regions may hold different block counts (HiSparse host-resident
+            # regions use hisparse_host_num_blocks); num_fa_descs is their sum
+            # times the block-size ratio, matching _build_fa_local.
+            descs_per_block = num_fa_descs // total_blocks
+            for i, num_blocks in zip(region_indices, region_blocks):
+                replicated = self._is_region_replicated(i)
+                flags.extend([replicated] * (num_blocks * descs_per_block))
+        else:
+            nblk = num_fa_descs // self.num_regions
+            for i in range(n_regions):
+                replicated = self._is_region_replicated(i)
+                flags.extend([replicated] * nblk)
         assert len(flags) == num_fa_descs, (
             f"FA desc flags {len(flags)} != num_fa_descs {num_fa_descs}"
         )
