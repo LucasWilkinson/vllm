@@ -35,6 +35,7 @@ from vllm.model_executor.models.utils import extract_layer_index
 from vllm.models.deepseek_v32.common.kernels import fused_norm_rope, fused_q
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import is_quantized_kv_cache
+from vllm.v1.hisparse.runtime import EARLY_INDEXER as HISPARSE_EARLY_INDEXER
 from vllm.v1.attention.ops.pcp import (
     finalize_mla_pcp_decode,
     maybe_gather_mla_latent_cache_inputs,
@@ -405,6 +406,92 @@ class DeepseekV32Attention(MLAAttention):
             index_k_out=index_k_out,
         )
 
+        # HiSparse leader, all-decode, non-piecewise batch: run the indexer
+        # first and issue residency resolution + host swaps on the copy stream
+        # now, so they overlap q_b_proj, the W_UK bmm, the MLA query
+        # RoPE/quant and the KV write below.
+        early_indexer = (
+            HISPARSE_EARLY_INDEXER
+            and hisparse_cache is not None
+            and has_indexer
+            and not self.use_pcp
+            and layer_attn_metadata is not None
+            and forward_context.cudagraph_runtime_mode != CUDAGraphMode.PIECEWISE
+            and layer_attn_metadata.num_decode_tokens
+            == layer_attn_metadata.num_actual_tokens
+            and layer_attn_metadata.num_actual_tokens > 0
+        )
+        early_index_q_fp8 = early_index_weights = None
+        if early_indexer:
+            index_q = self.indexer.wq_b(q_c)[0].view(
+                -1, self.indexer.n_head, self.indexer.head_dim
+            )
+            # fused_q always also ropes an MLA query; give it a 4-head dummy.
+            dummy_q_pe = q_c.new_zeros((q_c.shape[0], 4, self.qk_rope_head_dim))
+            dummy_ql_nope = q_c.new_zeros(
+                (
+                    q_c.shape[0],
+                    4,
+                    self.kv_lora_rank if prepare_mqa_query else self.qk_nope_head_dim,
+                )
+            )
+            early_index_q_fp8, early_index_weights, _ = fused_q(
+                positions,
+                dummy_q_pe,
+                self.rotary_emb.cos_sin_cache,
+                index_q,
+                self.indexer_rope_emb.cos_sin_cache,
+                dummy_ql_nope,
+                self._q_scale,
+                index_weights,
+                indexer_softmax_scale,
+                indexer_n_head_scale,
+                has_indexer=True,
+                index_rope_interleave=self._index_rope_interleave,
+                quantize_mqa=self._fp8_query and prepare_mqa_query,
+            )
+            self._run_sparse_indexer(
+                q_c, early_index_q_fp8, index_k_out, early_index_weights
+            )
+            self.impl.record_logical_topk_ready()  # type: ignore[attr-defined]
+            self.impl.index_group.issue_decode_swap(  # type: ignore[attr-defined]
+                self.impl.index_group_index,  # type: ignore[attr-defined]
+                layer_attn_metadata,
+            )
+
+        q = self.q_b_proj(q_c)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+        q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+        if prepare_mqa_query:
+            ql_nope = torch.bmm(q_nope.transpose(0, 1), self.W_UK_T).transpose(0, 1)
+        else:
+            ql_nope = q_nope
+
+        if self.indexer is not None and not self.skip_topk and not early_indexer:
+            index_q = self.indexer.wq_b(q_c)[0]
+            index_q = index_q.view(-1, self.indexer.n_head, self.indexer.head_dim)
+        else:
+            index_q = None
+
+        index_q_fp8, index_weights_out, mqa_q = fused_q(
+            positions,
+            q_pe,
+            self.rotary_emb.cos_sin_cache,
+            index_q,
+            self.indexer_rope_emb.cos_sin_cache
+            if has_indexer and not early_indexer
+            else None,
+            ql_nope,
+            self._q_scale,
+            index_weights,
+            indexer_softmax_scale,
+            indexer_n_head_scale,
+            has_indexer=has_indexer and not early_indexer,
+            index_rope_interleave=self._index_rope_interleave,
+            quantize_mqa=self._fp8_query and prepare_mqa_query,
+        )
+        if early_indexer:
+            index_q_fp8, index_weights_out = early_index_q_fp8, early_index_weights
+
         if hisparse_cache is not None and mla_slot is not None:
             assert kv_c_out is not None and k_pe_out is not None
             self.update_kv_cache(
@@ -416,35 +503,6 @@ class DeepseekV32Attention(MLAAttention):
                 self.kv_cache_dtype,
                 self._k_scale,
             )
-
-        q = self.q_b_proj(q_c)[0].view(-1, self.num_local_heads, self.qk_head_dim)
-        q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-        if prepare_mqa_query:
-            ql_nope = torch.bmm(q_nope.transpose(0, 1), self.W_UK_T).transpose(0, 1)
-        else:
-            ql_nope = q_nope
-
-        if self.indexer is not None and not self.skip_topk:
-            index_q = self.indexer.wq_b(q_c)[0]
-            index_q = index_q.view(-1, self.indexer.n_head, self.indexer.head_dim)
-        else:
-            index_q = None
-
-        index_q_fp8, index_weights_out, mqa_q = fused_q(
-            positions,
-            q_pe,
-            self.rotary_emb.cos_sin_cache,
-            index_q,
-            self.indexer_rope_emb.cos_sin_cache if has_indexer else None,
-            ql_nope,
-            self._q_scale,
-            index_weights,
-            indexer_softmax_scale,
-            indexer_n_head_scale,
-            has_indexer=has_indexer,
-            index_rope_interleave=self._index_rope_interleave,
-            quantize_mqa=self._fp8_query and prepare_mqa_query,
-        )
 
         self._sparse_indexer_and_attn(
             positions,
@@ -459,8 +517,53 @@ class DeepseekV32Attention(MLAAttention):
             ql_nope,
             mqa_q,
             output,
+            indexer_done=early_indexer,
         )
         return self.o_proj(output)[0]
+
+    def _run_sparse_indexer(
+        self,
+        q_c: torch.Tensor,
+        index_q_fp8: torch.Tensor | None,
+        index_k: torch.Tensor | None,
+        index_weights_out: torch.Tensor | None,
+    ) -> None:
+        assert index_q_fp8 is not None
+        assert index_weights_out is not None
+        if self.use_pcp:
+            assert index_k is not None
+        sparse_attn_indexer(
+            q_c,
+            self.indexer.k_cache.prefix,
+            self.indexer.k_cache.kv_cache,
+            index_q_fp8,
+            None,
+            index_k,
+            index_weights_out,
+            self.indexer.quant_block_size,
+            self.indexer.scale_fmt,
+            self.indexer.topk_tokens,
+            self.indexer.head_dim,
+            self.indexer.max_model_len,
+            self.indexer.max_total_seq_len,
+            self.topk_indices_buffer,
+            skip_k_cache_insert=not self.use_pcp,
+            use_pcp=self.use_pcp,
+            dense_mha_metadata_layer_name=self._dense_mha_metadata_layer_name,
+            dcp_rank=(
+                self.dcp_manager.group.rank_in_group
+                if self.dcp_manager is not None
+                else 0
+            ),
+            dcp_world_size=(
+                self._vllm_config.parallel_config.decode_context_parallel_size
+            ),
+            cp_kv_cache_interleave_size=(
+                self._vllm_config.parallel_config.cp_kv_cache_interleave_size
+            ),
+            skip_topk_buffer_clear=True,
+            topk_backend=self.indexer.indexer_op.topk_backend,
+        )
 
     @eager_break_during_capture
     def _sparse_indexer_and_attn(
@@ -477,45 +580,12 @@ class DeepseekV32Attention(MLAAttention):
         ql_nope: torch.Tensor,
         mqa_q: torch.Tensor,
         output: torch.Tensor,
+        indexer_done: bool = False,
     ) -> None:
-        if self.indexer is not None and not self.skip_topk:
-            assert index_q_fp8 is not None
-            assert index_weights_out is not None
-            if self.use_pcp:
-                assert index_k is not None
-            sparse_attn_indexer(
-                q_c,
-                self.indexer.k_cache.prefix,
-                self.indexer.k_cache.kv_cache,
-                index_q_fp8,
-                None,
-                index_k,
-                index_weights_out,
-                self.indexer.quant_block_size,
-                self.indexer.scale_fmt,
-                self.indexer.topk_tokens,
-                self.indexer.head_dim,
-                self.indexer.max_model_len,
-                self.indexer.max_total_seq_len,
-                self.topk_indices_buffer,
-                skip_k_cache_insert=not self.use_pcp,
-                use_pcp=self.use_pcp,
-                dense_mha_metadata_layer_name=self._dense_mha_metadata_layer_name,
-                dcp_rank=(
-                    self.dcp_manager.group.rank_in_group
-                    if self.dcp_manager is not None
-                    else 0
-                ),
-                dcp_world_size=(
-                    self._vllm_config.parallel_config.decode_context_parallel_size
-                ),
-                cp_kv_cache_interleave_size=(
-                    self._vllm_config.parallel_config.cp_kv_cache_interleave_size
-                ),
-                skip_topk_buffer_clear=True,
-                topk_backend=self.indexer.indexer_op.topk_backend,
-            )
-        self.impl.record_logical_topk_ready()  # type: ignore[attr-defined]
+        if not indexer_done:
+            if self.indexer is not None and not self.skip_topk:
+                self._run_sparse_indexer(q_c, index_q_fp8, index_k, index_weights_out)
+            self.impl.record_logical_topk_ready()  # type: ignore[attr-defined]
 
         attn_metadata, _, kv_cache, layer_slot_mapping = get_attention_context(
             self.layer_name

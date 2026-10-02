@@ -42,6 +42,10 @@ PRESTAGE_MULTI_TOKEN_DECODE = os.environ.get(
 NUMA_INTERLEAVE_HOST_POOL = os.environ.get(
     "VLLM_HISPARSE_NUMA_INTERLEAVE", "0"
 ) not in ("", "0")
+# Experimental: on a group's leader, run the indexer before the MLA query
+# projections and issue residency resolution + swaps right away, so they
+# overlap q_b_proj, the W_UK bmm, the MLA query RoPE/quant and the KV write.
+EARLY_INDEXER = os.environ.get("VLLM_HISPARSE_EARLY_INDEXER", "0") not in ("", "0")
 
 if TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.index_group import HiSparseMLAIndexGroup
@@ -749,6 +753,9 @@ class HiSparseRuntime:
         self._layer_ready_event: torch.Event | None = None
         self._swap_staged = False
         self._swap_step = 0
+        # Rows of a swap issued ahead of attention (issue_swap_in), consumed
+        # by the next swap_in of this forward.
+        self._early_rows: slice | None = None
         self.is_group_leader = index_group is None
         if index_group is None:
             index_group = HiSparseIndexGroup(
@@ -1079,6 +1086,37 @@ class HiSparseRuntime:
         current_stream().wait_event(self._layer_ready_event)
         self._swap_staged = False
 
+    def issue_swap_in(
+        self,
+        *,
+        resident: HiSparseCacheHandle,
+        req_id_per_token: torch.Tensor,
+        block_table: torch.Tensor,
+        logical_topk_indices: torch.Tensor,
+        block_size: int,
+        num_valid_rows: torch.Tensor,
+    ) -> None:
+        """Leader only: resolve and stage this group's swaps without waiting.
+
+        The next swap_in of this forward reuses the rows and only waits.
+        Valid counts are always produced so either return form is available.
+        """
+        assert self.is_group_leader and self._early_rows is None
+        shared_rows = self._step_rows(logical_topk_indices.shape[0])
+        self._resolve_and_stage_group(
+            resident=resident,
+            req_id_per_token=req_id_per_token,
+            block_table=block_table,
+            logical_topk_indices=logical_topk_indices,
+            block_size=block_size,
+            return_valid_counts=True,
+            shared_rows=shared_rows,
+            attention_indices_out=None,
+            valid_counts_out=None,
+            num_valid_rows=num_valid_rows,
+        )
+        self._early_rows = shared_rows
+
     def swap_in(
         self,
         *,
@@ -1094,13 +1132,23 @@ class HiSparseRuntime:
     ) -> HiSparseTopKResult:
         """Resolve once per group and ensure this layer's rows are available."""
         num_tokens = logical_topk_indices.shape[0]
-        shared_rows = self._step_rows(num_tokens)
         group = self.index_group
         hot = self.hot
         assert hot.block_size == block_size
         assert hot.attention_block_stride == group.leader.hot.attention_block_stride
 
-        if self.is_group_leader:
+        issued_early = self._early_rows is not None
+        if issued_early:
+            shared_rows = self._early_rows
+            self._early_rows = None
+            assert shared_rows.stop - shared_rows.start == num_tokens
+            assert attention_indices_out is None and valid_counts_out is None
+            # A prepare_for_batch between issue and here resets the counter.
+            self._swap_step = shared_rows.stop // num_tokens
+        else:
+            shared_rows = self._step_rows(num_tokens)
+
+        if self.is_group_leader and not issued_early:
             self._resolve_and_stage_group(
                 resident=resident,
                 req_id_per_token=req_id_per_token,
