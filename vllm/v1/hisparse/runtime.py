@@ -45,7 +45,11 @@ NUMA_INTERLEAVE_HOST_POOL = os.environ.get(
 # Experimental: on a group's leader, run the indexer before the MLA query
 # projections and issue residency resolution + swaps right away, so they
 # overlap q_b_proj, the W_UK bmm, the MLA query RoPE/quant and the KV write.
-EARLY_INDEXER = os.environ.get("VLLM_HISPARSE_EARLY_INDEXER", "0") not in ("", "0")
+# Values: "1" (indexer early, swaps issued early, KV write after); any
+# combination of "kvfirst" (KV write stays before the indexer) and "noissue"
+# (swaps issued at attention as before), e.g. "kvfirst,noissue". Diagnostic.
+EARLY_INDEXER_MODE = os.environ.get("VLLM_HISPARSE_EARLY_INDEXER", "0")
+EARLY_INDEXER = EARLY_INDEXER_MODE not in ("", "0")
 
 if TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.index_group import HiSparseMLAIndexGroup

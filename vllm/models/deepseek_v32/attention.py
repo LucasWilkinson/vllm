@@ -36,6 +36,7 @@ from vllm.models.deepseek_v32.common.kernels import fused_norm_rope, fused_q
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import is_quantized_kv_cache
 from vllm.v1.hisparse.runtime import EARLY_INDEXER as HISPARSE_EARLY_INDEXER
+from vllm.v1.hisparse.runtime import EARLY_INDEXER_MODE as HISPARSE_EARLY_MODE
 from vllm.v1.attention.ops.pcp import (
     finalize_mla_pcp_decode,
     maybe_gather_mla_latent_cache_inputs,
@@ -422,6 +423,23 @@ class DeepseekV32Attention(MLAAttention):
             and layer_attn_metadata.num_actual_tokens > 0
         )
         early_index_q_fp8 = early_index_weights = None
+        kv_written = False
+        if (
+            hisparse_cache is not None
+            and mla_slot is not None
+            and (not early_indexer or "kvfirst" in HISPARSE_EARLY_MODE)
+        ):
+            assert kv_c_out is not None and k_pe_out is not None
+            self.update_kv_cache(
+                kv_c_out,
+                k_pe_out,
+                self.kv_cache,
+                mla_slot,
+                layer_attn_metadata,
+                self.kv_cache_dtype,
+                self._k_scale,
+            )
+            kv_written = True
         if early_indexer:
             index_q = self.indexer.wq_b(q_c)[0].view(
                 -1, self.indexer.n_head, self.indexer.head_dim
@@ -454,10 +472,11 @@ class DeepseekV32Attention(MLAAttention):
                 q_c, early_index_q_fp8, index_k_out, early_index_weights
             )
             self.impl.record_logical_topk_ready()  # type: ignore[attr-defined]
-            self.impl.index_group.issue_decode_swap(  # type: ignore[attr-defined]
-                self.impl.index_group_index,  # type: ignore[attr-defined]
-                layer_attn_metadata,
-            )
+            if "noissue" not in HISPARSE_EARLY_MODE:
+                self.impl.index_group.issue_decode_swap(  # type: ignore[attr-defined]
+                    self.impl.index_group_index,  # type: ignore[attr-defined]
+                    layer_attn_metadata,
+                )
 
         q = self.q_b_proj(q_c)[0].view(-1, self.num_local_heads, self.qk_head_dim)
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
@@ -492,7 +511,7 @@ class DeepseekV32Attention(MLAAttention):
         if early_indexer:
             index_q_fp8, index_weights_out = early_index_q_fp8, early_index_weights
 
-        if hisparse_cache is not None and mla_slot is not None:
+        if hisparse_cache is not None and mla_slot is not None and not kv_written:
             assert kv_c_out is not None and k_pe_out is not None
             self.update_kv_cache(
                 kv_c_out,
