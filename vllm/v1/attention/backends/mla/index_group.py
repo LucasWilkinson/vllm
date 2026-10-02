@@ -259,6 +259,32 @@ class HiSparseMLAIndexGroup(SparseMLAIndexGroup):
             num_valid_rows=attn_metadata.query_start_loc[-1:],
         )
 
+    def issue_decode_swap(self, layer_index: int, attn_metadata: Any) -> bool:
+        """Start a leader's residency resolution and swaps for an all-decode
+        batch right after its indexer, without waiting; attention's later
+        convert_logical_to_physical_topk only waits for them."""
+        cache = self.cache(layer_index)
+        runtime = cache.runtime
+        num_tokens = attn_metadata.num_decode_tokens
+        if (
+            not runtime.is_group_leader
+            or num_tokens == 0
+            or num_tokens != attn_metadata.num_actual_tokens
+            or num_tokens > self.physical_topk_indices.shape[0]
+            or in_piecewise_cudagraph()
+        ):
+            return False
+        assert cache.source_block_table is not None
+        runtime.issue_swap_in(
+            resident=cache,
+            req_id_per_token=attn_metadata.req_id_per_token[:num_tokens],
+            block_table=cache.source_block_table,
+            logical_topk_indices=self.logical_topk_indices[:num_tokens],
+            block_size=attn_metadata.block_size,
+            num_valid_rows=attn_metadata.query_start_loc[-1:],
+        )
+        return True
+
     def stage_prefill_rows(
         self, layer_index: int, kv_cache: torch.Tensor, attn_metadata: Any
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
