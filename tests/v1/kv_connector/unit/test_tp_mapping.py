@@ -336,3 +336,17 @@ class TestFaDescReplicatedNonUniformRegions:
     def test_flags_with_block_size_ratio(self):
         worker = self._worker()
         assert worker._fa_desc_replicated(22) == [True] * 8 + [False] * 6 + [True] * 8
+
+
+def test_build_src_split_handles_accepts_tuple_list():
+    """Mixed DRAM/VRAM registration hands the splitter a list of tuples."""
+    plan = _compute_mapping(tp_rank=0, tp_size=1, remote_tp_size=2)
+    worker = _make_mock_worker_for_splits((FullAttentionSpec,))
+    blocks = [(0x2000 + i * 1024, 1024, 0) for i in range(4)]
+    from_list = list(worker._build_local_splits_from_plan(plan, blocks, len(blocks)))
+    from_array = list(
+        worker._build_local_splits_from_plan(
+            plan, np.array(blocks, dtype=np.uint64), len(blocks)
+        )
+    )
+    assert from_list == from_array
