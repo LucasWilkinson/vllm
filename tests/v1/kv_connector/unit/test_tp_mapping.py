@@ -22,7 +22,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.worker import (
     NixlConnectorWorker,
 )
-from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
+from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec, MLAAttentionSpec
 
 # ======================================================================
 # Test fixtures / helpers
@@ -314,3 +314,25 @@ def test_csa_linear_tp_layout_boundary(total_kv_heads, local_tp, remote_tp, comp
     else:
         with pytest.raises(ValueError, match="KV-head sharding boundary"):
             worker._validate_csa_linear_tp_layout(remote_tp)
+
+
+class TestFaDescReplicatedNonUniformRegions:
+    """HiSparse host-resident regions hold a different block count than the
+    GPU-resident ones; replicate flags must follow each region's count."""
+
+    def _worker(self):
+        worker = _make_mock_worker_for_splits((MLAAttentionSpec,))
+        worker.block_len_per_layer = [656, 132, 656]
+        worker.num_regions = 3
+        worker._region_is_mla = [True, False, True]
+        worker.region_num_blocks = [4, 3, 4]
+        worker._transfer_layer_region_indices = []
+        return worker
+
+    def test_flags_follow_region_block_counts(self):
+        worker = self._worker()
+        assert worker._fa_desc_replicated(11) == [True] * 4 + [False] * 3 + [True] * 4
+
+    def test_flags_with_block_size_ratio(self):
+        worker = self._worker()
+        assert worker._fa_desc_replicated(22) == [True] * 8 + [False] * 6 + [True] * 8
