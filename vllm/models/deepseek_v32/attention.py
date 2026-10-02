@@ -421,6 +421,10 @@ class DeepseekV32Attention(MLAAttention):
             and layer_attn_metadata.num_decode_tokens
             == layer_attn_metadata.num_actual_tokens
             and layer_attn_metadata.num_actual_tokens > 0
+            and not ("nodraft" in HISPARSE_EARLY_MODE and hisparse_cache.draft_layer)
+            and not (
+                "draftonly" in HISPARSE_EARLY_MODE and not hisparse_cache.draft_layer
+            )
         )
         early_index_q_fp8 = early_index_weights = None
         kv_written = False
