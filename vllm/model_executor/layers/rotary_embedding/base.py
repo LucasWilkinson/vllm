@@ -119,26 +119,24 @@ class RotaryEmbeddingBase(CustomOp):
         return cache
 
     def _match_cos_sin_cache_dtype(self, query: torch.Tensor) -> torch.Tensor:
+        return self._cos_sin_cache_as(query.dtype, query.device)
+
+    def _cos_sin_cache_as(
+        self, dtype: torch.dtype, device: torch.device
+    ) -> torch.Tensor:
         # __setattr__ in nn.Module (called by `self.cos_sin_cache = ...`)
         # is expensive, so avoid calling it if possible
         cos_sin_cache = self.cos_sin_cache
-        if (
-            cos_sin_cache.device == query.device
-            and self.cos_sin_cache.dtype == query.dtype
-        ):
+        if cos_sin_cache.device == device and self.cos_sin_cache.dtype == dtype:
             return cos_sin_cache
 
         # Reuse precomputed bf16 cache in the AITER compile path.
-        if (
-            self.use_aiter
-            and torch.compiler.is_compiling()
-            and query.dtype == torch.bfloat16
-        ):
+        if self.use_aiter and torch.compiler.is_compiling() and dtype == torch.bfloat16:
             cache_bf16 = getattr(self, "cos_sin_cache_bf16", None)
-            if cache_bf16 is not None and cache_bf16.device == query.device:
+            if cache_bf16 is not None and cache_bf16.device == device:
                 return cache_bf16
 
-        cos_sin_cache = cos_sin_cache.to(query.device, dtype=query.dtype)
+        cos_sin_cache = cos_sin_cache.to(device, dtype=dtype)
         # Avoid mutating buffers during torch.compile (cudagraph) tracing.
         if torch.compiler.is_compiling():
             return cos_sin_cache
@@ -147,7 +145,7 @@ class RotaryEmbeddingBase(CustomOp):
         return cos_sin_cache
 
     def get_rotation(
-        self, positions: torch.Tensor, query: torch.Tensor
+        self, positions: torch.Tensor, dtype: torch.dtype
     ) -> RopeRotation | None:
         """Describe this layer's rotation for `positions`, or return None if it
         is not a plain per-token cos/sin rotation."""
@@ -181,12 +179,14 @@ class RotaryEmbedding(RotaryEmbeddingBase):
         )
 
     def get_rotation(
-        self, positions: torch.Tensor, query: torch.Tensor
+        self, positions: torch.Tensor, dtype: torch.dtype
     ) -> RopeRotation | None:
         if positions.dim() != 1:
             return None
         return RopeRotation(
-            self._match_cos_sin_cache_dtype(query), positions, self.is_neox_style
+            self._cos_sin_cache_as(dtype, positions.device),
+            positions,
+            self.is_neox_style,
         )
 
     @staticmethod

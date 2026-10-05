@@ -448,6 +448,7 @@ class Attention(nn.Module, AttentionLayerBase):
         self._fuse_rope_kvcache = bool(
             pass_config.fuse_rope_kvcache
             and kv_sharing_target_layer_name is None
+            and self.head_size_v == self.head_size
             and self.kv_cache_torch_dtype == self.dtype
             and not pass_config.fuse_attn_quant
             and self.impl.fused_rope_kvcache_q_out_supported()
@@ -627,7 +628,7 @@ class Attention(nn.Module, AttentionLayerBase):
             or query.shape[0] <= self.rope_kvcache_fusion_max_token_num
         ):
             return None
-        return rotary_emb.get_rotation(positions, query)
+        return rotary_emb.get_rotation(positions, query.dtype)
 
     def _fused_rope_kv_cache_update(
         self,

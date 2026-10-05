@@ -11,16 +11,14 @@ from .mrope import MRotaryEmbedding
 class Ernie4_5_VLRotaryEmbedding(MRotaryEmbedding):
     """3D rotary positional embedding. 3D is t:time h:height w:width."""
 
-    def get_rotation(
-        self, positions: torch.Tensor, query: torch.Tensor
-    ) -> RopeRotation:
-        cos_sin = self._match_cos_sin_cache_dtype(query)[positions]
+    def get_rotation(self, positions: torch.Tensor, dtype: torch.dtype) -> RopeRotation:
+        cos_sin = self._cos_sin_cache_as(dtype, positions.device)[positions]
         if positions.ndim == 2:
             assert self.mrope_section
             section_h, section_w, section_t = self.mrope_section
             assert section_h == section_w
             # Split cos and sin according to [h w h w h w h w... t t t...]
-            cos_sin = cos_sin.unflatten(-1, (2, -1))
+            cos_sin = cos_sin.view(*cos_sin.shape[:-1], 2, -1)
             hw = torch.stack(
                 [
                     cos_sin[1, ..., : section_h + section_w : 2],
@@ -42,7 +40,7 @@ class Ernie4_5_VLRotaryEmbedding(MRotaryEmbedding):
         assert key is not None
 
         num_tokens = positions.shape[-1]
-        cos, sin = self.get_rotation(positions, query).cos_sin.chunk(2, dim=-1)
+        cos, sin = self.get_rotation(positions, query.dtype).cos_sin.chunk(2, dim=-1)
 
         query_shape = query.shape
         query = query.view(num_tokens, -1, self.head_size)

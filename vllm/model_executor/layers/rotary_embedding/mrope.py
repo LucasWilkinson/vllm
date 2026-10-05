@@ -371,14 +371,12 @@ class MRotaryEmbedding(RotaryEmbeddingBase):
             return super()._compute_cos_sin_cache()
         return YaRNScalingRotaryEmbedding._compute_cos_sin_cache(self)
 
-    def get_rotation(
-        self, positions: torch.Tensor, query: torch.Tensor
-    ) -> RopeRotation:
-        cos_sin = self._match_cos_sin_cache_dtype(query)[positions]
+    def get_rotation(self, positions: torch.Tensor, dtype: torch.dtype) -> RopeRotation:
+        cos_sin = self._cos_sin_cache_as(dtype, positions.device)[positions]
         if positions.ndim == 2:
             assert self.mrope_section
             # Select T/H/W sections from their position rows, for cos and sin.
-            cos_sin = cos_sin.unflatten(-1, (2, -1))
+            cos_sin = cos_sin.view(*cos_sin.shape[:-1], 2, -1)
             if self.mrope_interleaved:
                 cos_sin = apply_interleaved_rope(cos_sin, self.mrope_section)
             else:
@@ -414,7 +412,7 @@ class MRotaryEmbedding(RotaryEmbeddingBase):
         assert key is not None
 
         num_tokens = positions.shape[-1]
-        cos, sin = self.get_rotation(positions, query).cos_sin.chunk(2, dim=-1)
+        cos, sin = self.get_rotation(positions, query.dtype).cos_sin.chunk(2, dim=-1)
 
         query_shape = query.shape
         query = query.view(num_tokens, -1, self.head_size)

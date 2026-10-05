@@ -185,7 +185,7 @@ class FourierRotaryEmbedding(RotaryEmbedding):
         return query, key
 
     def get_rotation(
-        self, positions: torch.Tensor, query: torch.Tensor
+        self, positions: torch.Tensor, dtype: torch.dtype
     ) -> RopeRotation | None:
         # Per-KV-head angles and a lazily built cache.
         return None
