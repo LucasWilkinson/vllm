@@ -21,6 +21,7 @@
 
 import torch
 
+from .base import RopeRotation
 from .mrope import MRotaryEmbedding
 
 
@@ -98,11 +99,11 @@ class MRotaryEmbeddingInterleaved(MRotaryEmbedding):
         )
         return cos_sin, torch.arange(cos_sin.shape[0], device=positions.device)
 
-    def _select_cos_sin(
+    def get_rotation(
         self, positions: torch.Tensor, query: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> RopeRotation | None:
         cos_sin, _ = self._rebuild_pos_emb(positions)
-        return cos_sin.chunk(2, dim=-1)
+        return RopeRotation(cos_sin.to(query.dtype), None, self.is_neox_style)
 
     def forward(
         self,

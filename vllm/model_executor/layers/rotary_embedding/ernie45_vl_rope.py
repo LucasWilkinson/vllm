@@ -4,32 +4,33 @@
 
 import torch
 
+from .base import RopeRotation
 from .mrope import MRotaryEmbedding
 
 
 class Ernie4_5_VLRotaryEmbedding(MRotaryEmbedding):
     """3D rotary positional embedding. 3D is t:time h:height w:width."""
 
-    def _select_cos_sin(
+    def get_rotation(
         self, positions: torch.Tensor, query: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        cos, sin = self.cos_sin_cache[positions].chunk(2, dim=-1)
-        if positions.ndim == 1:
-            return cos, sin
-
-        assert self.mrope_section
-        section_h, section_w, section_t = self.mrope_section
-        assert section_h == section_w
-
-        def select(x: torch.Tensor) -> torch.Tensor:
-            # Split according to [h w h w h w h w... t t t...]
-            x_t = x[0, :, -section_t:]
-            x_h = x[1, :, : section_h + section_w : 2]
-            x_w = x[2, :, 1 : section_h + section_w : 2]
-            x_hw = torch.stack([x_h, x_w], dim=-1).flatten(-2)
-            return torch.cat([x_hw, x_t], dim=-1)
-
-        return select(cos), select(sin)
+    ) -> RopeRotation | None:
+        cos_sin = self._match_cos_sin_cache_dtype(query)[positions]
+        if positions.ndim == 2:
+            assert self.mrope_section
+            section_h, section_w, section_t = self.mrope_section
+            assert section_h == section_w
+            # Split cos and sin according to [h w h w h w h w... t t t...]
+            cos_sin = cos_sin.unflatten(-1, (2, -1))
+            hw = torch.stack(
+                [
+                    cos_sin[1, ..., : section_h + section_w : 2],
+                    cos_sin[2, ..., 1 : section_h + section_w : 2],
+                ],
+                dim=-1,
+            ).flatten(-2)
+            cos_sin = torch.cat([hw, cos_sin[0, ..., -section_t:]], dim=-1)
+            cos_sin = cos_sin.flatten(-2)
+        return RopeRotation(cos_sin, None, self.is_neox_style)
 
     def forward_native(  # type: ignore[override]
         self,
@@ -41,7 +42,35 @@ class Ernie4_5_VLRotaryEmbedding(MRotaryEmbedding):
         assert key is not None
 
         num_tokens = positions.shape[-1]
-        cos, sin = self._select_cos_sin(positions, query)
+        cos_sin = self.cos_sin_cache[positions]
+        cos, sin = cos_sin.chunk(2, dim=-1)
+        if positions.ndim == 2:
+            assert self.mrope_section
+
+            section_h = self.mrope_section[0]  # 22
+            section_w = self.mrope_section[1]  # 22
+            section_t = self.mrope_section[2]  # 20
+            assert section_h == section_w
+            # Split according to [h w h w h w h w... t t t...]
+            section_cos_t = cos[..., -section_t:]
+            section_cos_h = cos[..., : section_h + section_w : 2]
+            section_cos_w = cos[..., 1 : section_h + section_w : 2]
+
+            cos_t, cos_h, cos_w = section_cos_t[0], section_cos_h[1], section_cos_w[2]
+            cos_hw = torch.stack([cos_h, cos_w], dim=-1).reshape(
+                cos_h.shape[:-1] + (cos_h.shape[-1] * 2,)
+            )
+            cos = torch.cat([cos_hw, cos_t], dim=-1)
+
+            section_sin_t = sin[..., -section_t:]
+            section_sin_h = sin[..., : section_h + section_w : 2]
+            section_sin_w = sin[..., 1 : section_h + section_w : 2]
+
+            sin_t, sin_h, sin_w = section_sin_t[0], section_sin_h[1], section_sin_w[2]
+            sin_hw = torch.stack([sin_h, sin_w], dim=-1).reshape(
+                sin_h.shape[:-1] + (sin_h.shape[-1] * 2,)
+            )
+            sin = torch.cat([sin_hw, sin_t], dim=-1)
 
         query_shape = query.shape
         query = query.view(num_tokens, -1, self.head_size)
