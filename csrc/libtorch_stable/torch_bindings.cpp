@@ -1057,7 +1057,7 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C_cache_ops, ops) {
       "                     Tensor key,"
       "                     Tensor value,"
       "                     Tensor! query_out,"
-      "                     Tensor positions,"
+      "                     Tensor? positions,"
       "                     Tensor cos_sin_cache,"
       "                     bool is_neox,"
       "                     Tensor! key_cache,"

@@ -9,7 +9,7 @@ from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 
-from .base import RotaryEmbeddingBase
+from .base import RopeRotation, RotaryEmbeddingBase
 from .yarn_scaling_rope import YaRNScalingRotaryEmbedding, yarn_get_mscale
 
 
@@ -371,6 +371,35 @@ class MRotaryEmbedding(RotaryEmbeddingBase):
             return super()._compute_cos_sin_cache()
         return YaRNScalingRotaryEmbedding._compute_cos_sin_cache(self)
 
+    def _select_cos_sin(
+        self, positions: torch.Tensor, query: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Per-token cos/sin, taking each T/H/W section from its position row."""
+        cos_sin = self._match_cos_sin_cache_dtype(query)[positions]
+        cos, sin = cos_sin.chunk(2, dim=-1)
+        if positions.ndim == 2:
+            assert self.mrope_section
+            if self.mrope_interleaved:
+                cos = apply_interleaved_rope(cos, self.mrope_section)
+                sin = apply_interleaved_rope(sin, self.mrope_section)
+            else:
+                cos = torch.cat(
+                    [m[i] for i, m in enumerate(cos.split(self.mrope_section, dim=-1))],
+                    dim=-1,
+                )
+                sin = torch.cat(
+                    [m[i] for i, m in enumerate(sin.split(self.mrope_section, dim=-1))],
+                    dim=-1,
+                )
+        return cos, sin
+
+    def get_rotation(
+        self, positions: torch.Tensor, query: torch.Tensor
+    ) -> RopeRotation | None:
+        cos, sin = self._select_cos_sin(positions, query)
+        cos_sin = torch.cat((cos, sin), dim=-1).to(query.dtype)
+        return RopeRotation(cos_sin, None, self.is_neox_style)
+
     def forward_native(
         self,
         positions: torch.Tensor,
@@ -392,24 +421,8 @@ class MRotaryEmbedding(RotaryEmbeddingBase):
         assert positions.ndim == 1 or positions.ndim == 2
         assert key is not None
 
-        cos_sin_cache = self._match_cos_sin_cache_dtype(query)
         num_tokens = positions.shape[-1]
-        cos_sin = cos_sin_cache[positions]
-        cos, sin = cos_sin.chunk(2, dim=-1)
-        if positions.ndim == 2:
-            assert self.mrope_section
-            if self.mrope_interleaved:
-                cos = apply_interleaved_rope(cos, self.mrope_section)
-                sin = apply_interleaved_rope(sin, self.mrope_section)
-            else:
-                cos = torch.cat(
-                    [m[i] for i, m in enumerate(cos.split(self.mrope_section, dim=-1))],
-                    dim=-1,
-                )
-                sin = torch.cat(
-                    [m[i] for i, m in enumerate(sin.split(self.mrope_section, dim=-1))],
-                    dim=-1,
-                )
+        cos, sin = self._select_cos_sin(positions, query)
 
         query_shape = query.shape
         query = query.view(num_tokens, -1, self.head_size)

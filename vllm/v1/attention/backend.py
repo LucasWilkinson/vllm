@@ -1049,7 +1049,7 @@ class AttentionImpl(AttentionImplBase[T], Generic[T]):
         key: torch.Tensor,
         value: torch.Tensor,
         query_out: torch.Tensor,
-        positions: torch.Tensor,
+        positions: torch.Tensor | None,
         cos_sin_cache: torch.Tensor,
         is_neox: bool,
         kv_cache: torch.Tensor,
@@ -1057,6 +1057,8 @@ class AttentionImpl(AttentionImplBase[T], Generic[T]):
     ) -> None:
         """Write rotated Q and update K/V cache without mutating inputs.
 
+        Token ``i`` uses row ``positions[i]`` of ``cos_sin_cache``, or row
+        ``i`` when ``positions`` is None (see ``RopeRotation``).
         Implementations must write rotated K directly to cache; materializing
         K would defeat this interface's ownership boundary. ``query_out`` is a
         fresh contiguous buffer owned by the compiled model graph.

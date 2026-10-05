@@ -9,7 +9,7 @@ from vllm.distributed import (
     get_tensor_model_parallel_world_size,
 )
 
-from .base import RotaryEmbedding
+from .base import RopeRotation, RotaryEmbedding
 from .common import rotate_neox
 
 
@@ -183,6 +183,12 @@ class FourierRotaryEmbedding(RotaryEmbedding):
             key = key.view(key_shape)
 
         return query, key
+
+    def get_rotation(
+        self, positions: torch.Tensor, query: torch.Tensor
+    ) -> RopeRotation | None:
+        # Per-KV-head angles and a lazily built cache.
+        return None
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         """Load fope weights."""

@@ -98,6 +98,12 @@ class MRotaryEmbeddingInterleaved(MRotaryEmbedding):
         )
         return cos_sin, torch.arange(cos_sin.shape[0], device=positions.device)
 
+    def _select_cos_sin(
+        self, positions: torch.Tensor, query: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        cos_sin, _ = self._rebuild_pos_emb(positions)
+        return cos_sin.chunk(2, dim=-1)
+
     def forward(
         self,
         positions: torch.Tensor,

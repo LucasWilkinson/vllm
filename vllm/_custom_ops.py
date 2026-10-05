@@ -2826,7 +2826,7 @@ def fused_rope_and_reshape_cache_flash_q_out(
     key: torch.Tensor,
     value: torch.Tensor,
     query_out: torch.Tensor,
-    positions: torch.Tensor,
+    positions: torch.Tensor | None,
     cos_sin_cache: torch.Tensor,
     is_neox: bool,
     key_cache: torch.Tensor,

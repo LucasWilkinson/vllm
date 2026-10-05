@@ -734,7 +734,7 @@ void concat_and_cache_mla_rope_fused(
 void fused_rope_and_reshape_cache_flash_q_out(
     const torch::stable::Tensor& query, const torch::stable::Tensor& key,
     const torch::stable::Tensor& value, torch::stable::Tensor& query_out,
-    const torch::stable::Tensor& positions,
+    const std::optional<torch::stable::Tensor>& positions,
     const torch::stable::Tensor& cos_sin_cache, bool is_neox,
     torch::stable::Tensor& key_cache, torch::stable::Tensor& value_cache,
     const torch::stable::Tensor& slot_mapping);

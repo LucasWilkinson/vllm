@@ -17,15 +17,17 @@ namespace vllm {
 // the scheduling overhead of separate per-head tasks at small decode shapes.
 template <typename qk_t, bool IS_NEOX, bool VECTORIZE_VALUE>
 __global__ void fused_rope_and_reshape_cache_flash_q_out_kernel(
-    const int64_t* __restrict__ positions,  // [num_padded_tokens]
-    const qk_t* __restrict__ query,         // [num_padded_tokens, num_q_heads,
-                                            // head_size]
-    const qk_t* __restrict__ key,           // [num_padded_tokens, num_kv_heads,
-                                            // head_size]
-    const qk_t* __restrict__ value,         // [num_padded_tokens, num_kv_heads,
-                                            // head_size]
-    qk_t* __restrict__ query_out,  // contiguous, same logical shape as query
-    const qk_t* __restrict__ cos_sin_cache,  // [max_position, rot_dim]
+    // [num_padded_tokens], or nullptr to index cos_sin_cache by token
+    const int64_t* __restrict__ positions,
+    const qk_t* __restrict__ query,  // [num_padded_tokens, num_q_heads,
+                                     // head_size]
+    const qk_t* __restrict__ key,    // [num_padded_tokens, num_kv_heads,
+                                     // head_size]
+    const qk_t* __restrict__ value,  // [num_padded_tokens, num_kv_heads,
+                                     // head_size]
+    qk_t* __restrict__ query_out,    // contiguous, same logical shape as query
+    const qk_t* __restrict__ cos_sin_cache,  // [max_position or tokens,
+                                             // rot_dim]
     qk_t* __restrict__ key_cache,    // [num_blocks, block_size, num_kv_heads,
                                      // head_size]
     qk_t* __restrict__ value_cache,  // same logical shape
@@ -44,7 +46,7 @@ __global__ void fused_rope_and_reshape_cache_flash_q_out_kernel(
   if (token_idx >= num_rope_tokens) {
     return;
   }
-  const int64_t pos = positions[token_idx];
+  const int64_t pos = positions ? positions[token_idx] : token_idx;
   const qk_t* cos_sin_ptr = cos_sin_cache + pos * cos_sin_stride_token;
   const int embed_dim = rot_dim / 2;
 
@@ -173,9 +175,8 @@ __global__ void fused_rope_and_reshape_cache_flash_q_out_kernel(
           using qk_t = scalar_t;                                              \
           vllm::fused_rope_and_reshape_cache_flash_q_out_kernel<              \
               qk_t, IS_NEOX, VECTORIZE_VALUE><<<grid, block, 0, stream>>>(    \
-              positions.const_data_ptr<int64_t>(),                            \
-              query.const_data_ptr<qk_t>(), key.const_data_ptr<qk_t>(),       \
-              value.const_data_ptr<qk_t>(),                                   \
+              positions_ptr, query.const_data_ptr<qk_t>(),                    \
+              key.const_data_ptr<qk_t>(), value.const_data_ptr<qk_t>(),       \
               query_out.mutable_data_ptr<qk_t>(),                             \
               cos_sin_cache.const_data_ptr<qk_t>(),                           \
               key_cache.mutable_data_ptr<qk_t>(),                             \
@@ -197,15 +198,14 @@ __global__ void fused_rope_and_reshape_cache_flash_q_out_kernel(
 void fused_rope_and_reshape_cache_flash_q_out(
     const torch::stable::Tensor& query, const torch::stable::Tensor& key,
     const torch::stable::Tensor& value, torch::stable::Tensor& query_out,
-    const torch::stable::Tensor& positions,
+    const std::optional<torch::stable::Tensor>& positions,
     const torch::stable::Tensor& cos_sin_cache, bool is_neox,
     torch::stable::Tensor& key_cache, torch::stable::Tensor& value_cache,
     const torch::stable::Tensor& slot_mapping) {
   STD_TORCH_CHECK(query.dim() == 3 && key.dim() == 3 && value.dim() == 3 &&
                       query_out.dim() == 3,
                   "query, key, value, and query_out must be 3D tensors");
-  STD_TORCH_CHECK(positions.dim() == 1 && slot_mapping.dim() == 1,
-                  "positions and slot_mapping must be 1D tensors");
+  STD_TORCH_CHECK(slot_mapping.dim() == 1, "slot_mapping must be a 1D tensor");
   STD_TORCH_CHECK(cos_sin_cache.dim() == 2,
                   "cos_sin_cache must be a 2D tensor");
 
@@ -236,9 +236,9 @@ void fused_rope_and_reshape_cache_flash_q_out(
   const auto device = query.device();
   STD_TORCH_CHECK(
       key.device() == device && value.device() == device &&
-          query_out.device() == device && positions.device() == device &&
-          cos_sin_cache.device() == device && key_cache.device() == device &&
-          value_cache.device() == device && slot_mapping.device() == device,
+          query_out.device() == device && cos_sin_cache.device() == device &&
+          key_cache.device() == device && value_cache.device() == device &&
+          slot_mapping.device() == device,
       "all inputs and outputs must be on the same device");
 
   STD_TORCH_CHECK(query.stride(2) == 1);
@@ -248,10 +248,19 @@ void fused_rope_and_reshape_cache_flash_q_out(
   STD_TORCH_CHECK(key.stride(0) > 0 && key.stride(1) > 0);
   STD_TORCH_CHECK(value.stride(0) > 0 && value.stride(1) > 0);
 
-  STD_TORCH_CHECK(positions.scalar_type() ==
-                  torch::headeronly::ScalarType::Long);
-  STD_TORCH_CHECK(positions.size(0) == num_rope_tokens);
-  STD_TORCH_CHECK(positions.stride(0) == 1);
+  const int64_t* positions_ptr = nullptr;
+  if (positions.has_value()) {
+    STD_TORCH_CHECK(positions->dim() == 1, "positions must be a 1D tensor");
+    STD_TORCH_CHECK(positions->device() == device);
+    STD_TORCH_CHECK(positions->scalar_type() ==
+                    torch::headeronly::ScalarType::Long);
+    STD_TORCH_CHECK(positions->size(0) == num_rope_tokens);
+    STD_TORCH_CHECK(positions->stride(0) == 1);
+    positions_ptr = positions->const_data_ptr<int64_t>();
+  } else {
+    STD_TORCH_CHECK(cos_sin_cache.size(0) >= num_rope_tokens,
+                    "per-token cos_sin_cache needs a row per token");
+  }
   STD_TORCH_CHECK(slot_mapping.scalar_type() ==
                   torch::headeronly::ScalarType::Long);
   STD_TORCH_CHECK(slot_mapping.stride(0) == 1);

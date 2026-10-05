@@ -256,6 +256,11 @@ class BailingMRotaryEmbedding(MRotaryEmbedding):
             mrope_section=mrope_section,
         )
 
+    def _select_cos_sin(
+        self, positions: torch.Tensor, query: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.select_cos_sin(positions, self._match_cos_sin_cache_dtype(query))
+
     def select_cos_sin(
         self,
         positions: torch.Tensor,

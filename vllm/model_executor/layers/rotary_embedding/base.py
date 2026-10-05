@@ -2,12 +2,28 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Rotary Positional Embeddings Base Class."""
 
+from dataclasses import dataclass
+
 import torch
 
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.model_executor.custom_op import CustomOp
 
 from .common import ApplyRotaryEmb
+
+
+@dataclass
+class RopeRotation:
+    """A RoPE rotation expressed as data, so fused kernels can apply it.
+
+    Token ``i`` is rotated by row ``positions[i]`` of ``cos_sin``, or by row
+    ``i`` when ``positions`` is None. Each row is ``[cos | sin]`` over
+    ``rotary_dim // 2`` pairs; dims past ``rotary_dim`` pass through.
+    """
+
+    cos_sin: torch.Tensor
+    positions: torch.Tensor | None
+    is_neox: bool
 
 
 # --8<-- [start:rotary_embedding]
@@ -130,6 +146,13 @@ class RotaryEmbeddingBase(CustomOp):
         self.cos_sin_cache = cos_sin_cache
         return cos_sin_cache
 
+    def get_rotation(
+        self, positions: torch.Tensor, query: torch.Tensor
+    ) -> RopeRotation | None:
+        """Describe this layer's rotation for `positions`, or return None if it
+        is not a plain per-token cos/sin rotation."""
+        return None
+
     def get_cos_sin(self, seqlen: int) -> tuple[torch.Tensor, torch.Tensor]:
         cos_sin = self.cos_sin_cache[:seqlen]
         cos, sin = cos_sin.chunk(2, dim=-1)
@@ -155,6 +178,15 @@ class RotaryEmbedding(RotaryEmbeddingBase):
             is_neox_style=is_neox_style,
             dtype=dtype,
             init_cache=init_cache,
+        )
+
+    def get_rotation(
+        self, positions: torch.Tensor, query: torch.Tensor
+    ) -> RopeRotation | None:
+        if positions.dim() != 1:
+            return None
+        return RopeRotation(
+            self._match_cos_sin_cache_dtype(query), positions, self.is_neox_style
         )
 
     @staticmethod
