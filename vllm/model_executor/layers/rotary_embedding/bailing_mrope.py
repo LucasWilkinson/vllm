@@ -258,10 +258,9 @@ class BailingMRotaryEmbedding(MRotaryEmbedding):
         )
 
     def get_rotation(self, positions: torch.Tensor, dtype: torch.dtype) -> RopeRotation:
-        cos, sin = self.select_cos_sin(
-            positions, self._cos_sin_cache_as(dtype, positions.device)
-        )
-        return RopeRotation(torch.cat((cos, sin), dim=-1), None, self.is_neox_style)
+        cache = self._cos_sin_cache_as(dtype, positions.device)
+        cos_sin = torch.cat(self.select_cos_sin(positions, cache), dim=-1)
+        return RopeRotation(None, cos_sin, self.is_neox_style)
 
     def select_cos_sin(
         self,

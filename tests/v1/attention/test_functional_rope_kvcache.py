@@ -205,11 +205,14 @@ def test_mrope_rotation_matches_unfused_forward(
     query = torch.randn(num_tokens, 4 * 64)
     key = torch.randn(num_tokens, 2 * 64)
 
-    rotation = rotary_emb.get_rotation(positions, query.dtype)
-    assert rotation is not None and rotation.positions is None
-    assert rotation.is_neox is is_neox
+    rope_positions, cos_sin, rope_is_neox = rotary_emb.get_rotation(
+        positions, query.dtype
+    )
+    assert rope_is_neox is is_neox
+    if rope_positions is None:
+        rope_positions = torch.arange(num_tokens)
     actual = RotaryEmbedding.forward_static(
-        torch.arange(num_tokens), query, key, 64, 64, rotation.cos_sin, is_neox
+        rope_positions, query, key, 64, 64, cos_sin, is_neox
     )
     forward = (
         rotary_emb.forward

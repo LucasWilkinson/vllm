@@ -19,16 +19,11 @@ class Ernie4_5_VLRotaryEmbedding(MRotaryEmbedding):
             assert section_h == section_w
             # Split cos and sin according to [h w h w h w h w... t t t...]
             cos_sin = cos_sin.view(*cos_sin.shape[:-1], 2, -1)
-            hw = torch.stack(
-                [
-                    cos_sin[1, ..., : section_h + section_w : 2],
-                    cos_sin[2, ..., 1 : section_h + section_w : 2],
-                ],
-                dim=-1,
-            ).flatten(-2)
-            cos_sin = torch.cat([hw, cos_sin[0, ..., -section_t:]], dim=-1)
-            cos_sin = cos_sin.flatten(-2)
-        return RopeRotation(cos_sin, None, self.is_neox_style)
+            hw_end = section_h + section_w
+            h, w = cos_sin[1, ..., :hw_end:2], cos_sin[2, ..., 1:hw_end:2]
+            hw = torch.stack([h, w], dim=-1).flatten(-2)
+            cos_sin = torch.cat([hw, cos_sin[0, ..., -section_t:]], dim=-1).flatten(-2)
+        return RopeRotation(None, cos_sin, self.is_neox_style)
 
     def forward_native(  # type: ignore[override]
         self,

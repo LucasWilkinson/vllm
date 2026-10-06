@@ -380,15 +380,10 @@ class MRotaryEmbedding(RotaryEmbeddingBase):
             if self.mrope_interleaved:
                 cos_sin = apply_interleaved_rope(cos_sin, self.mrope_section)
             else:
-                cos_sin = torch.cat(
-                    [
-                        m[i]
-                        for i, m in enumerate(cos_sin.split(self.mrope_section, dim=-1))
-                    ],
-                    dim=-1,
-                )
+                sections = cos_sin.split(self.mrope_section, dim=-1)
+                cos_sin = torch.cat([m[i] for i, m in enumerate(sections)], dim=-1)
             cos_sin = cos_sin.flatten(-2)
-        return RopeRotation(cos_sin, None, self.is_neox_style)
+        return RopeRotation(None, cos_sin, self.is_neox_style)
 
     def forward_native(
         self,

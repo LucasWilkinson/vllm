@@ -1563,7 +1563,7 @@ class FlashAttentionImpl(AttentionImpl):
         key: torch.Tensor,
         value: torch.Tensor,
         query_out: torch.Tensor,
-        positions: torch.Tensor | None,
+        positions: torch.Tensor,
         cos_sin_cache: torch.Tensor,
         is_neox: bool,
         kv_cache: torch.Tensor,

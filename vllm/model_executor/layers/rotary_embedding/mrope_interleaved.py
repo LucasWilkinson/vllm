@@ -100,8 +100,8 @@ class MRotaryEmbeddingInterleaved(MRotaryEmbedding):
         return cos_sin, torch.arange(cos_sin.shape[0], device=positions.device)
 
     def get_rotation(self, positions: torch.Tensor, dtype: torch.dtype) -> RopeRotation:
-        cos_sin, _ = self._rebuild_pos_emb(positions)
-        return RopeRotation(cos_sin.to(dtype), None, self.is_neox_style)
+        cos_sin, token_idx = self._rebuild_pos_emb(positions)
+        return RopeRotation(token_idx, cos_sin.to(dtype), self.is_neox_style)
 
     def forward(
         self,

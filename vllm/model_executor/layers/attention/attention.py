@@ -537,9 +537,19 @@ class Attention(nn.Module, AttentionLayerBase):
             if rotation is None:
                 query, key = rotary_emb(positions, query, key)
             else:
-                query = self._fused_rope_kv_cache_update(
-                    query, key, value, rotation, encoded
+                rope_positions, cos_sin, is_neox = rotation
+                if rope_positions is None:
+                    rope_positions = torch.arange(len(cos_sin), device=cos_sin.device)
+                q = query.view(-1, self.num_heads, self.head_size)
+                query = torch.empty_like(q, memory_format=torch.contiguous_format)
+                key = key.view(-1, self.num_kv_heads, self.head_size)
+                value = value.view(-1, self.num_kv_heads, self.head_size_v)
+                op = (
+                    fused_rope_and_unified_kv_cache_update_q_out
+                    if self.use_direct_call
+                    else torch.ops.vllm.fused_rope_and_unified_kv_cache_update_q_out
                 )
+                op(q, key, value, query, rope_positions, cos_sin, is_neox, encoded)
                 key = value = None
 
         if output_dtype is None:
@@ -630,43 +640,13 @@ class Attention(nn.Module, AttentionLayerBase):
             return None
         return rotary_emb.get_rotation(positions, query.dtype)
 
-    def _fused_rope_kv_cache_update(
-        self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        rotation: "RopeRotation",
-        layer_name: LayerNameType,
-    ) -> torch.Tensor:
-        """Write rotated K and V to the cache and return rotated Q."""
-        query = query.view(-1, self.num_heads, self.head_size)
-        key = key.view(-1, self.num_kv_heads, self.head_size)
-        value = value.view(-1, self.num_kv_heads, self.head_size_v)
-        query_out = torch.empty_like(query, memory_format=torch.contiguous_format)
-        op = (
-            fused_rope_and_unified_kv_cache_update_q_out
-            if self.use_direct_call
-            else torch.ops.vllm.fused_rope_and_unified_kv_cache_update_q_out
-        )
-        op(
-            query,
-            key,
-            value,
-            query_out,
-            rotation.positions,
-            rotation.cos_sin,
-            rotation.is_neox,
-            layer_name,
-        )
-        return query_out
-
     def _rope_and_kv_cache_update_q_out(
         self,
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
         query_out: torch.Tensor,
-        positions: torch.Tensor | None,
+        positions: torch.Tensor,
         cos_sin_cache: torch.Tensor,
         is_neox: bool,
         kv_cache: torch.Tensor,
@@ -693,8 +673,6 @@ class Attention(nn.Module, AttentionLayerBase):
 
         from vllm import _custom_ops
 
-        if positions is None:
-            positions = torch.arange(query.shape[0], device=query.device)
         query_out.copy_(query)
         key_out = key.clone() if layer_slot_mapping is not None else None
         _custom_ops.rotary_embedding(
@@ -867,7 +845,7 @@ def fused_rope_and_unified_kv_cache_update_q_out(
     key: torch.Tensor,
     value: torch.Tensor,
     query_out: torch.Tensor,
-    positions: torch.Tensor | None,
+    positions: torch.Tensor,
     cos_sin_cache: torch.Tensor,
     is_neox: bool,
     layer_name: LayerNameType,

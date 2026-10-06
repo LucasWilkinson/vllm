@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Rotary Positional Embeddings Base Class."""
 
-from dataclasses import dataclass
+from typing import NamedTuple
 
 import torch
 
@@ -12,17 +12,12 @@ from vllm.model_executor.custom_op import CustomOp
 from .common import ApplyRotaryEmb
 
 
-@dataclass
-class RopeRotation:
-    """A RoPE rotation expressed as data, so fused kernels can apply it.
+class RopeRotation(NamedTuple):
+    """RoPE as data for fused kernels: token ``i`` is rotated by row
+    ``positions[i]`` (or ``i`` if None) of ``cos_sin``, laid out ``[cos | sin]``."""
 
-    Token ``i`` is rotated by row ``positions[i]`` of ``cos_sin``, or by row
-    ``i`` when ``positions`` is None. Each row is ``[cos | sin]`` over
-    ``rotary_dim // 2`` pairs; dims past ``rotary_dim`` pass through.
-    """
-
-    cos_sin: torch.Tensor
     positions: torch.Tensor | None
+    cos_sin: torch.Tensor
     is_neox: bool
 
 
@@ -183,11 +178,8 @@ class RotaryEmbedding(RotaryEmbeddingBase):
     ) -> RopeRotation | None:
         if positions.dim() != 1:
             return None
-        return RopeRotation(
-            self._cos_sin_cache_as(dtype, positions.device),
-            positions,
-            self.is_neox_style,
-        )
+        cos_sin = self._cos_sin_cache_as(dtype, positions.device)
+        return RopeRotation(positions, cos_sin, self.is_neox_style)
 
     @staticmethod
     def forward_static(

@@ -296,8 +296,6 @@ def test_fused_value_copy_preserves_strided_storage(
     ),
     CASES,
 )
-# Pre-gathered: per-token cos/sin rows with positions=None (e.g. MRoPE).
-@pytest.mark.parametrize("pregathered", [False, True])
 @torch.inference_mode()
 def test_fused_rope_and_reshape_cache_flash_q_out_matches_unfused(
     dtype: torch.dtype,
@@ -311,7 +309,6 @@ def test_fused_rope_and_reshape_cache_flash_q_out_matches_unfused(
     layout: KVCacheLayout,
     page_padding: int,
     is_neox: bool,
-    pregathered: bool,
 ) -> None:
     device = torch.device("cuda")
     set_random_seed(SEED)
@@ -341,8 +338,6 @@ def test_fused_rope_and_reshape_cache_flash_q_out_matches_unfused(
     ].to(torch.long)
     if num_cache_tokens >= 4:
         slot_mapping[1] = -1
-    fused_positions = None if pregathered else positions
-    fused_cos_sin = cos_sin_cache[positions] if pregathered else cos_sin_cache
 
     key_cache_q_out, value_cache_q_out, physical_cache_q_out = _make_cache_views(
         layout,
@@ -387,8 +382,8 @@ def test_fused_rope_and_reshape_cache_flash_q_out_matches_unfused(
         key_q_out_input,
         value_q_out_input,
         query_out_buffer,
-        fused_positions,
-        fused_cos_sin,
+        positions,
+        cos_sin_cache,
         is_neox,
         key_cache_q_out,
         value_cache_q_out,
@@ -428,8 +423,8 @@ def test_fused_rope_and_reshape_cache_flash_q_out_matches_unfused(
                 key_q_out_input,
                 value_q_out_input,
                 query_out_buffer,
-                fused_positions,
-                fused_cos_sin,
+                positions,
+                cos_sin_cache,
                 is_neox,
                 key_cache_q_out,
                 value_cache_q_out,
