@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Torch implementations of the Model Runner V2 Triton kernels, for CPUs
-without Triton. Registered through `vllm.triton_utils.dispatcher`."""
+"""CPU implementations of the Model Runner V2 Triton kernels, for CPUs without
+Triton: numba ports of the per-request bookkeeping kernels and torch for the
+vocab-sized sampling math. Registered through `vllm.triton_utils.dispatcher`."""
 
 from collections.abc import Callable
 from typing import Any

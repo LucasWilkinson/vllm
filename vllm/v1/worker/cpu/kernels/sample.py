@@ -4,7 +4,7 @@
 
 import torch
 
-from vllm.v1.worker.cpu.kernels.utils import token_to_batch_idx
+from vllm.v1.worker.cpu.kernels.utils import numba_kernel
 
 
 def _compile(fn):
@@ -118,37 +118,29 @@ def apply_penalties(
     )
 
 
+@numba_kernel
 def bincount(
-    expanded_idx_mapping_ptr: torch.Tensor,
-    all_token_ids_ptr: torch.Tensor,
-    all_token_ids_stride: int,
-    prompt_len_ptr: torch.Tensor,
-    prefill_len_ptr: torch.Tensor,
-    prompt_bin_mask_ptr: torch.Tensor,
-    prompt_bin_mask_stride: int,
-    output_bin_counts_ptr: torch.Tensor,
-    output_bin_counts_stride: int,
-    BLOCK_SIZE: int,
-) -> None:
-    num_words = prompt_bin_mask_ptr.shape[1]
-    bits = torch.arange(32, dtype=torch.int64)
-    for req in expanded_idx_mapping_ptr.tolist():
-        prompt_len = int(prompt_len_ptr[req])
-        prefill_len = int(prefill_len_ptr[req])
-        token_ids = all_token_ids_ptr[req, :prefill_len].long()
-
-        prompt_mask = torch.zeros(num_words * 32, dtype=torch.int64)
-        prompt_mask[token_ids[:prompt_len]] = 1
-        packed = (prompt_mask.view(num_words, 32) << bits).sum(dim=1)
-        # Bit 31 makes the word negative in int32; the cast wraps it.
-        prompt_bin_mask_ptr[req] |= packed.to(prompt_bin_mask_ptr.dtype)
-
-        output_tokens = token_ids[prompt_len:]
-        output_bin_counts_ptr[req].index_add_(
-            0,
-            output_tokens,
-            torch.ones_like(output_tokens, dtype=output_bin_counts_ptr.dtype),
-        )
+    grid,
+    expanded_idx_mapping_ptr,
+    all_token_ids_ptr,
+    all_token_ids_stride,
+    prompt_len_ptr,
+    prefill_len_ptr,
+    prompt_bin_mask_ptr,
+    prompt_bin_mask_stride,
+    output_bin_counts_ptr,
+    output_bin_counts_stride,
+    BLOCK_SIZE,
+):
+    for token_idx in range(grid[0]):
+        req = expanded_idx_mapping_ptr[token_idx]
+        prompt_len = prompt_len_ptr[req]
+        for i in range(prefill_len_ptr[req]):
+            token_id = all_token_ids_ptr[req, i]
+            if i < prompt_len:
+                prompt_bin_mask_ptr[req, token_id // 32] |= 1 << (token_id % 32)
+            else:
+                output_bin_counts_ptr[req, token_id] += 1
 
 
 def _gather_ragged(
@@ -336,29 +328,26 @@ def fill_logprob_token_ids(
     out_valid_mask_ptr[:, 1:] |= valid
 
 
+@numba_kernel
 def prompt_logprobs_token_ids(
-    prompt_logprobs_token_ids_ptr: torch.Tensor,
-    query_start_loc_ptr: torch.Tensor,
-    idx_mapping_ptr: torch.Tensor,
-    num_computed_tokens_ptr: torch.Tensor,
-    all_token_ids_ptr: torch.Tensor,
-    all_token_ids_stride: int,
-    BLOCK_SIZE: int,
-) -> None:
-    num_reqs = idx_mapping_ptr.shape[0]
-    query_start_loc = query_start_loc_ptr[: num_reqs + 1].long()
-    num_tokens = int(query_start_loc[-1])
-    batch_idx = token_to_batch_idx(query_start_loc, num_tokens)
-    req = idx_mapping_ptr.long()[batch_idx]
-    # Shifted by one: the logprob at a position is for the next token.
-    target_pos = (
-        num_computed_tokens_ptr[req].long()
-        + 1
-        + torch.arange(num_tokens)
-        - query_start_loc[batch_idx]
-    )
-    target_pos = target_pos.clamp_max(all_token_ids_ptr.shape[1] - 1)
-    prompt_logprobs_token_ids_ptr[:num_tokens] = all_token_ids_ptr[req, target_pos]
+    grid,
+    prompt_logprobs_token_ids_ptr,
+    query_start_loc_ptr,
+    idx_mapping_ptr,
+    num_computed_tokens_ptr,
+    all_token_ids_ptr,
+    all_token_ids_stride,
+    BLOCK_SIZE,
+):
+    for batch_idx in range(grid[0]):
+        req = idx_mapping_ptr[batch_idx]
+        start = query_start_loc_ptr[batch_idx]
+        end = query_start_loc_ptr[batch_idx + 1]
+        last_col = all_token_ids_ptr.shape[1] - 1
+        for i in range(end - start):
+            # Shifted by one: the logprob at a position is for the next token.
+            col = min(num_computed_tokens_ptr[req] + 1 + i, last_col)
+            prompt_logprobs_token_ids_ptr[start + i] = all_token_ids_ptr[req, col]
 
 
 def compact_sampling_mask(

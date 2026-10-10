@@ -148,8 +148,9 @@ def _rebind_kernels(
             # kernel as an instance attribute; read the instance dict directly
             # so module-level __getattr__ hooks are never triggered, and so
             # this scan needs no dependency on the warmup machinery.
-            if hasattr(value, "__dict__"):
-                wrapper = lookup(vars(value).get("kernel"))
+            instance_dict = getattr(value, "__dict__", None)
+            if isinstance(instance_dict, dict):
+                wrapper = lookup(instance_dict.get("kernel"))
             if wrapper is None:
                 continue
             value.kernel = wrapper
