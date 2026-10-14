@@ -15,6 +15,9 @@ from tests.v1.kv_connector.unit.offloading_connector.test_config import (
 from tests.v1.kv_connector.unit.offloading_connector.utils import (
     MockOffloadingSpec,
     generate_store_output,
+    make_kv_cache_group,
+    mamba_layer,
+    sliding_window_layer,
     to_keys,
 )
 from tests.v1.kv_connector.unit.utils import (
@@ -71,18 +74,14 @@ from vllm.v1.core.sched.output import (
     SchedulerOutput,
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
-    FullAttentionManager,
+    ChunkedLocalAttentionManager,
     SlidingWindowManager,
 )
 from vllm.v1.kv_cache_interface import (
-    ChunkedLocalAttentionSpec,
-    FullAttentionSpec,
+    AttentionSpec,
     KVCacheConfig,
-    KVCacheGroupSpec,
-    MambaSpec,
-    SlidingWindowSpec,
+    KVCacheGroup,
 )
-from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.kv_hints import KvHintsEnvelope
 from vllm.v1.kv_offload.base import (
     GPULoadStoreSpec,
@@ -201,16 +200,16 @@ def test_swa_offload_window_covers_unaligned_hit(
             block_size=block_size, num_kv_heads=1, head_size=1, dtype=torch.float32
         )
         kv_spec = (
-            FullAttentionSpec(**kwargs)
+            AttentionSpec(**kwargs)
             if group_window is None
-            else SlidingWindowSpec(
+            else sliding_window_layer(
                 **kwargs,
                 sliding_window=group_window,
                 extra_retained_tokens=extra_retained if i == 1 else 0,
             )
         )
         groups.append(
-            KVCacheGroupSpec([f"layer{i}"], kv_spec, is_eagle_group=eagle and i == 1)
+            make_kv_cache_group([f"layer{i}"], kv_spec, is_eagle_group=eagle and i == 1)
         )
     manager = CPUOffloadingManager(num_chunks=100)
     spec = SimpleNamespace(
@@ -218,9 +217,9 @@ def test_swa_offload_window_covers_unaligned_hit(
             groups=tuple(
                 SimpleNamespace(
                     group_id=i,
-                    tokens_per_block=group.kv_cache_spec.block_size,
+                    tokens_per_block=group.block_size,
                     sliding_window_size_in_chunks=get_sliding_window_size_in_chunks(
-                        group.kv_cache_spec, group.kv_cache_spec.block_size * 4
+                        group, group.block_size * 4
                     ),
                 )
                 for i, group in enumerate(groups)
@@ -285,9 +284,8 @@ def test_swa_offload_window_covers_unaligned_hit(
     pool = BlockPool(256, enable_caching=True, hash_block_size=8)
     managers = []
     for i, group in enumerate(groups):
-        cls = FullAttentionManager if i == 0 else SlidingWindowManager
-        m = cls(
-            kv_cache_spec=group.kv_cache_spec,
+        m = group.manager_cls(
+            group,
             block_pool=pool,
             enable_caching=True,
             kv_cache_group_id=i,
@@ -809,12 +807,12 @@ def test_pending_attention_outside_hit_keeps_shared_prefix_junction():
         num_blocks=20,
         kv_cache_tensors=[],
         kv_cache_groups=[
-            KVCacheGroupSpec(["full"], FullAttentionSpec(**attention)),
-            KVCacheGroupSpec(
-                ["window_a"], SlidingWindowSpec(**attention, sliding_window=16)
+            make_kv_cache_group(["full"], AttentionSpec(**attention)),
+            make_kv_cache_group(
+                ["window_a"], sliding_window_layer(**attention, sliding_window=16)
             ),
-            KVCacheGroupSpec(
-                ["window_b"], SlidingWindowSpec(**attention, sliding_window=16)
+            make_kv_cache_group(
+                ["window_b"], sliding_window_layer(**attention, sliding_window=16)
             ),
         ],
     )
@@ -849,8 +847,8 @@ def test_unconfirmed_attention_does_not_register_junction():
     )
     config.cache_config.prefix_cache_retention_interval = 0
     kv_config = _make_mamba_hybrid_kv_cache_config()
-    full = kv_config.kv_cache_groups[0].kv_cache_spec
-    kv_config.kv_cache_groups.insert(1, KVCacheGroupSpec(["other_full"], full))
+    full = kv_config.kv_cache_groups[0].kv_cache_specs["full_layer"]
+    kv_config.kv_cache_groups.insert(1, make_kv_cache_group(["other_full"], full))
     spec = CPUOffloadingSpec(build_offloading_config(config, kv_config))
     scheduler = OffloadingConnectorScheduler(spec, config, kv_config)
     request = create_request(num_tokens=49, block_size=16)
@@ -910,13 +908,10 @@ def test_max_load_tokens_preserves_aligned_sliding_window_chunk(
         block_size=block_size, num_kv_heads=1, head_size=1, dtype=torch.float32
     )
     kv_cache_groups = [
-        KVCacheGroupSpec(["full"], FullAttentionSpec(**spec_kwargs)),
-        KVCacheGroupSpec(
+        make_kv_cache_group(["full"], AttentionSpec(**spec_kwargs)),
+        make_kv_cache_group(
             ["sliding"],
-            SlidingWindowSpec(
-                **spec_kwargs,
-                sliding_window=2 * tokens_per_chunk,
-            ),
+            sliding_window_layer(**spec_kwargs, sliding_window=2 * tokens_per_chunk),
         ),
     ]
     runner = request_runner(
@@ -1077,9 +1072,9 @@ def test_external_cache_hit_sources_reconcile_different_group_chunk_sizes(
     """Groups with different chunk sizes overlap; the outermost tier wins."""
     block_size = 4
     groups = [
-        KVCacheGroupSpec(
+        make_kv_cache_group(
             [f"layer{group_idx}"],
-            FullAttentionSpec(
+            AttentionSpec(
                 block_size=block_size * (group_idx + 1),
                 num_kv_heads=1,
                 head_size=1,
@@ -1211,15 +1206,15 @@ def test_external_cache_hit_sources_use_loaded_attention_ranges(
         block_size=block_size, num_kv_heads=1, head_size=1, dtype=torch.float32
     )
     sparse_spec = (
-        SlidingWindowSpec(**spec_kwargs, sliding_window=2 * chunk_size)
+        sliding_window_layer(**spec_kwargs, sliding_window=2 * chunk_size)
         if sparse_kind == "sliding"
-        else ChunkedLocalAttentionSpec(
-            **spec_kwargs, attention_chunk_size=2 * chunk_size
+        else ChunkedLocalAttentionManager.layer_config(
+            AttentionSpec(**spec_kwargs), attention_chunk_size=2 * chunk_size
         )
     )
-    groups = [KVCacheGroupSpec(["sparse"], sparse_spec)]
+    groups = [make_kv_cache_group(["sparse"], sparse_spec)]
     if full_attention:
-        groups.insert(0, KVCacheGroupSpec(["full"], FullAttentionSpec(**spec_kwargs)))
+        groups.insert(0, make_kv_cache_group(["full"], AttentionSpec(**spec_kwargs)))
     vllm_config = _make_vllm_config(extra_config={"block_size": chunk_size})
     vllm_config.cache_config.block_size = block_size
     vllm_config.speculative_config = None
@@ -3171,18 +3166,18 @@ def test_two_groups_full_and_sliding_window(request_runner, async_scheduling: bo
     sliding_window = 8
 
     kv_cache_groups = [
-        KVCacheGroupSpec(
+        make_kv_cache_group(
             ["layer0"],
-            FullAttentionSpec(
+            AttentionSpec(
                 block_size=block_size,
                 num_kv_heads=1,
                 head_size=1,
                 dtype=torch.float32,
             ),
         ),
-        KVCacheGroupSpec(
+        make_kv_cache_group(
             ["layer1"],
-            SlidingWindowSpec(
+            sliding_window_layer(
                 block_size=block_size,
                 num_kv_heads=1,
                 head_size=1,
@@ -3260,10 +3255,10 @@ def test_sliding_window_chunk_with_null_block_is_not_stored(
         block_size=block_size, num_kv_heads=1, head_size=1, dtype=torch.float32
     )
     kv_cache_groups = [
-        KVCacheGroupSpec(["layer0"], FullAttentionSpec(**spec_kwargs)),
-        KVCacheGroupSpec(
+        make_kv_cache_group(["layer0"], AttentionSpec(**spec_kwargs)),
+        make_kv_cache_group(
             ["layer1"],
-            SlidingWindowSpec(**spec_kwargs, sliding_window=2 * block_size),
+            sliding_window_layer(**spec_kwargs, sliding_window=2 * block_size),
         ),
     ]
     runner = request_runner(
@@ -3311,9 +3306,9 @@ def test_swa_retry_keeps_internal_null_block_in_store_spec(request_runner):
         blocks_per_chunk=3,
         async_scheduling=False,
         kv_cache_groups=[
-            KVCacheGroupSpec(
+            make_kv_cache_group(
                 ["swa"],
-                SlidingWindowSpec(
+                sliding_window_layer(
                     block_size=block_size,
                     num_kv_heads=1,
                     head_size=1,
@@ -3354,18 +3349,18 @@ def test_two_groups_different_block_sizes(request_runner, async_scheduling: bool
     # Group 0: block_size=12 (tokens_per_chunk=12)
     # Group 1: block_size=16 (tokens_per_chunk=16)
     kv_cache_groups = [
-        KVCacheGroupSpec(
+        make_kv_cache_group(
             ["layer0"],
-            FullAttentionSpec(
+            AttentionSpec(
                 block_size=tokens_per_hash * 3,
                 num_kv_heads=1,
                 head_size=1,
                 dtype=torch.float32,
             ),
         ),
-        KVCacheGroupSpec(
+        make_kv_cache_group(
             ["layer1"],
-            FullAttentionSpec(
+            AttentionSpec(
                 block_size=tokens_per_hash * 4,
                 num_kv_heads=1,
                 head_size=1,
@@ -3818,15 +3813,15 @@ def test_swa_load_does_not_wait_for_unusable_pending_suffix(
 ):
     """A CPU store beyond a missing SWA chunk must not block a ready prefix."""
     groups = [
-        KVCacheGroupSpec(
+        make_kv_cache_group(
             ["full"],
-            FullAttentionSpec(
+            AttentionSpec(
                 block_size=4, num_kv_heads=1, head_size=1, dtype=torch.float32
             ),
         ),
-        KVCacheGroupSpec(
+        make_kv_cache_group(
             ["swa"],
-            SlidingWindowSpec(
+            sliding_window_layer(
                 block_size=4,
                 num_kv_heads=1,
                 head_size=1,
@@ -4323,18 +4318,18 @@ def test_failed_load_ends_or_reruns_its_request(
         # The sliding-window group loads only the blocks inside its window.
         expected_loaded = ((0, 0), (0, 1), (0, 2), (1, 1), (1, 2))
         kv_cache_groups = [
-            KVCacheGroupSpec(
+            make_kv_cache_group(
                 ["layer0"],
-                FullAttentionSpec(
+                AttentionSpec(
                     block_size=block_size,
                     num_kv_heads=1,
                     head_size=1,
                     dtype=torch.float32,
                 ),
             ),
-            KVCacheGroupSpec(
+            make_kv_cache_group(
                 ["layer1"],
-                SlidingWindowSpec(
+                sliding_window_layer(
                     block_size=block_size,
                     num_kv_heads=1,
                     head_size=1,
@@ -4813,18 +4808,18 @@ def test_swa_alignment_skip(request_runner, async_scheduling: bool, extra_retain
     num_gpu_blocks = 200
 
     kv_cache_groups = [
-        KVCacheGroupSpec(
+        make_kv_cache_group(
             ["layer0"],
-            FullAttentionSpec(
+            AttentionSpec(
                 block_size=full_attn_block_size,
                 num_kv_heads=1,
                 head_size=1,
                 dtype=torch.float32,
             ),
         ),
-        KVCacheGroupSpec(
+        make_kv_cache_group(
             ["layer1"],
-            SlidingWindowSpec(
+            sliding_window_layer(
                 block_size=swa_block_size,
                 num_kv_heads=1,
                 head_size=1,
@@ -4904,21 +4899,21 @@ def test_swa_alignment_skip(request_runner, async_scheduling: bool, extra_retain
 
 def _full_and_swa_groups(
     full_attn_block_size: int, swa_block_size: int, sliding_window: int
-) -> list[KVCacheGroupSpec]:
+) -> list[KVCacheGroup]:
     """Group 0 full attention (MLA-like), group 1 sliding window."""
     return [
-        KVCacheGroupSpec(
+        make_kv_cache_group(
             ["layer0"],
-            FullAttentionSpec(
+            AttentionSpec(
                 block_size=full_attn_block_size,
                 num_kv_heads=1,
                 head_size=1,
                 dtype=torch.float32,
             ),
         ),
-        KVCacheGroupSpec(
+        make_kv_cache_group(
             ["layer1"],
-            SlidingWindowSpec(
+            sliding_window_layer(
                 block_size=swa_block_size,
                 num_kv_heads=1,
                 head_size=1,
@@ -5066,9 +5061,9 @@ def test_stale_sliding_window_block_after_prepare_store_failure(
     num_gpu_blocks = 4
 
     kv_cache_groups = [
-        KVCacheGroupSpec(
+        make_kv_cache_group(
             ["layer0"],
-            SlidingWindowSpec(
+            sliding_window_layer(
                 block_size=block_size,
                 num_kv_heads=1,
                 head_size=1,
@@ -5273,9 +5268,9 @@ class TestEagle:
         """Full-attn eagle group with 3 blocks all hit → pop to 2 blocks."""
         block_size = 4
         groups = [
-            KVCacheGroupSpec(
+            make_kv_cache_group(
                 ["layer0"],
-                FullAttentionSpec(
+                AttentionSpec(
                     block_size=block_size,
                     num_kv_heads=1,
                     head_size=1,
@@ -5335,9 +5330,9 @@ class TestEagle:
             num_blocks=100,
             kv_cache_tensors=[],
             kv_cache_groups=[
-                KVCacheGroupSpec(
+                make_kv_cache_group(
                     ["mtp"],
-                    FullAttentionSpec(
+                    AttentionSpec(
                         block_size=block_size,
                         num_kv_heads=1,
                         head_size=1,
@@ -5371,9 +5366,9 @@ class TestEagle:
         """Full-attn eagle group with 1 block hit → pop to 0 → returns 0."""
         block_size = 4
         groups = [
-            KVCacheGroupSpec(
+            make_kv_cache_group(
                 ["layer0"],
-                FullAttentionSpec(
+                AttentionSpec(
                     block_size=block_size,
                     num_kv_heads=1,
                     head_size=1,
@@ -5404,9 +5399,9 @@ class TestEagle:
         """Full-attn eagle group with 0 hits returns 0 before pop."""
         block_size = 4
         groups = [
-            KVCacheGroupSpec(
+            make_kv_cache_group(
                 ["layer0"],
-                FullAttentionSpec(
+                AttentionSpec(
                     block_size=block_size,
                     num_kv_heads=1,
                     head_size=1,
@@ -5443,9 +5438,9 @@ class TestEagle:
         block_size = 4
         sw_blocks = 2
         groups = [
-            KVCacheGroupSpec(
+            make_kv_cache_group(
                 ["layer0"],
-                SlidingWindowSpec(
+                sliding_window_layer(
                     block_size=block_size,
                     num_kv_heads=1,
                     head_size=1,
@@ -5500,9 +5495,9 @@ class TestEagle:
         block_size = 4
         sw_blocks = 2
         groups = [
-            KVCacheGroupSpec(
+            make_kv_cache_group(
                 ["layer0"],
-                SlidingWindowSpec(
+                sliding_window_layer(
                     block_size=block_size,
                     num_kv_heads=1,
                     head_size=1,
@@ -5535,9 +5530,9 @@ class TestEagle:
         block_size = 4
         sw_blocks = 2
         groups = [
-            KVCacheGroupSpec(
+            make_kv_cache_group(
                 ["layer0"],
-                SlidingWindowSpec(
+                sliding_window_layer(
                     block_size=block_size,
                     num_kv_heads=1,
                     head_size=1,
@@ -5577,9 +5572,9 @@ class TestEagle:
         """
         block_size = 4
         groups = [
-            KVCacheGroupSpec(
+            make_kv_cache_group(
                 ["layer0"],
-                FullAttentionSpec(
+                AttentionSpec(
                     block_size=block_size,
                     num_kv_heads=1,
                     head_size=1,
@@ -5587,9 +5582,9 @@ class TestEagle:
                 ),
                 is_eagle_group=False,
             ),
-            KVCacheGroupSpec(
+            make_kv_cache_group(
                 ["layer1"],
-                FullAttentionSpec(
+                AttentionSpec(
                     block_size=block_size,
                     num_kv_heads=2,
                     head_size=1,
@@ -5633,9 +5628,9 @@ class TestEagle:
         """
         block_size = 4
         groups = [
-            KVCacheGroupSpec(
+            make_kv_cache_group(
                 ["layer0"],
-                FullAttentionSpec(
+                AttentionSpec(
                     block_size=block_size,
                     num_kv_heads=1,
                     head_size=1,
@@ -5643,9 +5638,9 @@ class TestEagle:
                 ),
                 is_eagle_group=False,
             ),
-            KVCacheGroupSpec(
+            make_kv_cache_group(
                 ["layer1"],
-                FullAttentionSpec(
+                AttentionSpec(
                     block_size=block_size,
                     num_kv_heads=2,
                     head_size=1,
@@ -5704,18 +5699,18 @@ class TestEagle:
         num_gpu_blocks = 100
 
         kv_cache_groups = [
-            KVCacheGroupSpec(
+            make_kv_cache_group(
                 ["layer0"],
-                FullAttentionSpec(
+                AttentionSpec(
                     block_size=block_size,
                     num_kv_heads=1,
                     head_size=1,
                     dtype=torch.float32,
                 ),
             ),
-            KVCacheGroupSpec(
+            make_kv_cache_group(
                 ["layer1"],
-                FullAttentionSpec(
+                AttentionSpec(
                     block_size=block_size,
                     num_kv_heads=2,
                     head_size=1,
@@ -5777,9 +5772,9 @@ class TestEagle:
         num_gpu_blocks = 100
 
         kv_cache_groups = [
-            KVCacheGroupSpec(
+            make_kv_cache_group(
                 ["layer0"],
-                SlidingWindowSpec(
+                sliding_window_layer(
                     block_size=block_size,
                     num_kv_heads=1,
                     head_size=1,
@@ -5830,9 +5825,9 @@ class TestEagle:
         num_gpu_blocks = 100
 
         kv_cache_groups = [
-            KVCacheGroupSpec(
+            make_kv_cache_group(
                 ["layer0"],
-                FullAttentionSpec(
+                AttentionSpec(
                     block_size=block_size,
                     num_kv_heads=1,
                     head_size=1,
@@ -5919,9 +5914,9 @@ class TestEagle:
         num_gpu_blocks = 1000
 
         kv_cache_groups = [
-            KVCacheGroupSpec(
+            make_kv_cache_group(
                 ["layer0"],
-                FullAttentionSpec(
+                AttentionSpec(
                     block_size=block_size,
                     num_kv_heads=1,
                     head_size=1,
@@ -5984,18 +5979,18 @@ class TestEagle:
         num_tokens = 1200
 
         kv_cache_groups = [
-            KVCacheGroupSpec(
+            make_kv_cache_group(
                 ["layer0"],
-                FullAttentionSpec(
+                AttentionSpec(
                     block_size=full_attn_block_size,
                     num_kv_heads=1,
                     head_size=1,
                     dtype=torch.float32,
                 ),
             ),
-            KVCacheGroupSpec(
+            make_kv_cache_group(
                 ["layer1"],
-                SlidingWindowSpec(
+                sliding_window_layer(
                     block_size=swa_block_size,
                     num_kv_heads=1,
                     head_size=1,
@@ -6052,18 +6047,18 @@ class TestEagle:
         swa_block_size = 4
         prompt_tokens = 1200
         kv_cache_groups = [
-            KVCacheGroupSpec(
+            make_kv_cache_group(
                 ["layer0"],
-                FullAttentionSpec(
+                AttentionSpec(
                     block_size=full_attn_block_size,
                     num_kv_heads=1,
                     head_size=1,
                     dtype=torch.float32,
                 ),
             ),
-            KVCacheGroupSpec(
+            make_kv_cache_group(
                 ["layer1"],
-                SlidingWindowSpec(
+                sliding_window_layer(
                     block_size=swa_block_size,
                     num_kv_heads=1,
                     head_size=1,
@@ -6110,18 +6105,18 @@ class TestEagle:
             num_blocks=0,
             kv_cache_tensors=[],
             kv_cache_groups=[
-                KVCacheGroupSpec(
+                make_kv_cache_group(
                     ["full"],
-                    FullAttentionSpec(
+                    AttentionSpec(
                         block_size=36,
                         num_kv_heads=1,
                         head_size=1,
                         dtype=torch.float32,
                     ),
                 ),
-                KVCacheGroupSpec(
+                make_kv_cache_group(
                     ["swa"],
-                    SlidingWindowSpec(
+                    sliding_window_layer(
                         block_size=4,
                         num_kv_heads=1,
                         head_size=1,
@@ -6201,18 +6196,18 @@ class TestEagle:
         num_gpu_blocks = 100
 
         kv_cache_groups = [
-            KVCacheGroupSpec(
+            make_kv_cache_group(
                 ["layer0"],
-                FullAttentionSpec(
+                AttentionSpec(
                     block_size=block_size,
                     num_kv_heads=1,
                     head_size=1,
                     dtype=torch.float32,
                 ),
             ),
-            KVCacheGroupSpec(
+            make_kv_cache_group(
                 ["layer1"],
-                FullAttentionSpec(
+                AttentionSpec(
                     block_size=block_size,
                     num_kv_heads=2,
                     head_size=1,
@@ -6417,18 +6412,18 @@ def test_request_finished_mixed_full_attn_and_sliding_window(
     sliding_window = 8  # 2 blocks
 
     kv_cache_groups = [
-        KVCacheGroupSpec(
+        make_kv_cache_group(
             ["layer0"],
-            FullAttentionSpec(
+            AttentionSpec(
                 block_size=block_size,
                 num_kv_heads=1,
                 head_size=1,
                 dtype=torch.float32,
             ),
         ),
-        KVCacheGroupSpec(
+        make_kv_cache_group(
             ["layer1"],
-            SlidingWindowSpec(
+            sliding_window_layer(
                 block_size=block_size,
                 num_kv_heads=1,
                 head_size=1,
@@ -6512,18 +6507,23 @@ def test_request_finished_mixed_full_attn_and_sliding_window(
 
 def test_chunked_local_attention_reports_its_chunk_window():
     """Llama 4 uses chunked local attention, which used to trip the
-    FullAttentionSpec assert and kill the engine at startup."""
-    spec = ChunkedLocalAttentionSpec(
-        block_size=16,
-        num_kv_heads=2,
-        head_size=64,
-        dtype=torch.bfloat16,
-        attention_chunk_size=8192,
+    full-attention assert and kill the engine at startup."""
+    group = make_kv_cache_group(
+        ["layer"],
+        ChunkedLocalAttentionManager.layer_config(
+            AttentionSpec(
+                block_size=16,
+                num_kv_heads=2,
+                head_size=64,
+                dtype=torch.bfloat16,
+            ),
+            attention_chunk_size=8192,
+        ),
     )
 
-    assert get_sliding_window_size_in_chunks(spec, tokens_per_chunk=1024) == 8
+    assert get_sliding_window_size_in_chunks(group, tokens_per_chunk=1024) == 8
     # Partial chunks round up, so the reachable tail is never understated.
-    assert get_sliding_window_size_in_chunks(spec, tokens_per_chunk=3000) == 3
+    assert get_sliding_window_size_in_chunks(group, tokens_per_chunk=3000) == 3
 
 
 @pytest.mark.parametrize("blocks_per_chunk", [1, 2, 3])
@@ -6542,25 +6542,15 @@ def test_reachable_block_mask_chunk_to_block_index_conversion(
     sliding_window = 8
     alignment_tokens = 16 * blocks_per_chunk
 
-    swa_spec = SlidingWindowSpec(
-        block_size=block_size,
-        num_kv_heads=1,
-        head_size=1,
-        dtype=torch.float32,
-        sliding_window=sliding_window,
-    )
-
     num_chunks = 8
     start_chunk_idx = 0
 
-    manager_cls = KVCacheSpecRegistry.get_manager_class(swa_spec)
-    assert manager_cls is not None
-
-    block_mask = manager_cls.reachable_block_mask(
+    block_mask = SlidingWindowManager.reachable_block_mask(
         start_block=start_chunk_idx * blocks_per_chunk,
         end_block=num_chunks * blocks_per_chunk,
         alignment_tokens=alignment_tokens,
-        kv_cache_spec=swa_spec,
+        block_size=block_size,
+        manager_config=SlidingWindowManager.config(sliding_window=sliding_window),
         use_eagle=False,
     )
 
@@ -6609,18 +6599,18 @@ def test_retention_interval_sparsifies_swa_stores(
     num_gpu_blocks = 200
 
     kv_cache_groups = [
-        KVCacheGroupSpec(
+        make_kv_cache_group(
             ["layer0"],
-            FullAttentionSpec(
+            AttentionSpec(
                 block_size=full_attn_block_size,
                 num_kv_heads=1,
                 head_size=1,
                 dtype=torch.float32,
             ),
         ),
-        KVCacheGroupSpec(
+        make_kv_cache_group(
             ["layer1"],
-            SlidingWindowSpec(
+            sliding_window_layer(
                 block_size=swa_block_size,
                 num_kv_heads=1,
                 head_size=1,
@@ -6689,18 +6679,18 @@ def test_retention_interval_zero_stores_only_replay_boundary(
     num_gpu_blocks = 200
 
     kv_cache_groups = [
-        KVCacheGroupSpec(
+        make_kv_cache_group(
             ["layer0"],
-            FullAttentionSpec(
+            AttentionSpec(
                 block_size=full_attn_block_size,
                 num_kv_heads=1,
                 head_size=1,
                 dtype=torch.float32,
             ),
         ),
-        KVCacheGroupSpec(
+        make_kv_cache_group(
             ["layer1"],
-            SlidingWindowSpec(
+            sliding_window_layer(
                 block_size=swa_block_size,
                 num_kv_heads=1,
                 head_size=1,
@@ -6774,18 +6764,18 @@ class TestSharedGroupMTPOffload:
         non-speculative behavior of test_two_groups_full_and_sliding_window."""
         block_size = 4
         kv_cache_groups = [
-            KVCacheGroupSpec(
+            make_kv_cache_group(
                 ["layer0"],
-                FullAttentionSpec(
+                AttentionSpec(
                     block_size=block_size,
                     num_kv_heads=1,
                     head_size=1,
                     dtype=torch.float32,
                 ),
             ),
-            KVCacheGroupSpec(
+            make_kv_cache_group(
                 ["layer1"],
-                SlidingWindowSpec(
+                sliding_window_layer(
                     block_size=block_size,
                     num_kv_heads=1,
                     head_size=1,
@@ -6851,9 +6841,9 @@ class TestMambaHybridOffloadServing:
             num_blocks=64,
             kv_cache_tensors=[],
             kv_cache_groups=[
-                KVCacheGroupSpec(
+                make_kv_cache_group(
                     ["full_layer"],
-                    FullAttentionSpec(
+                    AttentionSpec(
                         block_size=self.BLOCK,
                         num_kv_heads=1,
                         head_size=1,
@@ -6861,9 +6851,9 @@ class TestMambaHybridOffloadServing:
                     ),
                     is_eagle_group=mamba_eagle,
                 ),
-                KVCacheGroupSpec(
+                make_kv_cache_group(
                     ["mamba_layer"],
-                    MambaSpec(
+                    mamba_layer(
                         block_size=self.MAMBA_BLOCK,
                         shapes=((1, 1),),
                         dtypes=(torch.float32,),
@@ -6983,8 +6973,6 @@ class TestMambaHybridOffloadServing:
 
 
 def _make_lookahead_hybrid_engine(lookahead=1, eagle=True):
-    from dataclasses import replace
-
     from tests.v1.kv_connector.unit.utils import make_kv_cache_config
 
     config = create_vllm_config(
@@ -7011,8 +6999,8 @@ def _make_lookahead_hybrid_engine(lookahead=1, eagle=True):
     caches.prefix_cache_retention_interval = 16
     caches.kv_cache_groups[0].is_eagle_group = eagle
     group = caches.kv_cache_groups[1]
-    group.kv_cache_spec = replace(
-        group.kv_cache_spec, num_speculative_blocks=1, num_prefill_checkpoint_blocks=1
+    group.manager_config = group.manager_config.replace_params(
+        num_speculative_blocks=1, num_prefill_checkpoint_blocks=1
     )
     init_none_hash(sha256)
     return create_scheduler(config, kv_cache_config=caches, hash_block_size=4)
