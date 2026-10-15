@@ -42,6 +42,7 @@ from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionMetadata,
     AttentionType,
+    MultipleOf,
 )
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.attention.selector import get_attn_backend
@@ -104,7 +105,6 @@ def _largest_kernel_block_within(
     page_budget: int,
     fallback: int,
     kv_cache_spec: KVCacheSpec | None = None,
-    divisor_of: int | None = None,
 ) -> int:
     """Largest supported kernel block size whose page fits in ``page_budget``.
 
@@ -113,12 +113,7 @@ def _largest_kernel_block_within(
     block whose natural page still fits under ``page_budget`` minimizes that waste.
     ``MultipleOf`` declarations are expanded to the largest aligned block that fits.
     Falls back to the smallest supported block when nothing fits.
-
-    With ``divisor_of``, prefer the largest fitting block that divides it, so the
-    page can be scaled to ``divisor_of`` by an integer ratio instead of padded.
     """
-    from vllm.v1.attention.backend import MultipleOf
-
     sizes = attn_backend.get_supported_kernel_block_sizes(kv_cache_spec)
     max_block_size = page_budget // per_token_bytes
     candidates = [s for s in sizes if isinstance(s, int)]
@@ -131,17 +126,6 @@ def _largest_kernel_block_within(
         return fallback
     smallest = min(candidates)
     fitting = [b for b in candidates if b * per_token_bytes <= page_budget]
-    if divisor_of is not None:
-        dividing = [b for b in fitting if divisor_of % b == 0]
-        dividing.extend(
-            b
-            for s in sizes
-            if isinstance(s, MultipleOf)
-            for b in range(s.base, max_block_size + 1, s.base)
-            if divisor_of % b == 0
-        )
-        if dividing:
-            return max(dividing)
     return max(fitting) if fitting else smallest
 
 
@@ -647,8 +631,10 @@ class Attention(nn.Module, AttentionLayerBase):
             # to a size coprime with the primary one, which inflates the
             # scheduler LCM (e.g. a 1024 B/token SWA draft next to a 1152
             # B/token MLA target: 1728 vs 1536 gives LCM 13824). Backends that
-            # cannot run the primary block start from their smallest block and
-            # ``unify`` scales it up by an integer ratio.
+            # cannot run the primary block start from their largest fitting
+            # block; ``kernel_block_alignment`` lets ``unify`` scale that up to
+            # a block it does not divide (e.g. 64 -> 1648) when the pages line
+            # up, instead of padding it.
             shared_page = vllm_config.cache_config.skip_page_size_padded
             # The backend owns its packing
             kv_cache_spec = self.attn_backend.customize_spec(
@@ -664,17 +650,24 @@ class Attention(nn.Module, AttentionLayerBase):
             )
             sw_per_token = kv_cache_spec.real_page_size_bytes
             page_budget = shared_page or sw_per_token * block_size
-            # Without a shared page, prefer a block that divides the primary
-            # block: ``unify`` pads any other block's page, and a padded page
-            # disables fine-grained prefix-cache hits on this group.
             sw_block_size = _largest_kernel_block_within(
                 self.attn_backend,
                 sw_per_token,
                 page_budget,
                 block_size,
                 kv_cache_spec,
-                divisor_of=None if shared_page else block_size,
             )
+            kernel_block_alignment = None
+            if shared_page is None:
+                kernel_block_alignment = min(
+                    (
+                        s.base if isinstance(s, MultipleOf) else s
+                        for s in self.attn_backend.get_supported_kernel_block_sizes(
+                            kv_cache_spec
+                        )
+                    ),
+                    default=None,
+                )
             return SlidingWindowSpec(
                 block_size=sw_block_size,
                 num_kv_heads=self.num_kv_heads,
@@ -684,6 +677,7 @@ class Attention(nn.Module, AttentionLayerBase):
                 kv_quant_mode=quant_mode,
                 sliding_window=self.sliding_window,
                 page_size_padded=shared_page,
+                kernel_block_alignment=kernel_block_alignment,
             )
         else:
             return FullAttentionSpec(

@@ -44,39 +44,34 @@ def test_largest_kernel_block_within(supported_sizes, expected):
 
 
 @pytest.mark.parametrize(
-    "supported_sizes,divisor_of,expected",
+    "supported_sizes,primary_block_size,primary_heads,primary_head_size,"
+    "expected_block_size,expected_padded",
     [
-        # FlashInfer on sm_120 next to a 1648-token hybrid (GDN) block: neither
-        # 64 nor 32 divides 1648, so only 16 lets ``unify`` scale the page.
-        ([16, 32, 64], 1648, 16),
-        ([16, 32, 64], 1536, 64),
-        ([MultipleOf(16)], 1648, 1648),
-        # No supported block divides it: keep the largest fitting block.
-        ([MultipleOf(32)], 1648, 1632),
-        ([2048], 1648, 2048),
+        # FlashInfer on sm_120 next to a 1648-token hybrid (GDN) block with
+        # equal bytes per token: 64 does not divide 1648, but the pages line up
+        # at 1648 tokens, a multiple of the 16-token kernel block.
+        ([16, 32, 64], 1648, 4, 256, 1648, False),
+        ([16, 32, 64], 1536, 4, 256, 1536, False),
+        # Half the bytes per token: the pages would line up at 824 tokens,
+        # which no kernel block divides, so keep padding 64-token blocks.
+        ([16, 32, 64], 1648, 2, 256, 64, True),
+        # 2048 vs 2304 B/token: scaling would give 1728 tokens and an LCM of
+        # 13824 with 1536, so pad instead (#53007).
+        ([MultipleOf(16)], 1536, 4, 288, 1536, True),
     ],
 )
-def test_largest_kernel_block_within_divisor_of(supported_sizes, divisor_of, expected):
-    class Backend:
-        @staticmethod
-        def get_supported_kernel_block_sizes(kv_cache_spec=None):
-            return supported_sizes
-
-    per_token = 1024
-    got = _largest_kernel_block_within(
-        Backend, per_token, per_token * divisor_of, divisor_of, divisor_of=divisor_of
-    )
-    assert got == expected
-
-
-@pytest.mark.parametrize("primary_block_size", [1648, 1536])
-def test_sliding_window_spec_unifies_without_padding(primary_block_size):
-    # A SW draft layer next to a hybrid primary block, on a backend limited to
-    # small kernel blocks (FlashInfer on sm_120).
+def test_sliding_window_spec_unify(
+    supported_sizes,
+    primary_block_size,
+    primary_heads,
+    primary_head_size,
+    expected_block_size,
+    expected_padded,
+):
     backend = SimpleNamespace(
         is_mla=lambda: False,
         customize_spec=lambda spec: spec,
-        get_supported_kernel_block_sizes=lambda kv_cache_spec=None: [16, 32, 64],
+        get_supported_kernel_block_sizes=lambda kv_cache_spec=None: supported_sizes,
     )
     layer = SimpleNamespace(
         attn_type=AttentionType.DECODER,
@@ -95,18 +90,17 @@ def test_sliding_window_spec_unifies_without_padding(primary_block_size):
     )
     sw_spec = Attention.get_kv_cache_spec(layer, vllm_config)
     assert isinstance(sw_spec, SlidingWindowSpec)
-    assert primary_block_size % sw_spec.block_size == 0
 
     primary_spec = FullAttentionSpec(
         block_size=primary_block_size,
-        num_kv_heads=4,
-        head_size=256,
+        num_kv_heads=primary_heads,
+        head_size=primary_head_size,
         dtype=torch.float8_e4m3fn,
         kv_quant_mode=get_kv_quant_mode("fp8"),
     )
     unified = unify_kv_cache_spec_page_size({"sw": sw_spec, "full": primary_spec})
-    assert unified["sw"].block_size == primary_block_size
-    assert unified["sw"].page_size_padded is None
+    assert unified["sw"].block_size == expected_block_size
+    assert (unified["sw"].page_size_padded is not None) == expected_padded
 
 
 @pytest.mark.parametrize(

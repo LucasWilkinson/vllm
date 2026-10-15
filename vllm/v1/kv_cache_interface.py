@@ -836,6 +836,10 @@ class SlidingWindowSpec(AttentionSpec):
     # re-prefill the last num_spec_prefill_tokens - 1 tokens from the end
     # of the sequence, and thus needs to delay freeing/caching of blocks.
     extra_retained_tokens: int = 0
+    kernel_block_alignment: int | None = None
+    """Smallest kernel block the backend supports. When set,
+    ``unify_kv_cache_spec_page_size`` may scale ``block_size`` to a multiple of
+    it that divides the max-page block, instead of padding the page."""
 
     def max_admission_blocks_per_request(
         self, max_in_flight_tokens: int, max_model_len: int

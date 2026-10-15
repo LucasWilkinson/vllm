@@ -1397,6 +1397,25 @@ def _glm5_next_tensor_layout(
     )
 
 
+def _can_scale_sliding_window(
+    spec: KVCacheSpec, block_size: int, max_page_block_sizes: set[int]
+) -> bool:
+    """Whether a sliding-window ``spec`` may scale to ``block_size`` tokens even
+    though ``block_size`` is not a multiple of ``spec.block_size``.
+
+    The backend's kernel blocks must still divide ``block_size``, and
+    ``block_size`` must divide every max-page attention block so the scheduler
+    block (their LCM) does not grow.
+    """
+    if not isinstance(spec, SlidingWindowSpec) or spec.kernel_block_alignment is None:
+        return False
+    return (
+        block_size % spec.kernel_block_alignment == 0
+        and bool(max_page_block_sizes)
+        and all(b % block_size == 0 for b in max_page_block_sizes)
+    )
+
+
 def unify_kv_cache_spec_page_size(
     kv_cache_spec: dict[str, KVCacheSpec],
 ) -> dict[str, KVCacheSpec]:
@@ -1427,6 +1446,11 @@ def unify_kv_cache_spec_page_size(
         return kv_cache_spec
 
     max_page_size = max(page_sizes)
+    max_page_block_sizes = {
+        spec.block_size
+        for spec in kv_cache_spec.values()
+        if isinstance(spec, AttentionSpec) and spec.page_size_bytes == max_page_size
+    }
     new_kv_cache_spec = {}
     for layer_name, layer_spec in kv_cache_spec.items():
         if layer_spec.page_size_bytes == max_page_size:
@@ -1443,9 +1467,15 @@ def unify_kv_cache_spec_page_size(
             new_kv_cache_spec[layer_name] = new_spec
         else:
             layer_page_size = layer_spec.page_size_bytes
-            if max_page_size % layer_page_size == 0:
-                ratio = max_page_size // layer_page_size
-                new_block_size = layer_spec.block_size * ratio
+            new_block_size, rem = divmod(
+                layer_spec.block_size * max_page_size, layer_page_size
+            )
+            if max_page_size % layer_page_size == 0 or (
+                rem == 0
+                and _can_scale_sliding_window(
+                    layer_spec, new_block_size, max_page_block_sizes
+                )
+            ):
                 new_spec = replace(layer_spec, block_size=new_block_size)
             elif isinstance(layer_spec, AttentionSpec) and not isinstance(
                 layer_spec, MLAAttentionSpec
@@ -1906,7 +1936,7 @@ def _promote_local_kv_cache_specs(
                 target_cls,
                 # Promoted specs allocate blocks for all tokens and never free
                 # below the window, so the trailing-edge extension is moot.
-                drop=("extra_retained_tokens",),
+                drop=("extra_retained_tokens", "kernel_block_alignment"),
                 block_size=block_size,
                 page_size_padded=promoted_page_size_padded(spec, block_size),
             )
