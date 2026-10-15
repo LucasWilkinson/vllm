@@ -32,6 +32,6 @@ void launch_cp_gather_and_upconvert_nvfp4_kv_cache(
     const int32_t* workspace_starts, int32_t num_reqs, int32_t block_size,
     int32_t total_tokens, int64_t block_table_stride,
     int64_t cache_block_stride, int64_t cache_entry_stride,
-    int64_t dst_entry_stride, cudaStream_t stream);
+    int64_t dst_entry_stride, const int32_t* seq_starts, cudaStream_t stream);
 
 }  // namespace vllm

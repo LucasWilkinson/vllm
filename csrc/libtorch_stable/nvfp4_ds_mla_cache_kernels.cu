@@ -186,7 +186,8 @@ __global__ void cp_gather_and_upconvert_nvfp4_kv_cache_kernel(
     const int32_t num_reqs, const int32_t block_size,
     const int32_t total_tokens, const int64_t block_table_stride,
     const int64_t cache_block_stride, const int64_t cache_entry_stride,
-    const int64_t dst_entry_stride) {
+    const int64_t dst_entry_stride,
+    const int32_t* __restrict__ seq_starts) {  // [num_reqs] or nullptr
   const int flat_warp_id = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
   if (flat_warp_id >= total_tokens) return;
   const int lane_id = threadIdx.x & 31;
@@ -203,7 +204,8 @@ __global__ void cp_gather_and_upconvert_nvfp4_kv_cache_kernel(
   const int req_id = lo;
 
   const int out_token_id = flat_warp_id;
-  const int token_offset = out_token_id - workspace_starts[req_id];
+  const int token_offset = out_token_id - workspace_starts[req_id] +
+                           (seq_starts == nullptr ? 0 : seq_starts[req_id]);
   const int cache_block_idx = token_offset / block_size;
   const int offset_in_block = token_offset % block_size;
   const int physical_block =
@@ -257,7 +259,7 @@ void launch_cp_gather_and_upconvert_nvfp4_kv_cache(
     const int32_t* workspace_starts, int32_t num_reqs, int32_t block_size,
     int32_t total_tokens, int64_t block_table_stride,
     int64_t cache_block_stride, int64_t cache_entry_stride,
-    int64_t dst_entry_stride, cudaStream_t stream) {
+    int64_t dst_entry_stride, const int32_t* seq_starts, cudaStream_t stream) {
   constexpr int warps_per_block = 8;
   const int grid_size = (total_tokens + warps_per_block - 1) / warps_per_block;
   const int block_size_threads = warps_per_block * 32;  // 256 threads
@@ -265,7 +267,7 @@ void launch_cp_gather_and_upconvert_nvfp4_kv_cache(
                                                   0, stream>>>(
       src_cache, reinterpret_cast<__nv_bfloat16*>(dst), block_table,
       workspace_starts, num_reqs, block_size, total_tokens, block_table_stride,
-      cache_block_stride, cache_entry_stride, dst_entry_stride);
+      cache_block_stride, cache_entry_stride, dst_entry_stride, seq_starts);
 }
 
 }  // namespace vllm

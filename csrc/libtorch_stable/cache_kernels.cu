@@ -1847,7 +1847,8 @@ void cp_gather_and_upconvert_nvfp4_kv_cache(
     torch::stable::Tensor const& dst,               // [TOT_TOKENS, 576]
     torch::stable::Tensor const& block_table,       // [BATCH, BLOCK_INDICES]
     torch::stable::Tensor const& workspace_starts,  // [BATCH]
-    int64_t batch_size) {
+    int64_t batch_size,
+    std::optional<torch::stable::Tensor> seq_starts = std::nullopt) {
   // The kernel lives in nvfp4_ds_mla_cache_kernels.cu, which is only built when
   // the target list contains an SM100 arch.
 #if !defined(USE_ROCM) && defined(ENABLE_NVFP4_SM100) && ENABLE_NVFP4_SM100
@@ -1899,7 +1900,9 @@ void cp_gather_and_upconvert_nvfp4_kv_cache(
       workspace_starts.const_data_ptr<int32_t>(),
       static_cast<int32_t>(batch_size), block_size, total_tokens,
       block_table_stride, cache_block_stride, cache_entry_stride,
-      dst_entry_stride, stream);
+      dst_entry_stride,
+      seq_starts.has_value() ? seq_starts->const_data_ptr<int32_t>() : nullptr,
+      stream);
 #else
   STD_TORCH_CHECK(false,
                   "the nvfp4 ds_mla kv-cache format requires a CUDA build "
