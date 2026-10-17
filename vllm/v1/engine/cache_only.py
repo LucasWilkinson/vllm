@@ -23,11 +23,14 @@ def validate_dsv41_cache_only_request(
     params: Any = (
         extra_args.get("kv_transfer_params") if isinstance(extra_args, dict) else None
     )
+    # A dedicated encoder-only producer serves only cache-only requests, so a
+    # remote-decode request implies ``cache_only`` (the llm-d routing sidecar
+    # does not set it).
     if (
         not isinstance(params, dict)
         or not params.get("do_remote_decode")
         or params.get("do_remote_prefill")
-        or not params.get("cache_only")
+        or params.get("cache_only") is False
     ):
         raise VLLMValidationError(
             "A dsv41_encoder_only_prefill producer requires a cache-only "

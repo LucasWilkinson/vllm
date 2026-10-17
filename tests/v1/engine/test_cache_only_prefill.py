@@ -44,7 +44,11 @@ def _request(
     ("kv_transfer_params", "prompt_logprobs", "message"),
     [
         (None, None, "cache-only remote decode request"),
-        ({"do_remote_decode": True}, None, "cache-only remote decode"),
+        (
+            {"do_remote_decode": True, "cache_only": False},
+            None,
+            "cache-only remote decode",
+        ),
         (
             {
                 "do_remote_decode": True,
@@ -88,6 +92,10 @@ def test_cache_only_request_validation_is_request_scoped(
     EngineCore.add_request(core, request, wave)
 
     core.scheduler.add_request.assert_called_once_with(request)
+
+    # The llm-d routing sidecar omits cache_only; the producer implies it.
+    sidecar_request = _request("sidecar", {"do_remote_decode": True})
+    EngineCore.preprocess_add_request(core, sidecar_request)
 
 
 def test_cache_only_request_rejects_multimodal():
