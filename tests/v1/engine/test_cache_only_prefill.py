@@ -116,6 +116,7 @@ def test_frontend_rejects_bad_p_request_before_engine_admission():
     processor = InputProcessor.__new__(InputProcessor)
     processor.vllm_config = SimpleNamespace(
         is_dsv41_encoder_only_prefill=True,
+        watermark_config=None,
         parallel_config=SimpleNamespace(
             data_parallel_size=1,
             data_parallel_size_local=1,

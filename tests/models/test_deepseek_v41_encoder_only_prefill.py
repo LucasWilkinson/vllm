@@ -37,7 +37,9 @@ def test_official_index_sources_do_not_move_encoder_only_boundary(monkeypatch):
     vllm_config = SimpleNamespace(
         model_config=SimpleNamespace(hf_config=hf_config),
         quant_config=None,
-        parallel_config=SimpleNamespace(enable_expert_parallel=False),
+        parallel_config=SimpleNamespace(
+            enable_expert_parallel=False, prefill_context_parallel_size=1
+        ),
         kernel_config=SimpleNamespace(moe_backend="CUTLASS"),
         is_dsv41_encoder_only_prefill=True,
     )
@@ -91,6 +93,9 @@ def test_encoder_only_prefill_stops_at_global_cache_boundary(
     model.engram_hash = None
     model.engram_dp_shared_memory = False
     model.use_sequence_parallel = False
+    model.parallel_config = SimpleNamespace(
+        enable_expert_parallel=False, prefill_context_parallel_size=1
+    )
     model.aux_hidden_state_layers = set()
     model.encoder_only_prefill = True
     model.encoder_only_boundary_layer = 20

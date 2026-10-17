@@ -92,11 +92,11 @@ def test_cache_only_runner_waits_for_kv_writes_before_output(monkeypatch):
         slot_mappings_by_layer=None,
         hidden_states=torch.ones(1, 1),
         aux_hidden_states=None,
-        dp_sync=None,
+        dp_sync_state=None,
         finished_req_ids=set(),
         ec_connector_output=None,
-        routed_experts=None,
         cudagraph_stats=None,
+        num_spec_tokens_to_schedule=0,
     )
     runner.is_last_pp_rank = True
     runner.is_dsv41_encoder_only_prefill = True
