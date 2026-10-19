@@ -117,7 +117,7 @@ def tl_store(ptr, value, mask):
 
 @numba.njit
 def tl_atomic_add(ptr, value, mask):
-    # Programs run one at a time, so this is atomic.
+    # Kernels with atomics launch their programs one at a time.
     old = tl_load(ptr, mask, 0)
     tl_store(ptr, old + value, mask)
     return old
@@ -344,17 +344,27 @@ def _generate(fn: Callable[..., Any], consts: dict[str, Any]) -> tuple[str, list
             pending.update(callees)
     args = ", ".join(params)
     grid = "__grid0, __grid1, __grid2"
-    launch = textwrap.dedent(f"""
-        @njit(cache=True, nogil=True)
-        def __launch({grid}, {args}):
-            for __pid0 in range(__grid0):
-                for __pid1 in range(__grid1):
-                    for __pid2 in range(__grid2):
-                        {fn.__name__}(__pid0, __pid1, __pid2, {grid}, {args})
-    """)
+    # Programs are unordered, as on the GPU, so they can run on all threads,
+    # unless they use atomics.
+    parallel = "tl_atomic" not in body + "".join(helpers.values())
+    launch = "".join(
+        textwrap.dedent(f"""
+        @njit(cache=True, nogil=True, parallel={parallel})
+        def {name}({grid}, {args}):
+            for __pid in {loop}(__grid0 * __grid1 * __grid2):
+                __pid0 = __pid // (__grid1 * __grid2)
+                __pid1 = __pid // __grid2 % __grid1
+                __pid2 = __pid % __grid2
+                {fn.__name__}(__pid0, __pid1, __pid2, {grid}, {args})
+        """)
+        for name, parallel, loop in (
+            ("launch_serial", False, "range"),
+            ("launch_parallel", parallel, "prange"),
+        )
+    )
     header = [
         "import numpy as np",
-        "from numba import njit",
+        "from numba import njit, prange",
         "from vllm.triton_utils.numba_translate import *  # noqa",
         *(f"{k} = {_repr(v)}" for k, v in consts.items()),
     ]
@@ -365,7 +375,7 @@ _RUNTIME_HASH = hashlib.sha256(pathlib.Path(__file__).read_bytes()).hexdigest()
 _CACHE_DIR = pathlib.Path(os.getenv("VLLM_CACHE_ROOT", "~/.cache/vllm"))
 
 
-def _compile(src: str) -> Callable[..., None]:
+def _compile(src: str) -> Any:
     # numba's disk cache needs a source file and doesn't see changes to the
     # runtime above, so key generated modules on both.
     digest = hashlib.sha256((src + _RUNTIME_HASH).encode()).hexdigest()[:16]
@@ -379,7 +389,7 @@ def _compile(src: str) -> Callable[..., None]:
     assert spec is not None and spec.loader is not None
     module = sys.modules[spec.name] = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    return module.__launch
+    return module
 
 
 def _to_ptr(t: torch.Tensor) -> Ptr:
@@ -391,8 +401,11 @@ def _to_ptr(t: torch.Tensor) -> Ptr:
 class NumbaKernel:
     """A Triton kernel translated to numba, launched like the original."""
 
-    def __init__(self, fn: Callable[..., Any]):
+    def __init__(self, fn: Callable[..., Any], parallel: bool = False):
         self.fn = fn
+        # Launches programs on all threads. This costs ~0.1 ms per launch and
+        # threads contend allocating blocks, so it pays off for heavy programs.
+        self.parallel = parallel
         self.__name__ = fn.__name__
         self.signature = inspect.signature(fn)
         self.constexprs = {
@@ -401,7 +414,7 @@ class NumbaKernel:
             if a.annotation and ast.unparse(a.annotation).endswith("constexpr")
         }
         _generate(fn, dict.fromkeys(self.constexprs, 0))  # Fail early.
-        self._compiled: dict[str, tuple[Callable[..., None], list[str]]] = {}
+        self._compiled: dict[str, tuple[Any, list[str]]] = {}
         # The kernel's parameters plus the launch grid, for the dispatcher.
         grid = inspect.Parameter("grid", inspect.Parameter.KEYWORD_ONLY)
         self.__signature__ = self.signature.replace(
@@ -422,29 +435,29 @@ class NumbaKernel:
         if key not in self._compiled:
             src, params = _generate(self.fn, consts)
             self._compiled[key] = _compile(src), params
-        launch, params = self._compiled[key]
+        module, params = self._compiled[key]
         grid = tuple(grid(values) if callable(grid) else grid)
+        grid += (1,) * (3 - len(grid))
+        launch = module.launch_parallel if self.parallel else module.launch_serial
         # numpy has no bfloat16: run on float32 copies, then write them back.
         bf16 = {
             p: values[p].float()
             for p in params
             if isinstance(values[p], torch.Tensor) and values[p].dtype == torch.bfloat16
         }
-        launch(
-            *grid + (1,) * (3 - len(grid)),
-            *(
-                _to_ptr(v) if isinstance(v, torch.Tensor) else v
-                for v in (bf16.get(p, values[p]) for p in params)
-            ),
-        )
+        launch_args = [
+            _to_ptr(v) if isinstance(v, torch.Tensor) else v
+            for v in (bf16.get(p, values[p]) for p in params)
+        ]
+        launch(*grid, *launch_args)
         for p, copy in bf16.items():
             values[p].copy_(copy)
 
 
-def translate_kernel(qualname: str) -> NumbaKernel:
+def translate_kernel(qualname: str, parallel: bool = False) -> NumbaKernel:
     """Translates the Triton kernel at `qualname`, e.g. `pkg.module._kernel`."""
     module, name = qualname.rsplit(".", 1)
-    return NumbaKernel(getattr(importlib.import_module(module), name))
+    return NumbaKernel(getattr(importlib.import_module(module), name), parallel)
 
 
 def translate_kernels(root: str) -> dict[str, NumbaKernel]:

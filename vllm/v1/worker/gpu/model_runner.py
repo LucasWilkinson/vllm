@@ -504,7 +504,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.device,
                 logprobs_mode=self.model_config.logprobs_mode,
             )
-            self.structured_outputs_worker = self.structured_outputs_worker_cls(
+            self.structured_outputs_worker = StructuredOutputsWorker(
                 max_num_logits=self.max_num_reqs * self.decode_query_len,
                 vocab_size=self.vocab_size,
                 device=self.device,
@@ -2407,14 +2407,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def pcp_manager_cls(self) -> type[pcp.PCPManager]:
         return pcp.PCPManager
 
-    # Hardware runners can select the sampler and structured outputs classes.
+    # Hardware runners can select a sampler class.
     @property
     def sampler_cls(self) -> type[Sampler]:
         return Sampler
-
-    @property
-    def structured_outputs_worker_cls(self) -> type[StructuredOutputsWorker]:
-        return StructuredOutputsWorker
 
 
 class ExecuteModelState(NamedTuple):

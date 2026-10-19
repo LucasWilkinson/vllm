@@ -8,14 +8,16 @@ Registered through `vllm.triton_utils.dispatcher`."""
 from collections.abc import Callable
 from typing import Any
 
-# Kernels run as numba translations of their Triton source.
-TRANSLATED_KERNELS = (
-    "vllm.v1.worker.gpu.block_table._gather_block_tables_kernel",
-    "vllm.v1.worker.gpu.block_table._compute_slot_mappings_kernel",
-    "vllm.v1.worker.gpu.buffer_utils._apply_write_kernel",
-    "vllm.v1.worker.gpu.cp_utils._dcp_local_seq_lens_kernel",
-    "vllm.v1.worker.utils._zero_kv_blocks_kernel",
-)
+# Kernels run as numba translations of their Triton source, and whether their
+# programs are launched in parallel.
+TRANSLATED_KERNELS = {
+    "vllm.v1.worker.gpu.block_table._gather_block_tables_kernel": False,
+    "vllm.v1.worker.gpu.block_table._compute_slot_mappings_kernel": False,
+    "vllm.v1.worker.gpu.buffer_utils._apply_write_kernel": False,
+    "vllm.v1.worker.gpu.cp_utils._dcp_local_seq_lens_kernel": False,
+    "vllm.v1.worker.gpu.structured_outputs._apply_grammar_bitmask_kernel": True,
+    "vllm.v1.worker.utils._zero_kv_blocks_kernel": False,
+}
 
 
 def get_kernel_overrides() -> dict[str, Callable[..., Any]]:
@@ -23,7 +25,11 @@ def get_kernel_overrides() -> dict[str, Callable[..., Any]]:
     from vllm.v1.worker.cpu.kernels import input_batch, sample
 
     gpu = "vllm.v1.worker.gpu"
-    return {name: translate_kernel(name) for name in TRANSLATED_KERNELS} | {
+    translated = {
+        name: translate_kernel(name, parallel)
+        for name, parallel in TRANSLATED_KERNELS.items()
+    }
+    return translated | {
         f"{gpu}.mm.rope._prepare_rope_positions_kernel": (
             input_batch.prepare_rope_positions
         ),

@@ -11,7 +11,6 @@ from vllm.logger import init_logger
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.worker.cpu.kernels import input_batch as kernels
 from vllm.v1.worker.cpu.sampler import CPUSampler
-from vllm.v1.worker.cpu.structured_outputs import CPUStructuredOutputsWorker
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.model_runner import BatchReqState, GPUModelRunner
@@ -26,10 +25,6 @@ class CPUModelRunner(GPUModelRunner):
     @property
     def sampler_cls(self) -> type[CPUSampler]:
         return CPUSampler
-
-    @property
-    def structured_outputs_worker_cls(self) -> type[CPUStructuredOutputsWorker]:
-        return CPUStructuredOutputsWorker
 
     def prepare_inputs(
         self,
