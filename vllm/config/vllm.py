@@ -3409,7 +3409,7 @@ class VllmConfig:
         """Check for features not yet supported by the V2 model runner."""
         from vllm.platforms import current_platform
 
-        # CPU registers torch implementations of the runner's Triton kernels.
+        # CPU plugins can register implementations of the runner's Triton kernels.
         if not HAS_TRITON and not current_platform.is_cpu():
             raise ValueError("Model Runner V2 requires Triton.")
 
