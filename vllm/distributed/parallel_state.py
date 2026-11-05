@@ -63,7 +63,6 @@ from vllm.utils.torch_utils import (
 )
 
 if TYPE_CHECKING:
-    from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
     from vllm.distributed.stateless_coordinator import StatelessGroupCoordinator
 
 
@@ -452,8 +451,8 @@ class GroupCoordinator:
     # device communicator (if use_device_communicator=True)
     device_communicator: DeviceCommunicatorBase | None
     mq_broadcaster: Any | None  # shared memory broadcaster
-    # one communicator per DBO microbatch, set by init_dbo_tp_comms
-    ubatch_comms: list["PyNcclCommunicator"] | None = None
+    # microbatch all-reduces run on the DBO comm stream; set by enable_dbo_tp_overlap
+    dbo_overlap: bool = False
 
     def __init__(
         self,
@@ -755,7 +754,7 @@ class GroupCoordinator:
 
     def _all_reduce_out_place(self, input_: torch.Tensor) -> torch.Tensor:
         # Under the vllm.all_reduce custom op, so compiled graphs reach it too.
-        if self.ubatch_comms is not None and not torch.compiler.is_compiling():
+        if self.dbo_overlap and not torch.compiler.is_compiling():
             from vllm.v1.worker.ubatching import dbo_all_reduce
 
             out = dbo_all_reduce(self, input_)
