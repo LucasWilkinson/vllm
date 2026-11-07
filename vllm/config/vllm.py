@@ -2240,7 +2240,7 @@ class VllmConfig:
                 supported_backends = [
                     b
                     for b in supported_backends
-                    if b in ("deepep_low_latency", "deepep_v2", "nixl_ep")
+                    if b in ("deepep_low_latency", "nixl_ep")
                 ]
             # Without expert parallelism this schedule has no all-to-all.
             needs_all2all = (
