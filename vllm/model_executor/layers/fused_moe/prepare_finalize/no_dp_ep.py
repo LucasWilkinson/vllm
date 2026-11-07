@@ -46,8 +46,8 @@ class MoEPrepareAndFinalizeNoDPEPModular(mk.FusedMoEPrepareAndFinalizeModular):
 
     def supports_dbo(self) -> bool:
         # No communication: prepare() and finalize() run on the microbatch's
-        # current stream, so microbatching (SubGPU pipelining on one rank)
-        # needs no compute/comm handoff here.
+        # current stream, so microbatching (attention-feed-forward-overlap on
+        # one rank) needs no compute/comm handoff here.
         return True
 
     @property

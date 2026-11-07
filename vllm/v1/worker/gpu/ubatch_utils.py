@@ -307,12 +307,10 @@ class UBatchRunner:
     Each microbatch gets a thread and its own forward context. Only one thread
     holds the GPU at a time; they hand off to each other at the communication
     points inside the model (see `vllm.v1.worker.ubatching`), so one
-    microbatch's expert all-to-all overlaps the other's compute.
-
-    Under SubGPU pipelining the handoffs are at the attention boundary instead:
-    the compute stream belongs to the attention SM pool and each microbatch's
-    comm stream to the rest-of-layer pool, so one microbatch's attention
-    overlaps the other's rest of the layer.
+    microbatch's expert all-to-all overlaps the other's compute. Under the
+    `attention-feed-forward-overlap` schedule the compute stream belongs to the
+    attention SM pool and each microbatch's comm stream to the feed-forward
+    pool, so one microbatch's attention overlaps the rest of the other's layer.
     """
 
     def __init__(
@@ -351,26 +349,21 @@ class UBatchRunner:
             else None
             for _ in range(self.num_ubatches)
         ]
-        self.schedule = (
-            self.parallel_config.subgpu_schedule
-            if self.parallel_config.subgpu_pipelining
-            else "default"
-        )
-        self.subgpu_pools: GreenContextPools | None = None
+        self.schedule = self.parallel_config.dbo_schedule
+        self.sm_pools: GreenContextPools | None = None
         self.comm_streams: list[torch.cuda.Stream] | None = None
-        if self.schedule == "subgpu":
-            self.subgpu_pools = GreenContextPools(
+        if self.schedule == "attention-feed-forward-overlap":
+            self.sm_pools = GreenContextPools(
                 device.index
                 if device.index is not None
                 else torch.accelerator.current_device_index(),
-                self.parallel_config.subgpu_attn_sms,
-                self.parallel_config.subgpu_rest_sms,
-                self.parallel_config.subgpu_rest_streams,
+                self.parallel_config.dbo_attention_sms,
+                self.num_ubatches,
             )
             # Threads, graph capture and replay all use the attention pool's
-            # stream; each microbatch's rest stage has its own rest-pool stream.
-            self.capture_stream = self.subgpu_pools.attn_stream
-            self.comm_streams = self.subgpu_pools.rest_streams
+            # stream; each microbatch's feed-forward stage has its own stream.
+            self.capture_stream = self.sm_pools.attn_stream
+            self.comm_streams = self.sm_pools.rest_streams
             self.comm_stream = self.comm_streams[0]
             # The pools partition the SMs; DBO's SM reservation does not apply.
             self.sm_control: Any = nullcontext()
@@ -385,17 +378,16 @@ class UBatchRunner:
 
     @contextmanager
     def pool_stream(self):
-        """Run the body on the attention pool's stream under SubGPU pipelining.
+        """Run the body on the attention pool's stream, if there is one.
 
         Microbatches run (and their graphs replay) on that stream so that the
-        pools apply; the caller's stream is ordered before and after. A no-op
-        without pools.
+        pools apply; the caller's stream is ordered before and after.
         """
-        if self.subgpu_pools is None:
+        if self.sm_pools is None:
             yield
             return
         caller_stream = current_stream()
-        stream = self.subgpu_pools.attn_stream
+        stream = self.sm_pools.attn_stream
         stream.wait_stream(caller_stream)
         with torch.cuda.stream(stream):
             yield
@@ -484,8 +476,8 @@ class UBatchRunner:
         The expert all-to-all runs once per microbatch, so each context's DP
         metadata carries that microbatch's token count. Microbatching pads every
         DP rank alike, so each rank can assume that count for the others too.
-        A single rank (SubGPU pipelining) has no DP metadata, as in a whole
-        batch's forward context.
+        A single rank (attention-feed-forward-overlap) has no DP metadata, as
+        in a whole batch's forward context.
         """
         dp_size = self.parallel_config.data_parallel_size
         forward_contexts = []
@@ -646,21 +638,20 @@ def maybe_build_ubatch_runner(
     kv_cache_config: KVCacheConfig,
     max_num_reqs: int,
 ) -> UBatchRunner | None:
-    """Build the microbatch runner, or None when microbatching is not in use.
+    """Build the microbatch runner, or None when DBO is not in use.
 
-    DBO needs the DP handshake to agree on it, so it is only available with
-    more than one DP rank (as in the V1 runner). SubGPU pipelining also runs
-    on one rank, where the token thresholds alone decide.
+    Microbatching needs the DP handshake to agree on it, so it is only
+    available with more than one DP rank (as in the V1 runner), except under
+    `attention-feed-forward-overlap`, where the token thresholds alone decide.
     """
     parallel_config = vllm_config.parallel_config
-    if not parallel_config.use_ubatching:
+    if not parallel_config.use_ubatching or (
+        parallel_config.data_parallel_size <= 1
+        and parallel_config.dbo_schedule == "dispatch-combine-overlap"
+    ):
         return None
-    if parallel_config.subgpu_pipelining:
-        logger.info_once("SubGPU pipelining is enabled.")
-    elif parallel_config.data_parallel_size <= 1:
-        return None
-    else:
-        logger.info_once("Dual batch overlap is enabled.")
+
+    logger.info_once("Dual batch overlap is enabled.")
     return UBatchRunner(
         vllm_config, device, model_state, attn_groups, kv_cache_config, max_num_reqs
     )

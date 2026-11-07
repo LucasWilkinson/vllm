@@ -2147,31 +2147,13 @@ def test_dbo_thresholds_cover_a_request_per_microbatch(threshold, expected):
     assert parallel_config.dbo_prefill_token_threshold == expected
 
 
-def test_subgpu_pipelining_uses_two_micro_batches():
-    assert not ParallelConfig().use_ubatching
-    config = ParallelConfig(subgpu_pipelining=True)
-    assert config.use_ubatching
-    assert config.num_ubatches == 2
-
-
-def test_subgpu_pipelining_config_validation():
-    with pytest.raises(ValueError, match="mutually exclusive"):
-        ParallelConfig(subgpu_pipelining=True, enable_dbo=True)
-    with pytest.raises(ValueError, match="multiple of 8"):
-        ParallelConfig(subgpu_pipelining=True, subgpu_attn_sms=66, subgpu_rest_sms=82)
-    # The green-context split needs only one of the two pools 8-SM aligned.
-    ParallelConfig(subgpu_pipelining=True, subgpu_attn_sms=64, subgpu_rest_sms=84)
-    # The DBO thresholds apply to SubGPU pipelining as well.
-    with pytest.raises(ValueError, match="number of microbatches"):
-        ParallelConfig(subgpu_pipelining=True, dbo_decode_token_threshold=1)
-
-
-def test_subgpu_pipelining_rejects_stream_switching_all2all_backends(monkeypatch):
+def test_attention_feed_forward_overlap_rejects_stream_switching_all2all_backends(
+    monkeypatch,
+):
     """The high-throughput and naive prepare/finalize switch streams around
-    their collectives; SubGPU pipelining runs the MoE on the rest pool's
-    stream, so with expert parallelism only the backends whose collectives
-    stay on the caller's stream work: the hook-based low-latency and nixl_ep
-    backends and deepep_v2's blocking collectives."""
+    their collectives; attention-feed-forward-overlap runs the MoE on the
+    feed-forward pool's stream, so with expert parallelism only the backends
+    whose collectives stay on the caller's stream work."""
     monkeypatch.setattr(envs, "VLLM_USE_V2_MODEL_RUNNER", None)
     # opt-125m has no experts; expert parallelism needs an MoE model, so
     # present it as one (the guard reads only the backend name).
@@ -2181,7 +2163,8 @@ def test_subgpu_pipelining_rejects_stream_switching_all2all_backends(monkeypatch
         return VllmConfig(
             model_config=ModelConfig("facebook/opt-125m", dtype="float16", seed=0),
             parallel_config=ParallelConfig(
-                subgpu_pipelining=True,
+                enable_dbo=True,
+                dbo_schedule="attention-feed-forward-overlap",
                 enable_expert_parallel=True,
                 all2all_backend=backend,
             ),
@@ -2190,25 +2173,21 @@ def test_subgpu_pipelining_rejects_stream_switching_all2all_backends(monkeypatch
             ),
         )
 
-    with pytest.raises(ValueError, match="switches streams"):
+    with pytest.raises(ValueError, match="deepep_high_throughput is not supported"):
         make("deepep_high_throughput")
     assert make("deepep_low_latency").parallel_config.use_ubatching
-    # deepep_v2 passes this guard; whether the platform lists it among the
-    # micro-batching backends is a separate check with its own message.
-    try:
-        make("deepep_v2")
-    except ValidationError as e:
-        assert "switches streams" not in str(e)
-        assert "Microbatching currently only supports" in str(e)
 
 
-def test_subgpu_pipelining_selects_the_v2_model_runner(monkeypatch):
-    """Microbatching picks the V1 runner until DBO on V2 is stable; SubGPU
-    pipelining exists only in V2, so asking for it is the opt-in."""
+def test_attention_feed_forward_overlap_selects_the_v2_model_runner(monkeypatch):
+    """DBO picks the V1 runner until it is stable on V2;
+    attention-feed-forward-overlap exists only in V2, so asking for it is the
+    opt-in."""
     monkeypatch.setattr(envs, "VLLM_USE_V2_MODEL_RUNNER", None)
     config = VllmConfig(
         model_config=ModelConfig("facebook/opt-125m", dtype="float16", seed=0),
-        parallel_config=ParallelConfig(subgpu_pipelining=True),
+        parallel_config=ParallelConfig(
+            enable_dbo=True, dbo_schedule="attention-feed-forward-overlap"
+        ),
         compilation_config=CompilationConfig(
             cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY
         ),

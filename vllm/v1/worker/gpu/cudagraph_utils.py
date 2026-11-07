@@ -574,7 +574,7 @@ class CudaGraphManager:
         get_offloader().sync_prev_onload()
         if desc.num_ubatches > 1:
             # On the stream the microbatches were captured on, so that the SM
-            # pools of SubGPU pipelining apply (a no-op without pools).
+            # pools of attention-feed-forward-overlap apply (a no-op without).
             assert self.ubatch_runner is not None
             with self.ubatch_runner.pool_stream():
                 self.graphs[desc].replay()
