@@ -1121,7 +1121,9 @@ class Qwen4ExpForConditionalGenerationConfig(Qwen3_5ForConditionalGenerationConf
         uses_ple_or_qsa = bool(text_config.ple_layer_ids) or (
             getattr(text_config, "indexer_n_heads", None) is not None
         )
-        if uses_ple_or_qsa and parallel_config.use_ubatching:
+        if uses_ple_or_qsa and (
+            parallel_config.enable_dbo or parallel_config.ubatch_size > 1
+        ):
             raise NotImplementedError(
                 "Qwen4Exp PLE/QSA does not support dual-batch overlap or microbatching"
             )

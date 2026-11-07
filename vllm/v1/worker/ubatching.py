@@ -63,6 +63,9 @@ class UBatchContext:
         self._restore_context()
         # Assume we want to start on the compute stream
         self.update_stream(self.compute_stream)
+        if self.schedule == "attention-feed-forward-overlap":
+            # Only attention runs on the attention pool (the compute stream).
+            self.switch_to_comm_sync()
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
@@ -70,6 +73,9 @@ class UBatchContext:
         _CURRENT_CONTEXTS[self.id] = None
         del _THREAD_ID_TO_CONTEXT[threading.get_ident()]
         self.maybe_run_recv_hook()
+        if self.schedule == "attention-feed-forward-overlap":
+            # End on the stream the step started (and the graph is captured) on.
+            self.switch_to_compute_sync()
         self.cpu_signal_event.set()
         self.cpu_wait_event.clear()
         return False
@@ -134,10 +140,10 @@ class UBatchContext:
             return
         # The hook completes the peer microbatch's receive, so its kernels
         # belong on the peer's stream, ahead of the work that consumes the
-        # received data. Under DBO both microbatches share one compute stream
-        # and this never triggers; under SubGPU pipelining each microbatch's
-        # rest stage has its own stream and a microbatch exits on the
-        # attention pool while its peer's receive may still be pending.
+        # received data. Under dispatch-combine-overlap both microbatches share
+        # one compute stream and this never triggers; under
+        # attention-feed-forward-overlap each microbatch's feed-forward stage
+        # has its own stream.
         with torch.cuda.stream(stream):
             hook()
 
@@ -146,7 +152,10 @@ class UBatchContext:
         self._cpu_yield()
         self.update_stream(self.current_stream)
 
-    def yield_and_switch_from_compute_to_comm(self):
+    def yield_and_switch_from_compute_to_comm(self, schedule: str | None = None):
+        """With `schedule`, a no-op unless that schedule is running."""
+        if schedule is not None and schedule != self.schedule:
+            return
         assert current_stream() == self.compute_stream
         self._signal_compute_done()
         self._cpu_yield()
@@ -154,27 +163,16 @@ class UBatchContext:
         self.update_stream(self.comm_stream)
         self._wait_compute_done()
 
-    def yield_and_switch_from_comm_to_compute(self):
+    def yield_and_switch_from_comm_to_compute(self, schedule: str | None = None):
+        """With `schedule`, a no-op unless that schedule is running."""
+        if schedule is not None and schedule != self.schedule:
+            return
         assert current_stream() == self.comm_stream
         self._signal_comm_done()
         self._cpu_yield()
         assert self.current_stream == self.comm_stream
         self.update_stream(self.compute_stream)
         self._wait_comm_done()
-
-    def subgpu_ensure_attn(self):
-        """Under SubGPU pipelining, move to the attention pool (the compute
-        stream) unless already there."""
-        if self.schedule != "subgpu" or self.current_stream == self.compute_stream:
-            return
-        self.yield_and_switch_from_comm_to_compute()
-
-    def subgpu_ensure_rest(self):
-        """Under SubGPU pipelining, move to the rest pool (the comm stream)
-        unless already there."""
-        if self.schedule != "subgpu" or self.current_stream == self.comm_stream:
-            return
-        self.yield_and_switch_from_compute_to_comm()
 
 
 def dbo_enabled() -> bool:
@@ -222,8 +220,6 @@ dbo_switch_to_comm_sync = _register_ubatch_function(UBatchContext.switch_to_comm
 dbo_switch_to_compute_sync = _register_ubatch_function(
     UBatchContext.switch_to_compute_sync
 )
-dbo_subgpu_ensure_attn = _register_ubatch_function(UBatchContext.subgpu_ensure_attn)
-dbo_subgpu_ensure_rest = _register_ubatch_function(UBatchContext.subgpu_ensure_rest)
 
 
 def dbo_register_recv_hook(recv_hook):
@@ -254,12 +250,6 @@ def make_ubatch_contexts(
     token_offsets: list[int] | None = None,
     comm_streams: list[torch.cuda.Stream] | None = None,
 ) -> list[UBatchContext]:
-    """Create the contexts of one microbatched step, one per thread.
-
-    `comm_streams` gives each microbatch its own comm stream (SubGPU pipelining
-    runs each micro-batch's rest stage on its own stream of the rest pool);
-    otherwise all share `comm_stream`.
-    """
     global _NUM_UBATCHES, _CURRENT_CONTEXTS
     assert num_micro_batches > 1, "num_micro_batches must be greater than 1"
 
@@ -268,6 +258,9 @@ def make_ubatch_contexts(
     if len(_CURRENT_CONTEXTS) < num_micro_batches:
         _CURRENT_CONTEXTS.extend([None] * (num_micro_batches - len(_CURRENT_CONTEXTS)))
 
+    """
+    Create a context manager for micro-batching synchronization.
+    """
     cpu_events = [threading.Event() for _ in range(num_micro_batches)]
     gpu_comm_done_events = [torch.Event() for _ in range(num_micro_batches)]
     gpu_compute_done_events = [torch.Event() for _ in range(num_micro_batches)]

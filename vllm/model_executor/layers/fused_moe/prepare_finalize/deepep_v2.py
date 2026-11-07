@@ -121,9 +121,12 @@ class DeepEPV2PrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         self.buffer = buffer
         # One buffer per micro-batch when micro-batching is on: the
         # collectives of two micro-batches in flight at the same time (two
-        # rest streams under SubGPU pipelining) must not share a buffer's
-        # slots, counters and barrier. Index = the current micro-batch id.
-        self.buffers: list[deep_ep.ElasticBuffer] = list(buffers) if buffers else [buffer]
+        # feed-forward streams under attention-feed-forward-overlap) must not
+        # share a buffer's slots, counters and barrier. Index = the current
+        # micro-batch id.
+        self.buffers: list[deep_ep.ElasticBuffer] = (
+            list(buffers) if buffers else [buffer]
+        )
         self.num_dispatchers_ = num_dispatchers
         self.dp_size = dp_size
         self.rank_expert_offset = rank_expert_offset

@@ -1270,10 +1270,10 @@ class DeepEPV2All2AllManager(All2AllManagerBase):
         kwargs = dict(kwargs)
         num_experts = kwargs.pop("num_experts", 256)
         # Micro-batching: one ElasticBuffer per micro-batch, so that two
-        # micro-batches' collectives in flight at the same time (two rest
-        # streams under SubGPU pipelining) never share a buffer's slots,
-        # counters and barrier. Same constructor arguments, distinct cache
-        # key; the index is not a buffer argument.
+        # micro-batches' collectives in flight at the same time (two
+        # feed-forward streams under attention-feed-forward-overlap) never share
+        # a buffer's slots, counters and barrier. Same constructor arguments,
+        # distinct cache key; the index is not a buffer argument.
         ubatch_idx = kwargs.pop("ubatch_idx", 0)
         buffer_kwargs = self._make_all2all_kwargs(**kwargs)
         if not self._gin_checked:

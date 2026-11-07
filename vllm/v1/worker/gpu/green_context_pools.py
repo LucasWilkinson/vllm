@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""CUDA green-context SM pools for SubGPU pipelining.
+"""CUDA green-context SM pools for the attention-feed-forward-overlap schedule.
 
 Kernels launched on a green-context stream run only on that context's SMs, so
-the attention pool and the rest-of-layer pool partition the GPU. Both pools are
-split out of one container green context, by whichever count is a multiple of
-8 (the split granularity); the other pool gets the remainder.
+the attention pool and the rest-of-layer pool partition the GPU. The device's
+SMs are split by whichever pool's count is a multiple of 8 (the split
+granularity); the other pool gets the remainder.
 
 The driver API is used directly because the two pools must be disjoint:
 `torch.cuda.green_contexts.GreenContext(num_sms=...)` (torch 2.14) creates
@@ -59,28 +59,19 @@ def _split(res, min_count: int, flags: int = 0):
 
 
 class GreenContextPools:
-    """An attention pool with one stream and a rest pool with `num_rest_streams`
-    streams. The streams are `torch.cuda.ExternalStream`s, which do not own
-    their handles, so this object must outlive them."""
+    """An attention pool of `attn_sms` SMs with one stream and a rest pool of
+    the remaining SMs with `num_rest_streams` streams. The streams are
+    `torch.cuda.ExternalStream`s, which do not own their handles, so this
+    object must outlive them."""
 
     def __init__(
         self,
         device_index: int,
         attn_sms: int,
-        rest_sms: int,
         num_rest_streams: int = 2,
     ) -> None:
         if _cu is None:
-            raise RuntimeError("SubGPU pipelining requires cuda-python.")
-        if rest_sms % 8 == 0:
-            split_count, split_is_attn = rest_sms, False
-        elif attn_sms % 8 == 0:
-            split_count, split_is_attn = attn_sms, True
-        else:
-            raise ValueError(
-                f"Neither attn_sms={attn_sms} nor rest_sms={rest_sms} is a "
-                "multiple of 8."
-            )
+            raise RuntimeError("Green-context SM pools require cuda-python.")
         self._gctxs: list = []
         self._raw_streams: list = []
         _check(_cu.cuInit(0))
@@ -106,13 +97,17 @@ class GreenContextPools:
 
         try:
             dev_res = _check(_cu.cuDeviceGetDevResource(dev, sm_type))
-            container, _ = _split(dev_res, attn_sms + rest_sms)
-            if not container:
-                raise RuntimeError("container green-context split failed")
-            parent = _check(
-                _cu.cuGreenCtxGetDevResource(make_gctx(container[0]), sm_type)
-            )
-            groups, rem = _split(parent, split_count)
+            rest_sms = int(_sm_of(dev_res).smCount) - attn_sms
+            if rest_sms % 8 == 0:
+                split_count, split_is_attn = rest_sms, False
+            elif attn_sms % 8 == 0:
+                split_count, split_is_attn = attn_sms, True
+            else:
+                raise ValueError(
+                    f"Neither attn_sms={attn_sms} nor rest_sms={rest_sms} is a "
+                    "multiple of 8."
+                )
+            groups, rem = _split(dev_res, split_count)
             if not groups or rem is None:
                 raise RuntimeError(f"split({split_count}) gave no group + remainder")
             res_attn, res_rest = (groups[0], rem) if split_is_attn else (rem, groups[0])
@@ -128,7 +123,7 @@ class GreenContextPools:
             self._destroy()
             raise
         logger.info(
-            "SubGPU pipelining: attention pool %d SMs, rest pool %d SMs, "
+            "Green-context SM pools: attention %d SMs, rest of the layer %d SMs, "
             "%d rest stream(s).",
             self.attn_sms,
             self.rest_sms,
@@ -144,5 +139,5 @@ class GreenContextPools:
         self._gctxs = []
 
     def close(self) -> None:
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         self._destroy()

@@ -321,10 +321,10 @@ def dispatch_cg_and_sync_dp(
             and parallel_config is not None
             and check_ubatch_thresholds(parallel_config, num_tokens, uniform_decode)
         ):
-            # No other rank to agree with (SubGPU pipelining on one rank): the
-            # thresholds decide, and only a captured microbatched graph is
-            # taken. An eager two-pool step has nothing to gain, so without
-            # one the batch runs whole.
+            # No other rank to agree with (attention-feed-forward-overlap on
+            # one rank): the thresholds decide, and only a captured
+            # microbatched graph is taken. An eager two-pool step has nothing
+            # to gain, so without one the batch runs whole.
             assert cudagraph_manager is not None
             ubatch_desc = cudagraph_manager.dispatch(
                 num_reqs,

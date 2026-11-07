@@ -300,13 +300,11 @@ def maybe_make_prepare_finalize(
         handle = all2all_manager.get_handle(all_to_all_args)
         vllm_config = get_current_vllm_config()
         use_cudagraph = not vllm_config.model_config.enforce_eager
-        # One buffer per micro-batch (DBO, SubGPU pipelining): the
-        # prepare/finalize picks the current micro-batch's buffer.
+        # One buffer per micro-batch: the prepare/finalize picks the current
+        # micro-batch's buffer.
         parallel_config = vllm_config.parallel_config
         num_ubatches = (
-            max(2, parallel_config.ubatch_size)
-            if parallel_config.use_ubatching
-            else 1
+            max(2, parallel_config.ubatch_size) if parallel_config.use_ubatching else 1
         )
         buffers = [handle] + [
             all2all_manager.get_handle(dict(all_to_all_args, ubatch_idx=i))
