@@ -394,12 +394,11 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if (
             self.pynccl_comm is not None
             and not use_fi_ar
-            and out is None
             and should_nccl_symm_mem_allreduce(self.pynccl_comm.world_size, input_)
         ):
-            out = torch.ops.vllm.all_reduce_symmetric_with_copy(input_)
-            if out is not None:
-                return out
+            result = torch.ops.vllm.all_reduce_symmetric_with_copy(input_)
+            if result is not None:
+                return result if out is None else out.copy_(result)
         qr_comm = self.qr_comm
         if (
             qr_comm is not None
@@ -424,9 +423,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
             and not aiter_ar_comm.disabled
             and aiter_ar_comm.should_custom_ar(input_)
         ):
-            out = aiter_ar_comm.custom_all_reduce(input_, out=out)
-            assert out is not None
-            return out
+            result = aiter_ar_comm.custom_all_reduce(input_)
+            assert result is not None
+            return result if out is None else out.copy_(result)
         ca_comm = self.ca_comm
         if (
             ca_comm is not None
