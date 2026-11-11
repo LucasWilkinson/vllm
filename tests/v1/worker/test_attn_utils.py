@@ -8,6 +8,7 @@ never addressed by the logical view.
 """
 
 import importlib
+from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
@@ -25,15 +26,26 @@ from tests.v1.attention.utils import (
 )
 from tests.v1.core.utils import full_layer, new_kv_cache_group, new_kv_cache_spec
 from vllm.config.compilation import CompilationConfig, CUDAGraphMode
+from vllm.platforms import current_platform
+from vllm.v1 import kv_cache_compat
 from vllm.v1.attention.backend import AttentionBackend, AttentionCGSupport, MultipleOf
 from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
 from vllm.v1.core.single_type_kv_cache_manager import (
+    ChunkedLocalAttentionManager,
+    CircularBufferManager,
+    CrossAttentionManager,
+    EncoderOnlyAttentionManager,
+    FullAttentionManager,
     HiSparseResidentManager,
     HiSparseSourceManager,
+    RSWAManager,
+    SinkFullAttentionManager,
+    SlidingWindowManager,
 )
 from vllm.v1.hisparse.backend import CUDAHiSparseBackend
 from vllm.v1.hisparse.binding import allocate_hisparse_kv_caches
 from vllm.v1.hisparse.runtime import _has_hisparse_ops
+from vllm.v1.kv_cache_compat import KVCacheSpecRegistry
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     HiSparsePageSpec,
@@ -152,6 +164,105 @@ def test_get_kv_cache_layer_configs_tags_draft_layers(monkeypatch):
 
     layer_configs = attn_utils.get_kv_cache_layer_configs(config)
     assert layer_configs["draft"].is_draft and not layer_configs["target"].is_draft
+
+
+def _get_layer_configs(monkeypatch, layers: dict[str, Any]):
+    backend = SimpleNamespace(
+        customize_spec=AttentionBackend.customize_spec,
+        get_supported_kernel_block_sizes=lambda _=None: [16],
+    )
+    for layer in layers.values():
+        layer.get_attn_backend = lambda: backend
+        layer.is_draft_layer = False
+        layer.kv_sharing_target_layer_name = None
+    monkeypatch.setattr(attn_utils, "get_layers_from_vllm_config", lambda *_: layers)
+    config = SimpleNamespace(attention_config=SimpleNamespace(hisparse_config=None))
+    return attn_utils.get_kv_cache_layer_configs(config)
+
+
+@pytest.mark.parametrize(
+    ("old_cls", "manager", "params"),
+    [
+        (kv_cache_compat.FullAttentionSpec, FullAttentionManager, {}),
+        (MLAAttentionSpec, FullAttentionManager, {}),
+        (
+            kv_cache_compat.SlidingWindowSpec,
+            SlidingWindowManager,
+            {"sliding_window": 128, "extra_retained_tokens": 3},
+        ),
+        (
+            kv_cache_compat.SlidingWindowMLASpec,
+            SlidingWindowManager,
+            {"sliding_window": 128, "bounded_replay": True},
+        ),
+        (
+            kv_cache_compat.ChunkedLocalAttentionSpec,
+            ChunkedLocalAttentionManager,
+            {"attention_chunk_size": 8192},
+        ),
+        (kv_cache_compat.CircularBufferSpec, CircularBufferManager, {}),
+        (kv_cache_compat.RSWASpec, RSWAManager, {"rswa_window": 512}),
+        (
+            kv_cache_compat.SinkFullAttentionSpec,
+            SinkFullAttentionManager,
+            {"sink_len": 32},
+        ),
+        (kv_cache_compat.CrossAttentionSpec, CrossAttentionManager, {}),
+        (kv_cache_compat.EncoderOnlyAttentionSpec, EncoderOnlyAttentionManager, {}),
+    ],
+)
+def test_get_kv_cache_layer_configs_translates_deprecated_spec(
+    monkeypatch, old_cls, manager, params
+):
+    """A layer still implementing only `get_kv_cache_spec` gets the layer config
+    the new API builds for the same policy and layout."""
+    layout = dict(block_size=16, num_kv_heads=1, head_size=64, dtype=torch.bfloat16)
+    layout_cls = (
+        MLAAttentionSpec if issubclass(old_cls, MLAAttentionSpec) else AttentionSpec
+    )
+    old_spec = old_cls(**layout, **params)
+    new_config = manager.layer_config(layout_cls(**layout), **params)
+    layers = {
+        "old": SimpleNamespace(get_kv_cache_spec=lambda _: old_spec),
+        "new": SimpleNamespace(get_kv_cache_config=lambda _: new_config),
+    }
+    with pytest.deprecated_call():
+        configs = _get_layer_configs(monkeypatch, layers)
+    assert configs["old"] == configs["new"]
+
+
+def test_deprecated_spec_names_import_from_kv_cache_interface():
+    with pytest.deprecated_call():
+        from vllm.v1.kv_cache_interface import SlidingWindowSpec
+    assert SlidingWindowSpec is kv_cache_compat.SlidingWindowSpec
+
+
+def test_platform_registered_spec_maps_to_its_manager(monkeypatch):
+    """A spec class the deprecated platform hook registers stays the layer's
+    spec, with its manager's params read from its fields."""
+
+    @dataclass(frozen=True, kw_only=True)
+    class CustomSinkSpec(AttentionSpec):
+        sink_len: int
+
+    monkeypatch.setattr(
+        kv_cache_compat, "_SPEC_MANAGERS", dict(kv_cache_compat._SPEC_MANAGERS)
+    )
+    monkeypatch.setattr(
+        current_platform,
+        "register_custom_kv_cache_specs",
+        lambda _: KVCacheSpecRegistry.register(
+            CustomSinkSpec, SinkFullAttentionManager
+        ),
+    )
+    spec = CustomSinkSpec(
+        block_size=16, num_kv_heads=1, head_size=64, dtype=torch.bfloat16, sink_len=32
+    )
+    layers = {"old": SimpleNamespace(get_kv_cache_spec=lambda _: spec)}
+    with pytest.deprecated_call():
+        configs = _get_layer_configs(monkeypatch, layers)
+    assert configs["old"].manager_config == SinkFullAttentionManager.config(sink_len=32)
+    assert type(configs["old"].spec) is CustomSinkSpec
 
 
 class _FakeMetadataBuilder:
