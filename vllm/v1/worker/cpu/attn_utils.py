@@ -19,6 +19,7 @@ from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.utils import (
     create_fast_prefill_custom_backend,
 )
+from vllm.v1.kv_cache_compat import get_layer_kv_cache_config
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheLayerConfig,
@@ -81,7 +82,7 @@ def get_kv_cache_layer_configs(
             # This layer will use KV cache of the sharing target layer.
             continue
         # Skip modules that don't need KV cache (eg encoder-only attention)
-        if layer_config := attn_module.get_kv_cache_config(vllm_config):
+        if layer_config := get_layer_kv_cache_config(attn_module, vllm_config):
             layer_configs[layer_name] = customize_layer_config(
                 attn_module.get_attn_backend(), layer_config
             )

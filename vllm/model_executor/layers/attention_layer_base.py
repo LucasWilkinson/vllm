@@ -39,9 +39,8 @@ class AttentionLayerBase(ABC):
         """Get the attention backend class for this layer."""
         pass
 
-    @abstractmethod
     def get_kv_cache_config(self, vllm_config: VllmConfig) -> KVCacheLayerConfig | None:
         """Get the KV cache config for this layer.
         May be None if the layer does not need KV cache.
         """
-        pass
+        raise NotImplementedError

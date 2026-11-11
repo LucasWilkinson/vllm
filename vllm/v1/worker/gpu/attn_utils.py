@@ -28,6 +28,7 @@ from vllm.v1.hisparse.binding import (
     init_hisparse_kv_cache,
     resolve_hisparse_specs,
 )
+from vllm.v1.kv_cache_compat import get_layer_kv_cache_config
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheLayerConfig,
@@ -148,7 +149,7 @@ def get_kv_cache_layer_configs(
             # This layer will use KV cache of the sharing target layer.
             continue
         # Skip modules that don't need KV cache (eg encoder-only attention)
-        if layer_config := attn_module.get_kv_cache_config(vllm_config):
+        if layer_config := get_layer_kv_cache_config(attn_module, vllm_config):
             layer_config = customize_layer_config(
                 attn_module.get_attn_backend(), layer_config
             )

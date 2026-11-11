@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import math
+import warnings
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from enum import IntEnum, StrEnum
@@ -939,3 +940,32 @@ class KVCacheConfig:
                 if isinstance(spec, AttentionSpec)
             )
         return len(kv_cache_precisions) > 1
+
+
+_DEPRECATED_SPEC_NAMES = frozenset(
+    {
+        "FullAttentionSpec",
+        "SlidingWindowSpec",
+        "SlidingWindowMLASpec",
+        "ChunkedLocalAttentionSpec",
+        "CircularBufferSpec",
+        "RSWASpec",
+        "SinkFullAttentionSpec",
+        "CrossAttentionSpec",
+        "EncoderOnlyAttentionSpec",
+    }
+)
+
+
+def __getattr__(name: str):
+    if name in _DEPRECATED_SPEC_NAMES:
+        from vllm.v1 import kv_cache_compat
+
+        warnings.warn(
+            f"{name} is deprecated; return `Manager.layer_config(spec, **params)` "
+            "from `get_kv_cache_config` with a layout spec.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return getattr(kv_cache_compat, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
