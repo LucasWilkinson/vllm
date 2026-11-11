@@ -141,9 +141,16 @@ class AttentionBackend(ABC):
         return False
 
     @classmethod
-    def customize_spec(cls, spec: "AttentionSpec") -> "AttentionSpec":
+    def customize_spec(
+        cls, spec: "AttentionSpec"
+    ) -> "AttentionSpec | dict[str, AttentionSpec]":
         """Adjust the layer's KV cache spec for this backend's kernels. Used when the
         kernels want KV packed in a specific way.
+
+        A backend that keeps several caches for a layer returns their specs by
+        cache name, `""` being the layer's own cache; each is planned as a
+        separate cache (see `kv_cache_name`) and `bind_kv_cache` receives them
+        by cache name.
 
         NOTE: temporary compatibility API. Today the Attention layer builds the spec
         from the model config and the backend only gets to adjust it post-hoc; the end
@@ -153,6 +160,14 @@ class AttentionBackend(ABC):
         (see: https://github.com/vllm-project/vllm/issues/42449)
         """
         return spec
+
+    @classmethod
+    def get_page_size_bytes(cls, spec: "AttentionSpec") -> int:
+        """Bytes per block of a layer's caches, as this backend packs them."""
+        specs = cls.customize_spec(spec)
+        if isinstance(specs, AttentionSpec):
+            return specs.page_size_bytes
+        return sum(spec.page_size_bytes for spec in specs.values())
 
     @classmethod
     def get_preferred_block_size(cls, default_block_size: int) -> int:

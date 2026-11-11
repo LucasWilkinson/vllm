@@ -38,6 +38,7 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     create_kv_cache_views,
     get_block_table_width,
+    kv_cache_name,
 )
 
 logger = init_logger(__name__)
@@ -518,35 +519,48 @@ def map_kv_caches_to_kernel_blocks(
     for group in attn_groups:
         if group.kernel_block_size is not None:
             mapped.update(
-                (name, group.map_kv_cache_to_kernel_blocks(kv_caches[name]))
-                for name in group.layer_names
-                if name in kv_caches
+                (name, group.map_kv_cache_to_kernel_blocks(kv_cache))
+                for name, kv_cache in kv_caches.items()
+                if name.partition(":")[0] in group.layer_names
             )
     return mapped
 
 
 def customize_attention_spec(
     backend: type[AttentionBackend], spec: AttentionSpec
-) -> AttentionSpec:
-    """The backend's spec. Blocks larger than every kernel block size a backend
-    takes are split into kernel blocks, which packed blocks must keep whole."""
-    spec = backend.customize_spec(spec)
+) -> dict[str, AttentionSpec]:
+    """The backend's specs by cache name (see `kv_cache_name`). Blocks larger
+    than every kernel block size a backend takes are split into kernel blocks,
+    which packed blocks must keep whole."""
+    specs = backend.customize_spec(spec)
+    if isinstance(specs, AttentionSpec):
+        specs = {"": specs}
     sizes = backend.get_supported_kernel_block_sizes(spec)
     fixed_sizes = [s for s in sizes if isinstance(s, int)]
-    if spec.block_stride_alignment is None and sizes and fixed_sizes == sizes:
-        spec = replace(spec, block_stride_alignment=MultipleOf(max(fixed_sizes)))
-    return spec
+    if sizes and fixed_sizes == sizes:
+        alignment = MultipleOf(max(fixed_sizes))
+        specs = {
+            name: spec
+            if spec.block_stride_alignment is not None
+            else replace(spec, block_stride_alignment=alignment)
+            for name, spec in specs.items()
+        }
+    return specs
 
 
 def customize_layer_config(
-    backend: type[AttentionBackend], layer_config: KVCacheLayerConfig
-) -> KVCacheLayerConfig:
-    """Apply `customize_attention_spec` to an attention layer's spec."""
+    backend: type[AttentionBackend], layer_name: str, layer_config: KVCacheLayerConfig
+) -> dict[str, KVCacheLayerConfig]:
+    """The layer's KV caches by name (see `kv_cache_name`), with
+    `customize_attention_spec` applied to an attention layer's spec."""
     if not isinstance(layer_config.spec, AttentionSpec):
-        return layer_config
-    return replace(
-        layer_config, spec=customize_attention_spec(backend, layer_config.spec)
-    )
+        return {layer_name: layer_config}
+    return {
+        kv_cache_name(layer_name, cache_name): replace(layer_config, spec=spec)
+        for cache_name, spec in customize_attention_spec(
+            backend, layer_config.spec
+        ).items()
+    }
 
 
 def _block_size_is_supported(
@@ -678,7 +692,7 @@ def layer_spec_for_tensor(
     group_id, group = next(
         (group_id, group)
         for group_id, group in enumerate(kv_cache_config.kv_cache_groups)
-        if layer_name in group.layer_names
+        if layer_name in group.kv_cache_specs
     )
     return group_id, group.kv_cache_specs[layer_name]
 
@@ -751,7 +765,7 @@ def prepare_kernel_block_sizes(
                 if any(
                     t.block_stride > t.layer_stride
                     for t in kv_cache_config.kv_cache_tensors
-                    if not set(t.layers).isdisjoint(kv_cache_group.layer_names)
+                    if not set(t.layers).isdisjoint(kv_cache_group.kv_cache_specs)
                 )
                 else select_common_block_size(
                     kv_manager_block_size, group_backends, group_specs
@@ -956,13 +970,19 @@ def bind_kv_cache_to_layers(
     kv_caches: dict[str, torch.Tensor],
     forward_context: dict[str, Attention],
 ) -> None:
-    """Bind layer cache views."""
+    """Bind layer cache views, by cache name for layers with several caches."""
+    layer_views: defaultdict[str, dict[str, torch.Tensor]] = defaultdict(dict)
+    for name, kv_cache in kv_caches.items():
+        layer_name, _, cache_name = name.partition(":")
+        layer_views[layer_name][cache_name] = kv_cache
     # Bind kv_caches to forward context. Each layer's bind_kv_cache unpacks
     # its raw allocation into the per-layer view(s) it needs (e.g. Mamba
     # splits conv/ssm), so the kv_caches dict can hold a single tensor per
     # layer for the KV connector to register.
-    for layer_name, kv_cache in kv_caches.items():
-        forward_context[layer_name].bind_kv_cache(kv_cache)
+    for layer_name, views in layer_views.items():
+        forward_context[layer_name].bind_kv_cache(
+            views[""] if views.keys() == {""} else views
+        )
 
 
 def clear_layer_kv_caches(layers: Iterable[Any]) -> None:

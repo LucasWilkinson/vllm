@@ -631,6 +631,12 @@ class KVCacheTensor:
     host_resident: bool = False
 
 
+def kv_cache_name(layer_name: str, cache_name: str) -> str:
+    """Name of a layer's KV cache. `""` is the layer's own cache, named after
+    the layer; a layer's other caches are `"<layer name>:<cache name>"`."""
+    return f"{layer_name}:{cache_name}" if cache_name else layer_name
+
+
 class KVCacheGroupRole(StrEnum):
     DEFAULT = "default"
     HISPARSE_INDEXER = "hisparse_indexer"
@@ -709,7 +715,9 @@ class KVCacheGroup:
 
     @property
     def layer_names(self) -> list[str]:
-        return list(self.kv_cache_specs)
+        """Layers whose own KV cache is in this group. `kv_cache_specs` also
+        holds their other named caches (see `kv_cache_name`)."""
+        return [name for name in self.kv_cache_specs if ":" not in name]
 
     @property
     def page_size_bytes(self) -> int:

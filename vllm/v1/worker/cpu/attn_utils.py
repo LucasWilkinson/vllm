@@ -82,8 +82,10 @@ def get_kv_cache_layer_configs(
             continue
         # Skip modules that don't need KV cache (eg encoder-only attention)
         if layer_config := attn_module.get_kv_cache_config(vllm_config):
-            layer_configs[layer_name] = customize_layer_config(
-                attn_module.get_attn_backend(), layer_config
+            layer_configs.update(
+                customize_layer_config(
+                    attn_module.get_attn_backend(), layer_name, layer_config
+                )
             )
     return layer_configs
 
@@ -224,10 +226,16 @@ def init_kv_cache(
             kernel_block_sizes,
         )
     for layer_name, target in get_shared_kv_cache_layers(vllm_config).items():
-        kv_caches[layer_name] = kv_caches[target]
+        for name, kv_cache in list(kv_caches.items()):
+            if name.partition(":")[0] == target:
+                kv_caches[layer_name + name[len(target) :]] = kv_cache
 
     bindable_caches = map_kv_caches_to_kernel_blocks(
-        {name: cache for name, cache in kv_caches.items() if name in forward_context},
+        {
+            name: cache
+            for name, cache in kv_caches.items()
+            if name.partition(":")[0] in forward_context
+        },
         attn_groups,
     )
     bind_kv_cache_to_layers(bindable_caches, forward_context)

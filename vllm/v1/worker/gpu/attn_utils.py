@@ -149,12 +149,13 @@ def get_kv_cache_layer_configs(
             continue
         # Skip modules that don't need KV cache (eg encoder-only attention)
         if layer_config := attn_module.get_kv_cache_config(vllm_config):
-            layer_config = customize_layer_config(
-                attn_module.get_attn_backend(), layer_config
-            )
             if attn_module.is_draft_layer:
                 layer_config = replace(layer_config, is_draft=True)
-            layer_configs[layer_name] = layer_config
+            layer_configs.update(
+                customize_layer_config(
+                    attn_module.get_attn_backend(), layer_name, layer_config
+                )
+            )
     if vllm_config.attention_config.hisparse_config is not None:
         layer_configs = resolve_hisparse_specs(vllm_config, layer_configs, attn_layers)
     return layer_configs
@@ -467,9 +468,15 @@ def bind_kv_caches(
 ) -> dict[str, Any]:
     """Bind per-layer KV cache views to the attention layers."""
     for layer_name, target in get_shared_kv_cache_layers(vllm_config).items():
-        kv_caches[layer_name] = kv_caches[target]
+        for name, kv_cache in list(kv_caches.items()):
+            if name.partition(":")[0] == target:
+                kv_caches[layer_name + name[len(target) :]] = kv_cache
     bindable_caches = map_kv_caches_to_kernel_blocks(
-        {name: cache for name, cache in kv_caches.items() if name in forward_context},
+        {
+            name: cache
+            for name, cache in kv_caches.items()
+            if name.partition(":")[0] in forward_context
+        },
         attn_groups,
     )
     bind_kv_cache_to_layers(bindable_caches, forward_context)
