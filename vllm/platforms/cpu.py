@@ -40,6 +40,15 @@ if TYPE_CHECKING:
 else:
     VllmConfig = None
 
+# Triton-CPU lowers the bitmask unpack in these kernels to IR quadratic in the
+# block size: ~70 s per cold compile at 8192, ~2 s at 1024, at no runtime cost.
+_TRITON_CPU_KERNEL_HEURISTICS = {
+    "vllm.v1.worker.gpu.sample.penalties._penalties_kernel": {"BLOCK_SIZE": 1024},
+    "vllm.v1.worker.gpu.structured_outputs._apply_grammar_bitmask_kernel": {
+        "BLOCK_SIZE": 1024
+    },
+}
+
 
 def _cpu_mamba_backend(vllm_config: VllmConfig) -> str:
     """Return the CPU state backend selected by the model configuration."""
@@ -701,18 +710,25 @@ class CpuPlatform(Platform):
 
     @classmethod
     def register_triton_kernel_overrides(cls) -> None:
-        """Fallback C++ implementations for core Triton kernels.
+        """Tune core Triton kernels for Triton-CPU, or replace them without it.
 
-        Used when the Triton-CPU backend is unavailable. When Triton-CPU is
-        present, the Triton kernels can run natively and the overrides
-        would only shadow them, so registration is skipped.
+        With the Triton-CPU backend, the Triton kernels run natively and only
+        their launch values change. Without it, C++ fallbacks replace them.
         """
         from vllm.triton_utils import HAS_TRITON
+        from vllm.triton_utils.dispatcher import (
+            override_kernel_heuristics,
+            register_kernels,
+        )
 
         if HAS_TRITON:
+            # Overriding imports the kernels' modules, which must not happen
+            # before the CPU worker's patches are in place.
+            import vllm.v1.worker.cpu.shm  # noqa: F401
+
+            override_kernel_heuristics(_TRITON_CPU_KERNEL_HEURISTICS)
             return
 
-        from vllm.triton_utils.dispatcher import register_kernels
         from vllm.utils import cpu_triton_utils as cpu_tl
 
         register_kernels(
