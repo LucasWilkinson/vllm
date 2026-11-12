@@ -39,6 +39,7 @@ from vllm.v1.kv_cache_interface import (
     create_kv_cache_views,
     get_block_table_width,
     kv_cache_name,
+    split_kv_cache_name,
 )
 
 logger = init_logger(__name__)
@@ -521,7 +522,7 @@ def map_kv_caches_to_kernel_blocks(
             mapped.update(
                 (name, group.map_kv_cache_to_kernel_blocks(kv_cache))
                 for name, kv_cache in kv_caches.items()
-                if name.partition(":")[0] in group.layer_names
+                if split_kv_cache_name(name)[0] in group.layer_names
             )
     return mapped
 
@@ -553,6 +554,8 @@ def customize_layer_config(
 ) -> dict[str, KVCacheLayerConfig]:
     """The layer's KV caches by name (see `kv_cache_name`), with
     `customize_attention_spec` applied to an attention layer's spec."""
+    if ":" in layer_name:
+        raise ValueError(f"':' names a layer's KV caches, got layer {layer_name!r}")
     if not isinstance(layer_config.spec, AttentionSpec):
         return {layer_name: layer_config}
     return {
@@ -963,25 +966,35 @@ def bind_kv_cache(
         for layer_name in layer_names:
             runner_kv_caches.append(kv_caches[layer_name])
 
-    bind_kv_cache_to_layers(layer_kv_caches or kv_caches, forward_context)
+    bind_kv_cache_to_layers(
+        group_kv_caches_by_layer(layer_kv_caches or kv_caches), forward_context
+    )
+
+
+def group_kv_caches_by_layer(
+    kv_caches: dict[str, torch.Tensor],
+) -> dict[str, dict[str, torch.Tensor]]:
+    """Each layer's caches by cache name (see `kv_cache_name`)."""
+    layer_caches: defaultdict[str, dict[str, torch.Tensor]] = defaultdict(dict)
+    for name, kv_cache in kv_caches.items():
+        layer_name, cache_name = split_kv_cache_name(name)
+        layer_caches[layer_name][cache_name] = kv_cache
+    return dict(layer_caches)
 
 
 def bind_kv_cache_to_layers(
-    kv_caches: dict[str, torch.Tensor],
+    layer_caches: dict[str, dict[str, torch.Tensor]],
     forward_context: dict[str, Attention],
 ) -> None:
-    """Bind layer cache views, by cache name for layers with several caches."""
-    layer_views: defaultdict[str, dict[str, torch.Tensor]] = defaultdict(dict)
-    for name, kv_cache in kv_caches.items():
-        layer_name, _, cache_name = name.partition(":")
-        layer_views[layer_name][cache_name] = kv_cache
+    """Bind layer cache views: a layer's own cache, or its caches by cache name
+    when it keeps several."""
     # Bind kv_caches to forward context. Each layer's bind_kv_cache unpacks
     # its raw allocation into the per-layer view(s) it needs (e.g. Mamba
     # splits conv/ssm), so the kv_caches dict can hold a single tensor per
     # layer for the KV connector to register.
-    for layer_name, views in layer_views.items():
+    for layer_name, caches in layer_caches.items():
         forward_context[layer_name].bind_kv_cache(
-            views[""] if views.keys() == {""} else views
+            caches[""] if caches.keys() == {""} else caches
         )
 
 
