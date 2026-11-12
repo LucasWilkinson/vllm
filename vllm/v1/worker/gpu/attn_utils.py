@@ -42,6 +42,7 @@ from vllm.v1.worker.utils import (
     allocate_kv_cache,
     bind_kv_cache_to_layers,
     customize_layer_config,
+    group_kv_caches_by_layer,
     map_kv_caches_to_kernel_blocks,
     prepare_kernel_block_sizes,
 )
@@ -467,19 +468,20 @@ def bind_kv_caches(
     attn_groups: Iterable[AttentionGroup] = (),
 ) -> dict[str, Any]:
     """Bind per-layer KV cache views to the attention layers."""
+    layer_caches = group_kv_caches_by_layer(
+        map_kv_caches_to_kernel_blocks(kv_caches, attn_groups)
+    )
     for layer_name, target in get_shared_kv_cache_layers(vllm_config).items():
-        for name, kv_cache in list(kv_caches.items()):
-            if name.partition(":")[0] == target:
-                kv_caches[layer_name + name[len(target) :]] = kv_cache
-    bindable_caches = map_kv_caches_to_kernel_blocks(
+        kv_caches[layer_name] = kv_caches[target]
+        layer_caches[layer_name] = layer_caches[target]
+    bind_kv_cache_to_layers(
         {
             name: cache
-            for name, cache in kv_caches.items()
-            if name.partition(":")[0] in forward_context
+            for name, cache in layer_caches.items()
+            if name in forward_context
         },
-        attn_groups,
+        forward_context,
     )
-    bind_kv_cache_to_layers(bindable_caches, forward_context)
     return kv_caches
 
 

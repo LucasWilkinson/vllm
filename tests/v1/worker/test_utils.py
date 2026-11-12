@@ -56,6 +56,7 @@ from vllm.v1.worker.utils import (
     bind_kv_cache_to_layers,
     clear_layer_kv_caches,
     copy_kv_cache_blocks_inplace,
+    group_kv_caches_by_layer,
     request_memory,
 )
 
@@ -1491,7 +1492,7 @@ def test_rebind_kv_cache_keeps_replayssm_trackers():
     def bind(num_blocks):
         config.num_blocks = num_blocks
         bind_kv_cache_to_layers(
-            {n: page[:num_blocks] for n, page in pages.items()}, ctx
+            {n: {"": page[:num_blocks]} for n, page in pages.items()}, ctx
         )
         initialize_replayssm_ring_trackers(config, ctx)
 
@@ -1546,7 +1547,8 @@ def test_triton_replayssm_plans_in_first_layer_of_each_group():
         ],
     )
     bind_kv_cache_to_layers(
-        {name: torch.zeros((4, 1, 1, 128), dtype=torch.int8) for name in names}, ctx
+        {name: {"": torch.zeros((4, 1, 1, 128), dtype=torch.int8)} for name in names},
+        ctx,
     )
     initialize_replayssm_ring_trackers(config, ctx)
 
@@ -1591,7 +1593,7 @@ def test_layer_with_named_caches_is_bound_a_view_per_cache():
     )
     kv_caches = allocate_kv_cache(kv_config, torch.device("cpu"), layout)
     ctx = {"layer": _Layer(), "plain": _Layer()}
-    bind_kv_cache_to_layers(kv_caches, ctx)
+    bind_kv_cache_to_layers(group_kv_caches_by_layer(kv_caches), ctx)
 
     assert isinstance(ctx["plain"].kv_cache, torch.Tensor)
     assert ctx["layer"].kv_cache.keys() == {"", "scales"}

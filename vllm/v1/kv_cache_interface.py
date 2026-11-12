@@ -637,6 +637,12 @@ def kv_cache_name(layer_name: str, cache_name: str) -> str:
     return f"{layer_name}:{cache_name}" if cache_name else layer_name
 
 
+def split_kv_cache_name(name: str) -> tuple[str, str]:
+    """The layer and cache names `kv_cache_name` joined."""
+    layer_name, _, cache_name = name.partition(":")
+    return layer_name, cache_name
+
+
 class KVCacheGroupRole(StrEnum):
     DEFAULT = "default"
     HISPARSE_INDEXER = "hisparse_indexer"
@@ -717,7 +723,9 @@ class KVCacheGroup:
     def layer_names(self) -> list[str]:
         """Layers whose own KV cache is in this group. `kv_cache_specs` also
         holds their other named caches (see `kv_cache_name`)."""
-        return [name for name in self.kv_cache_specs if ":" not in name]
+        return [
+            name for name in self.kv_cache_specs if not split_kv_cache_name(name)[1]
+        ]
 
     @property
     def page_size_bytes(self) -> int:

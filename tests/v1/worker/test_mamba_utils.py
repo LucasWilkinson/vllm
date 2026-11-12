@@ -53,6 +53,7 @@ from vllm.v1.worker.replayssm_utils import (
 from vllm.v1.worker.utils import (
     allocate_kv_cache,
     bind_kv_cache_to_layers,
+    group_kv_caches_by_layer,
 )
 
 # Conv + temporal copy specs, in the order the tests' MambaSpec shapes expect.
@@ -683,7 +684,7 @@ def test_replayssm_precopy_moves_packed_state_and_trackers(
         mixer.replayssm_buffer_len = 16
         mixer.A = -torch.ones(1, device=device)
         forward_context[name] = mixer
-    bind_kv_cache_to_layers(pages, forward_context)
+    bind_kv_cache_to_layers(group_kv_caches_by_layer(pages), forward_context)
     initialize_replayssm_ring_trackers(kv_config, forward_context)
     source_slot, destination_slot = previous_column + 1, destination_column + 1
     original = {}
