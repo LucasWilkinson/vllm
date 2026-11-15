@@ -880,7 +880,7 @@ class Platform:
             )
             # The backend owns its packing
             with set_current_vllm_config(vllm_config):
-                return backend_cls.customize_spec(spec).page_size_bytes
+                return backend_cls.get_page_size_bytes(spec)
 
         primary_dtype = (
             STR_DTYPE_TO_TORCH_DTYPE[cache_config.cache_dtype]
@@ -1036,7 +1036,7 @@ class Platform:
                 dtype=kv_cache_dtype,
                 kv_quant_mode=kv_quant_mode,
             )
-            tq_page = _pack_backend.customize_spec(tq_spec).page_size_bytes
+            tq_page = _pack_backend.get_page_size_bytes(tq_spec)
             if cache_config.kv_cache_dtype_skip_layers:
                 skip_page = AttentionSpec(
                     block_size=1,
@@ -1060,9 +1060,36 @@ class Platform:
             )
             # customize_spec may read the model config (e.g. Octave's rotary dim).
             with set_current_vllm_config(vllm_config):
-                attn_page_size_1_token = backend_cls.customize_spec(
-                    attn_spec
-                ).page_size_bytes
+                attn_page_size_1_token = backend_cls.get_page_size_bytes(attn_spec)
+                # A drafter whose attention layers hold more KV per token than the
+                # target's (e.g. an EAGLE head with more KV heads) sets the common
+                # page; size the block for it too (lcm, as for the skip layers
+                # above), or every Mamba page is later padded up to the drafter's.
+                spec_config = vllm_config.speculative_config
+                if (
+                    spec_config is not None
+                    and (draft_config := spec_config.draft_model_config) is not None
+                    and not draft_config.use_mla
+                ):
+                    draft_parallel_config = (
+                        spec_config.draft_parallel_config or parallel_config
+                    )
+                    draft_spec = AttentionSpec(
+                        block_size=1,
+                        num_kv_heads=draft_config.get_num_kv_heads(
+                            draft_parallel_config
+                        ),
+                        head_size=draft_config.get_head_size(),
+                        dtype=kv_cache_dtype,
+                        kv_quant_mode=kv_quant_mode,
+                    )
+                    draft_page_size_1_token = backend_cls.get_page_size_bytes(
+                        draft_spec
+                    )
+                    if draft_page_size_1_token > attn_page_size_1_token:
+                        attn_page_size_1_token = lcm(
+                            attn_page_size_1_token, draft_page_size_1_token
+                        )
 
         # Compute mamba page size
         model_cls, _ = ModelRegistry.resolve_model_cls(
@@ -1289,6 +1316,17 @@ class Platform:
         """Whether the current platform should enable multi-stream overlap
         for the given aux streams and attention metadata."""
         return False
+
+    @classmethod
+    def prepare_ubatch_streams(
+        cls,
+        device: torch.device,
+        streams: tuple[torch.cuda.Stream, ...],
+        num_threads: int,
+    ) -> None:
+        """Set up per-stream library state before dual batch overlap runs its
+        microbatches on `streams` from `num_threads` new threads."""
+        return
 
     @classmethod
     def supports_mx(cls) -> bool:

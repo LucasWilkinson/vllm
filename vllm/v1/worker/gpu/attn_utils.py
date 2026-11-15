@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, cast
@@ -40,8 +40,10 @@ from vllm.v1.worker.utils import (
     allocate_kv_cache,
     bind_kv_cache_to_layers,
     customize_layer_config,
+    groups_with_metadata_builders,
     map_kv_caches_to_kernel_blocks,
     prepare_kernel_block_sizes,
+    split_kv_cache_components,
 )
 
 if TYPE_CHECKING:
@@ -52,7 +54,7 @@ if TYPE_CHECKING:
     )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class AttentionCGSupportInfo:
     min_cg_support: AttentionCGSupport = AttentionCGSupport.ALWAYS
     min_cg_attn_backend: str | None = None
@@ -70,7 +72,7 @@ class AttentionCGSupportInfo:
         return self
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class FastPrefillBatchMetadata:
     """Per-step inputs for the KV-sharing fast prefill path."""
 
@@ -145,12 +147,13 @@ def get_kv_cache_layer_configs(
             continue
         # Skip modules that don't need KV cache (eg encoder-only attention)
         if layer_config := attn_module.get_kv_cache_config(vllm_config):
-            layer_config = customize_layer_config(
-                attn_module.get_attn_backend(), layer_config
-            )
             if attn_module.is_draft_layer:
                 layer_config = replace(layer_config, is_draft=True)
-            layer_configs[layer_name] = layer_config
+            layer_configs.update(
+                customize_layer_config(
+                    attn_module.get_attn_backend(), layer_config, layer_name
+                )
+            )
     if vllm_config.attention_config.hisparse_config is not None:
         layer_configs = resolve_hisparse_specs(vllm_config, layer_configs, attn_layers)
     return layer_configs
@@ -202,6 +205,8 @@ def init_attn_backend(
     device: torch.device,
     active_layer_names: set[str] | None = None,
     draft_layer_names: set[str] | None = None,
+    kernel_block_sizes: list[int] | None = None,
+    no_attn_metadata_layer_names: Collection[str] = (),
 ) -> tuple[list[list[AttentionGroup]], AttentionCGSupportInfo, list[int]]:
     # Phase 1: discover attention groups for each kv cache group.
     attn_groups: list[list[AttentionGroup]] = []
@@ -250,7 +255,7 @@ def init_attn_backend(
                     "FastPrefill", attn_backend
                 )
 
-            layer_kv_cache_spec = kv_cache_group_spec.kv_cache_specs[layer_name]
+            layer_kv_cache_spec = kv_cache_group_spec.layer_specs[layer_name]
 
             # Split on per-rank num_heads_q so layers with different Q-head
             # counts (e.g. a spec-decode draft head and its target) get separate
@@ -269,7 +274,8 @@ def init_attn_backend(
 
     # Phase 2: pick a kernel block size per kv cache group that is supported
     # by all backends within that group.
-    kernel_block_sizes = prepare_kernel_block_sizes(kv_cache_config, attn_groups)
+    if kernel_block_sizes is None:
+        kernel_block_sizes = prepare_kernel_block_sizes(kv_cache_config, attn_groups)
 
     # Phase 3: create metadata builders and determine cudagraph support.
     attn_backend_workspace: torch.Tensor | None = None
@@ -286,7 +292,13 @@ def init_attn_backend(
                 # Microbatches build attention metadata concurrently, and some
                 # builders keep the prepared metadata on themselves (MLA stores
                 # it on the prefill backend), so each ubatch needs its own.
-                num_metadata_builders=get_num_ubatches(vllm_config.parallel_config),
+                # Layers in no_attn_metadata_layer_names get none and keep their
+                # kernel-block layout.
+                num_metadata_builders=(
+                    0
+                    if set(group.layer_names).issubset(no_attn_metadata_layer_names)
+                    else get_num_ubatches(vllm_config.parallel_config)
+                ),
             )
             # The microbatches' builders share the workspace: they all issue
             # attention on the one compute stream the threads hand off, so the
@@ -310,7 +322,7 @@ def get_attn_cg_support(
     min_cg_support = AttentionCGSupport.ALWAYS
     min_cg_attn_backend = None
     for groups in attn_groups:
-        for group in groups:
+        for group in groups_with_metadata_builders(groups):
             if checked_layer_names is not None and checked_layer_names.isdisjoint(
                 group.layer_names
             ):
@@ -363,7 +375,7 @@ def get_varlen_cudagraph_unsupported_backend(
     max_query_len. See AttentionMetadataBuilder.get_varlen_cudagraph_max_query_len().
     """
     for groups in attn_groups:
-        for group in groups:
+        for group in groups_with_metadata_builders(groups):
             if checked_layer_names is not None and checked_layer_names.isdisjoint(
                 group.layer_names
             ):
@@ -430,13 +442,16 @@ def bind_kv_caches(
     attn_groups: Iterable[AttentionGroup] = (),
 ) -> dict[str, Any]:
     """Bind per-layer KV cache views to the attention layers."""
-    for layer_name, target in get_shared_kv_cache_layers(vllm_config).items():
+    shared_layers = get_shared_kv_cache_layers(vllm_config)
+    for layer_name, target in shared_layers.items():
         kv_caches[layer_name] = kv_caches[target]
-    bindable_caches = map_kv_caches_to_kernel_blocks(
-        {name: cache for name, cache in kv_caches.items() if name in forward_context},
-        attn_groups,
+    bind_kv_cache_to_layers(
+        split_kv_cache_components(
+            map_kv_caches_to_kernel_blocks(kv_caches, attn_groups), kv_cache_config
+        ),
+        forward_context,
+        shared_layers,
     )
-    bind_kv_cache_to_layers(bindable_caches, forward_context)
     return kv_caches
 
 
@@ -501,7 +516,8 @@ def build_attn_metadata(
     cached_metadata: dict[tuple[KVCacheSpec, type], Any] = {}
     num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
     for i in range(num_kv_cache_groups):
-        if not attn_groups[i]:
+        groups = groups_with_metadata_builders(attn_groups[i])
+        if not groups:
             continue
         block_table = block_tables[i]
         slot_mapping = slot_mappings[i]
@@ -549,7 +565,7 @@ def build_attn_metadata(
             **common_attn_metadata_extra_kwargs,
         )
 
-        for attn_group in attn_groups[i]:
+        for attn_group in groups:
             attn_metadata_builder = attn_group.get_metadata_builder(ubatch_idx)
             reuse_key = None
             if attn_metadata_builder.supports_update_block_table and isinstance(

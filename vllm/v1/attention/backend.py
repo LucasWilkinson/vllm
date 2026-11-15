@@ -46,7 +46,7 @@ class AttentionType(StrEnum):
     """Attention between dec. Q and enc. K/V for encoder-decoder."""
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class MultipleOf:
     base: int
 
@@ -75,6 +75,16 @@ class AttentionBackend(ABC):
         kv_cache_spec: "KVCacheSpec | None" = None,
     ) -> list[int | MultipleOf]:
         return [MultipleOf(1)]
+
+    @classmethod
+    def get_supported_kernel_block_sizes_for_layers(
+        cls,
+        kv_cache_spec: "KVCacheSpec | None",
+        layer_names: list[str],
+    ) -> list[int | MultipleOf]:
+        """Kernel block sizes for the named layers. Override when the sizes depend
+        on layer geometry that the cache spec does not hold, such as query heads."""
+        return cls.get_supported_kernel_block_sizes(kv_cache_spec)
 
     @staticmethod
     @abstractmethod
@@ -141,9 +151,16 @@ class AttentionBackend(ABC):
         return False
 
     @classmethod
-    def customize_spec(cls, spec: "AttentionSpec") -> "AttentionSpec":
+    def customize_spec(
+        cls, spec: "AttentionSpec"
+    ) -> "AttentionSpec | dict[str, AttentionSpec]":
         """Adjust the layer's KV cache spec for this backend's kernels. Used when the
         kernels want KV packed in a specific way.
+
+        A backend that keeps a layer's cache as several components (e.g. K and V
+        apart) returns their specs by component name. Each is planned as a
+        separate cache, named `"<layer name>:<component>"`, and `bind_kv_cache`
+        receives them by component name.
 
         NOTE: temporary compatibility API. Today the Attention layer builds the spec
         from the model config and the backend only gets to adjust it post-hoc; the end
@@ -153,6 +170,14 @@ class AttentionBackend(ABC):
         (see: https://github.com/vllm-project/vllm/issues/42449)
         """
         return spec
+
+    @classmethod
+    def get_page_size_bytes(cls, spec: "AttentionSpec") -> int:
+        """Bytes per block of a layer's caches, as this backend packs them."""
+        specs = cls.customize_spec(spec)
+        if isinstance(specs, AttentionSpec):
+            return specs.page_size_bytes
+        return sum(spec.page_size_bytes for spec in specs.values())
 
     @classmethod
     def get_preferred_block_size(cls, default_block_size: int) -> int:
@@ -396,7 +421,7 @@ class AttentionMetadata:
 T = TypeVar("T", bound=AttentionMetadata)
 
 
-@dataclass
+@dataclass(slots=True)
 class CommonAttentionMetadata:
     """Per-batch attention metadata, shared across layers and backends.
     AttentionMetadataBuilder instances use it to construct per-layer metadata.
