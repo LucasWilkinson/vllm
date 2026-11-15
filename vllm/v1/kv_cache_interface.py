@@ -329,45 +329,28 @@ class MultiComponentSpec(KVCacheSpec):
         """Byte `[B, H, N, C]` views of the components of `cache`, a byte
         `[B, H, N, C]` page view of this spec, with the same physical order."""
         assert cache.element_size() == 1, "split takes a byte page view"
-        views: dict[str, torch.Tensor] = {}
-        offset = 0
+        components = self.components
         if self.components_per_state:
-            for name, spec in self.components.items():
-                size = spec.state_content_size_bytes
-                views[name] = cache[..., offset : offset + size]
-                offset += size
-            assert offset <= cache.shape[3], (
-                f"{type(self).__name__} components overrun the "
-                f"{tuple(cache.shape)} page"
-            )
-            return views
+            sizes = [spec.state_content_size_bytes for spec in components.values()]
+            parts = cache.split([*sizes, cache.shape[3] - sum(sizes)], dim=3)
+            return dict(zip(components, parts))
         tokens = (
             cache.shape[2] * self.tokens_per_state
             if self.tokens_per_state > 0
             else self.block_size
         )
-        # A size-1 dim may share its neighbor's stride; keep H outside N then.
-        inner_to_outer = sorted((1, 2, 3), key=lambda dim: (cache.stride(dim), -dim))
-        page_bytes = prod(cache.shape[1:])
-        for name, spec in self.components.items():
-            shape = (
-                cache.shape[0],
-                spec.num_heads,
-                spec.get_num_kernel_states(tokens),
-                spec.state_content_size_bytes,
-            )
-            strides = [cache.stride(0), 0, 0, 0]
-            size = 1
-            for dim in inner_to_outer:
-                strides[dim] = size
-                size *= shape[dim]
-            assert offset + size <= page_bytes, (
-                f"{type(self).__name__} component {name!r} overruns the "
-                f"{tuple(cache.shape)} page"
-            )
-            views[name] = cache.as_strided(
-                shape, strides, cache.storage_offset() + offset
-            )
+        # Flatten each page in its physical order: [H, N, C], or [N, H, C].
+        nhd = cache.stride(1) < cache.stride(2)
+        page = (cache.transpose(1, 2) if nhd else cache).flatten(1)
+        views: dict[str, torch.Tensor] = {}
+        offset = 0
+        for name, spec in components.items():
+            shape = [spec.num_heads, spec.get_num_kernel_states(tokens)]
+            shape = [*reversed(shape)] if nhd else shape
+            shape.append(spec.state_content_size_bytes)
+            size = prod(shape)
+            view = page[:, offset : offset + size].unflatten(1, shape)
+            views[name] = view.transpose(1, 2) if nhd else view
             offset += round_up(size, self.component_alignment)
         return views
 
