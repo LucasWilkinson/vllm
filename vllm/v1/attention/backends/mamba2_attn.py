@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, replace
 from typing import Any
 
 import torch
@@ -93,19 +93,19 @@ def compute_varlen_chunk_metadata(
     return cu_chunk_seqlens, last_chunk_indices_t, seq_idx_chunks_t
 
 
-@dataclass(frozen=True)
-class Mamba2Spec(MambaSpec):
-    """Conv state `[x | B | C, conv]` and temporal state `[heads, head_dim,
-    state]`; `x`, `B`, `C` and heads are each sharded across TP."""
-
-    def _tp_segments(self) -> tuple[tuple[int, ...], ...] | None:
-        if len(self.shapes) != 2:
-            return None
-        conv, temporal = self.shapes
-        x = temporal[0] * temporal[1]
-        groups = (conv[0] - x) // 2
-        assert x + 2 * groups == conv[0], f"Unexpected Mamba2 state {self.shapes}"
-        return (x, groups, groups), (temporal[0],)
+def mamba2_tp_parts(
+    shapes: tuple[tuple[int, ...], ...], conv_dim: int
+) -> tuple[tuple[int, tuple[int, ...]], ...] | None:
+    """`MambaSpec.tp_parts` of the conv state (`x | B | C` at dim `conv_dim`)
+    and the temporal state `[heads, head_dim, state]`; `x`, `B`, `C` and heads
+    are each sharded across TP."""
+    if len(shapes) != 2:
+        return None
+    conv, temporal = shapes
+    x = temporal[0] * temporal[1]
+    groups = (conv[conv_dim] - x) // 2
+    assert x + 2 * groups == conv[conv_dim], f"Unexpected Mamba2 state {shapes}"
+    return (conv_dim, (x, groups, groups)), (0, (temporal[0],))
 
 
 class Mamba2AttentionBackend(AttentionBackend):
@@ -123,10 +123,8 @@ class Mamba2AttentionBackend(AttentionBackend):
 
     @classmethod
     def customize_mamba_spec(cls, spec: MambaSpec) -> MambaSpec:
-        # Sub-projections are contiguous only with (dim, state_len) conv state.
-        if not is_conv_state_dim_first():
-            return spec
-        return Mamba2Spec(**{f.name: getattr(spec, f.name) for f in fields(spec)})
+        conv_dim = 0 if is_conv_state_dim_first() else 1
+        return replace(spec, tp_parts=mamba2_tp_parts(spec.shapes, conv_dim))
 
     @classmethod
     def supports_device_cpu_query_lens_mismatch(cls) -> bool:

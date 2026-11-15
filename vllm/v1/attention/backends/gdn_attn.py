@@ -3,7 +3,7 @@
 """Backend for GatedDeltaNet attention."""
 
 import math
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, replace
 from typing import Literal
 
 import torch
@@ -77,20 +77,19 @@ class GDNFlashInferCheckpointPlan:
     rows: torch.Tensor
 
 
-@dataclass(frozen=True)
-class GDNSpec(MambaSpec):
-    """Conv state `[Q | K | V, conv]` (`dim(Q) == dim(K)`) and temporal
-    state `[v_heads, v_dim, k_dim]`; Q, K, V and heads are each sharded
-    across TP."""
-
-    def _tp_segments(self) -> tuple[tuple[int, ...], ...] | None:
-        if len(self.shapes) != 2:
-            return None
-        conv, temporal = self.shapes
-        value = temporal[0] * temporal[1]
-        key = (conv[0] - value) // 2
-        assert 2 * key + value == conv[0], f"Unexpected GDN state {self.shapes}"
-        return (key, key, value), (temporal[0],)
+def gdn_tp_parts(
+    shapes: tuple[tuple[int, ...], ...], conv_dim: int
+) -> tuple[tuple[int, tuple[int, ...]], ...] | None:
+    """`MambaSpec.tp_parts` of the conv state (`Q | K | V` at dim `conv_dim`,
+    `dim(Q) == dim(K)`) and the temporal state `[v_heads, v_dim, k_dim]`; Q,
+    K, V and heads are each sharded across TP."""
+    if len(shapes) != 2:
+        return None
+    conv, temporal = shapes
+    value = temporal[0] * temporal[1]
+    key = (conv[conv_dim] - value) // 2
+    assert 2 * key + value == conv[conv_dim], f"Unexpected GDN state {shapes}"
+    return (conv_dim, (key, key, value)), (0, (temporal[0],))
 
 
 class GDNAttentionBackend(AttentionBackend):
@@ -112,10 +111,8 @@ class GDNAttentionBackend(AttentionBackend):
 
     @classmethod
     def customize_mamba_spec(cls, spec: MambaSpec) -> MambaSpec:
-        # Sub-projections are contiguous only with (dim, state_len) conv state.
-        if not is_conv_state_dim_first():
-            return spec
-        return GDNSpec(**{f.name: getattr(spec, f.name) for f in fields(spec)})
+        conv_dim = 0 if is_conv_state_dim_first() else 1
+        return replace(spec, tp_parts=gdn_tp_parts(spec.shapes, conv_dim))
 
 
 @dataclass

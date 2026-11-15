@@ -231,16 +231,8 @@ class NixlBaseConnectorWorker:
                 remote_spec = replace(
                     spec, num_kv_heads=remote_heads, num_head_slots=slots
                 )
-            elif (
-                isinstance(spec, MambaSpec)
-                and tp_size != remote_tp_size
-                and not spec.tp_replicated
-            ):
-                shapes = tuple(
-                    (shape[0] * tp_size // remote_tp_size, *shape[1:])
-                    for shape in spec.shapes
-                )
-                remote_spec = replace(spec, shapes=shapes, page_size_padded=None)
+            elif isinstance(spec, MambaSpec):
+                remote_spec = spec.with_tp_size(tp_size, remote_tp_size)
 
             ssm = _is_ssm_spec(self._group_spec_types[group])
             ratio = 1 if ssm else block_size_ratio

@@ -8,14 +8,16 @@ have written itself, for prefill/decode engines with different TP sizes and
 layouts.
 """
 
+from dataclasses import dataclass
+
 import pytest
 import torch
 
 from tests.v1.kv_connector.unit.utils import transfer_kv
-from vllm.v1.attention.backends.gdn_attn import GDNSpec
-from vllm.v1.attention.backends.mamba1_attn import Mamba1Spec
-from vllm.v1.attention.backends.mamba2_attn import Mamba2Spec
-from vllm.v1.kv_cache_interface import AttentionSpec, MambaSpec
+from vllm.v1.attention.backends.gdn_attn import gdn_tp_parts
+from vllm.v1.attention.backends.mamba1_attn import mamba1_tp_parts
+from vllm.v1.attention.backends.mamba2_attn import mamba2_tp_parts
+from vllm.v1.kv_cache_interface import AttentionSpec, MambaSpec, MultiComponentSpec
 
 pytestmark = pytest.mark.cpu_test
 
@@ -134,32 +136,46 @@ CONV_ROWS = 3
 # Per Mamba spec: the global conv sub-projection sizes, each sharded across TP,
 # and the global temporal state shape, sharded along its first dim.
 MAMBA_LAYOUTS = {
-    Mamba1Spec: ((16,), (16, 4)),
-    Mamba2Spec: ((16, 8, 8), (8, 2, 4)),
-    GDNSpec: ((8, 8, 16), (8, 2, 4)),
+    mamba1_tp_parts: ((16,), (16, 4)),
+    mamba2_tp_parts: ((16, 8, 8), (8, 2, 4)),
+    gdn_tp_parts: ((8, 8, 16), (8, 2, 4)),
 }
 
 
+def _mamba_spec(tp_parts, shapes, dtypes, conv_dim: int = 0, **kwargs) -> MambaSpec:
+    """A Mamba spec as its backend publishes it, with the conv state's
+    sharded dim at `conv_dim`: 0 for (dim, state_len), 1 for (state_len, dim)."""
+    return MambaSpec(
+        shapes=shapes, dtypes=dtypes, tp_parts=tp_parts(shapes, conv_dim), **kwargs
+    )
+
+
 def _make_mamba_page(
-    spec_cls: type[MambaSpec],
+    tp_parts,
     conv: list[torch.Tensor],
     temporal: torch.Tensor,
     tp_size: int,
     tp_rank: int,
+    conv_dim: int = 0,
 ) -> tuple[MambaSpec, tuple[torch.Tensor, torch.Tensor]]:
     """One rank's spec and (raw bytes, `[B, 1, 1, C]` int8 view) blocks, from
-    global per-block conv sub-projections and temporal state."""
+    global per-block `[B, dim, state_len]` conv sub-projections and temporal
+    state."""
 
     def shard(state: torch.Tensor) -> torch.Tensor:
         rows = state.shape[1] // tp_size
         return state[:, tp_rank * rows : (tp_rank + 1) * rows]
 
     local_conv = torch.cat([shard(proj) for proj in conv], dim=1)
+    if conv_dim == 1:
+        local_conv = local_conv.transpose(1, 2).contiguous()
     local_temporal = shard(temporal)
-    spec = spec_cls(
+    spec = _mamba_spec(
+        tp_parts,
+        (tuple(local_conv.shape[1:]), tuple(local_temporal.shape[1:])),
+        (local_conv.dtype, local_temporal.dtype),
+        conv_dim,
         block_size=BLOCK_SIZE,
-        shapes=(tuple(local_conv.shape[1:]), tuple(local_temporal.shape[1:])),
-        dtypes=(local_conv.dtype, local_temporal.dtype),
     )
     raw = torch.cat(
         [
@@ -172,10 +188,14 @@ def _make_mamba_page(
 
 
 @pytest.mark.parametrize("p_tp,d_tp", TP_PAIRS)
-@pytest.mark.parametrize("spec_cls", list(MAMBA_LAYOUTS))
-def test_hetero_tp_transfer_assembles_decode_mamba_state(p_tp, d_tp, spec_cls):
-    """Each conv sub-projection and the temporal state are resharded on their own."""
-    conv_sizes, temporal_shape = MAMBA_LAYOUTS[spec_cls]
+@pytest.mark.parametrize("tp_parts", list(MAMBA_LAYOUTS))
+@pytest.mark.parametrize("conv_dim", [0, 1])
+def test_hetero_tp_transfer_assembles_decode_mamba_state(
+    p_tp, d_tp, tp_parts, conv_dim
+):
+    """Each conv sub-projection and the temporal state are resharded on their
+    own, in both the (dim, state_len) and (state_len, dim) conv state layouts."""
+    conv_sizes, temporal_shape = MAMBA_LAYOUTS[tp_parts]
     values = iter(range(1, 1 << 20))
 
     def state(*shape: int, dtype: torch.dtype) -> torch.Tensor:
@@ -183,33 +203,35 @@ def test_hetero_tp_transfer_assembles_decode_mamba_state(p_tp, d_tp, spec_cls):
         data = [next(values) for _ in range(numel)]
         return torch.tensor(data, dtype=dtype).view(shape)
 
+    def page(conv, temporal, tp_size, tp_rank):
+        return _make_mamba_page(tp_parts, conv, temporal, tp_size, tp_rank, conv_dim)
+
     conv = [
         state(NUM_BLOCKS, size, CONV_ROWS, dtype=torch.float16) for size in conv_sizes
     ]
     temporal = state(NUM_BLOCKS, *temporal_shape, dtype=torch.float32)
-    p_pages = [_make_mamba_page(spec_cls, conv, temporal, p_tp, r) for r in range(p_tp)]
+    p_pages = [page(conv, temporal, p_tp, r) for r in range(p_tp)]
     p_spec = p_pages[0][0]
     for d_rank in range(d_tp):
-        d_spec, (expected, _) = _make_mamba_page(spec_cls, conv, temporal, d_tp, d_rank)
+        d_spec, (expected, _) = page(conv, temporal, d_tp, d_rank)
         zeros = [torch.zeros_like(proj) for proj in conv]
-        _, d_page = _make_mamba_page(
-            spec_cls, zeros, torch.zeros_like(temporal), d_tp, d_rank
-        )
+        _, d_page = page(zeros, torch.zeros_like(temporal), d_tp, d_rank)
         transfer_kv(
             p_spec, [block for _, block in p_pages], p_tp, d_spec, d_page, d_tp, d_rank
         )
         assert torch.equal(d_page[0], expected)
 
 
-def test_mamba_spec_without_tp_layout_transfers_only_whole_pages():
+def test_mamba_spec_without_tp_layout_transfers_only_whole_states():
     """A plain MambaSpec does not know how its states shard."""
     spec = MambaSpec(
         block_size=BLOCK_SIZE, shapes=((8, 3), (8, 4)), dtypes=(torch.float32,) * 2
     )
-    block = torch.empty(NUM_BLOCKS, 1, 1, spec.page_size_bytes, device="meta")
-    assert spec.slice_for_tp_transfer(block, 2, 1, spec, 2, 1, receiving=True) == [
-        block
-    ]
+    block = torch.empty(
+        NUM_BLOCKS, 1, 1, spec.page_size_bytes, dtype=torch.int8, device="meta"
+    )
+    views = spec.slice_for_tp_transfer(block, 2, 1, spec, 2, 1, receiving=True)
+    assert [(v.shape[-1], v.storage_offset()) for v in views] == [(96, 0), (128, 96)]
     with pytest.raises(NotImplementedError):
         spec.slice_for_tp_transfer(block, 2, 0, spec, 1, 0, receiving=True)
 
@@ -218,17 +240,16 @@ def test_mamba2_replicated_groups_fail_closed():
     """With fewer groups than ranks, B and C are replicated rather than sharded,
     so they cannot be resliced by TP."""
     # One group of 8: TP1 holds it once, each TP2 rank holds a copy.
-    tp1 = Mamba2Spec(
-        block_size=BLOCK_SIZE,
-        shapes=((16 + 2 * 8, 3), (8, 2, 4)),
-        dtypes=(torch.float16, torch.float32),
+    dtypes = (torch.float16, torch.float32)
+    tp1 = _mamba_spec(
+        mamba2_tp_parts, ((16 + 2 * 8, 3), (8, 2, 4)), dtypes, block_size=BLOCK_SIZE
     )
-    tp2 = Mamba2Spec(
-        block_size=BLOCK_SIZE,
-        shapes=((8 + 2 * 8, 3), (4, 2, 4)),
-        dtypes=(torch.float16, torch.float32),
+    tp2 = _mamba_spec(
+        mamba2_tp_parts, ((8 + 2 * 8, 3), (4, 2, 4)), dtypes, block_size=BLOCK_SIZE
     )
-    block = torch.empty(NUM_BLOCKS, 1, 1, tp2.page_size_bytes, device="meta")
+    block = torch.empty(
+        NUM_BLOCKS, 1, 1, tp2.page_size_bytes, dtype=torch.int8, device="meta"
+    )
     with pytest.raises(NotImplementedError, match="does not shard evenly"):
         tp2.slice_for_tp_transfer(block, 2, 0, tp1, 1, 0, receiving=True)
 
@@ -355,11 +376,16 @@ def test_mamba_specs_split_real_model_conv_states(
     mamba_type, local_tp, conv_dim_local, conv_rows, temporal_shape, expected_proj_dims
 ):
     """Backend specs cut real models' conv states into their sub-projections."""
-    spec_cls = {"mamba1": Mamba1Spec, "mamba2": Mamba2Spec, "gdn_attention": GDNSpec}
-    spec = spec_cls[mamba_type](
+    tp_parts = {
+        "mamba1": mamba1_tp_parts,
+        "mamba2": mamba2_tp_parts,
+        "gdn_attention": gdn_tp_parts,
+    }
+    spec = _mamba_spec(
+        tp_parts[mamba_type],
+        ((conv_dim_local, conv_rows), temporal_shape),
+        (torch.bfloat16, torch.bfloat16),
         block_size=64,
-        shapes=((conv_dim_local, conv_rows), temporal_shape),
-        dtypes=(torch.bfloat16, torch.bfloat16),
     )
     block = torch.empty(1, 1, 1, spec.page_size_bytes, dtype=torch.int8, device="meta")
     views = spec.slice_for_tp_transfer(
@@ -367,3 +393,49 @@ def test_mamba_specs_split_real_model_conv_states(
     )
     conv_ranges = [view.numel() // (conv_rows * 2) for view in views[:-1]]
     assert conv_ranges == list(expected_proj_dims)
+
+
+def test_separate_k_and_v_components_reshard_with_no_slicing_code():
+    """A backend that keeps K and V apart only names them as components: each
+    is sliced by KV head with the plain attention rule."""
+
+    @dataclass(frozen=True, kw_only=True)
+    class SeparateKVSpec(MultiComponentSpec, AttentionSpec):
+        @property
+        def components(self):
+            side = AttentionSpec(
+                block_size=self.block_size,
+                num_kv_heads=self.num_kv_heads,
+                head_size=self.head_size,
+                head_size_v=0,
+                dtype=self.dtype,
+            )
+            return {"k": side, "v": side}
+
+    def spec(tp_size: int) -> AttentionSpec:
+        return SeparateKVSpec(
+            block_size=BLOCK_SIZE,
+            num_kv_heads=4 // tp_size,
+            head_size=HEAD_SIZE,
+            dtype=torch.float32,
+            num_head_slots=2 * 4 // tp_size,
+            state_content_bytes=HEAD_SIZE * 4,
+        )
+
+    def make_cache(kv: torch.Tensor, tp_size: int, tp_rank: int):
+        """One rank's `[B, 2H, N, D]` page: its K heads, then its V heads."""
+        heads = kv[:, tp_rank * 4 // tp_size : (tp_rank + 1) * 4 // tp_size]
+        raw = heads.flatten(0, 1).transpose(0, 1).contiguous().flatten()
+        raw = raw.view(torch.uint8)
+        return raw, raw.view(NUM_BLOCKS, -1, BLOCK_SIZE, HEAD_SIZE * 4)
+
+    shape = (2, 4, NUM_BLOCKS, BLOCK_SIZE, HEAD_SIZE)
+    kv = torch.arange(1, 1 + torch.Size(shape).numel(), dtype=torch.float32)
+    kv = kv.view(shape)
+    for p_tp, d_tp in [(1, 2), (2, 1), (4, 2), (2, 4)]:
+        p_caches = [make_cache(kv, p_tp, r) for r in range(p_tp)]
+        for d_rank in range(d_tp):
+            expected, _ = make_cache(kv, d_tp, d_rank)
+            d_cache = make_cache(torch.zeros_like(kv), d_tp, d_rank)
+            transfer_kv(spec(p_tp), p_caches, p_tp, spec(d_tp), d_cache, d_tp, d_rank)
+            torch.testing.assert_close(d_cache[0], expected, rtol=0, atol=0)

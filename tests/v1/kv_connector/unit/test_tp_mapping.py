@@ -9,7 +9,7 @@ descriptor lists from the KV cache specs. No GPU or NIXL required.
 from __future__ import annotations
 
 from collections import Counter, defaultdict
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -42,12 +42,14 @@ _ENGINE = "remote-engine"
 _HEAD_SIZE = 8
 
 
-@dataclass(frozen=True)
-class _ShardedStateSpec(MambaSpec):
+def _sharded_state_spec() -> MambaSpec:
     """One state sharded across TP along its leading dim."""
-
-    def _tp_segments(self) -> tuple[tuple[int, ...], ...]:
-        return ((self.shapes[0][0],),)
+    return MambaSpec(
+        block_size=4,
+        shapes=((400,),),
+        dtypes=(torch.int8,),
+        tp_parts=((0, (400,)),),
+    )
 
 
 def _spec(total_kv_heads: int | None, tp_size: int) -> AttentionSpec:
@@ -328,7 +330,7 @@ def test_mamba_state_is_one_more_region_of_chunked_pages():
     """MLA's replicated latent and a Mamba state sharded across P's ranks move
     through the same desc list: the latent whole from one rank, the state as
     one range per rank holding part of it."""
-    mamba = _ShardedStateSpec(block_size=4, shapes=((400,),), dtypes=(torch.int8,))
+    mamba = _sharded_state_spec()
     worker = _worker(0, 1, {"attn": None, "mamba": mamba})
     assert _map(worker, 2) == (0, 1)
     assert worker.source_ranks[_ENGINE] == [(0,), (0, 1)]
@@ -348,7 +350,7 @@ def test_mamba_state_is_one_more_region_of_chunked_pages():
 def test_push_writes_replicated_latent_to_every_rank_holding_it():
     """Pushing from P at TP1 to D at TP2, the specs' sending-side slices write
     MLA's replicated latent whole to both D ranks and each its Mamba shard."""
-    mamba = _ShardedStateSpec(block_size=4, shapes=((400,),), dtypes=(torch.int8,))
+    mamba = _sharded_state_spec()
     worker = _worker(0, 1, {"attn": None, "mamba": mamba})
     worker._TRANSFER_MODE = "push"
 

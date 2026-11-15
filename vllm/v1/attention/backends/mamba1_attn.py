@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, replace
 from typing import Any
 
 from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
@@ -13,16 +13,15 @@ from vllm.v1.attention.backends.mamba_attn import (
 from vllm.v1.kv_cache_interface import MambaSpec
 
 
-@dataclass(frozen=True)
-class Mamba1Spec(MambaSpec):
-    """Conv state `[x, conv]` and temporal state `[x, state]`, both
-    sharded across TP along `x`."""
-
-    def _tp_segments(self) -> tuple[tuple[int, ...], ...] | None:
-        if len(self.shapes) != 2:
-            return None
-        conv, temporal = self.shapes
-        return (conv[0],), (temporal[0],)
+def mamba1_tp_parts(
+    shapes: tuple[tuple[int, ...], ...], conv_dim: int
+) -> tuple[tuple[int, tuple[int, ...]], ...] | None:
+    """`MambaSpec.tp_parts` of the conv state (`x` at dim `conv_dim`) and the
+    temporal state `[x, state]`, both sharded across TP along `x`."""
+    if len(shapes) != 2:
+        return None
+    conv, temporal = shapes
+    return (conv_dim, (conv[conv_dim],)), (0, (temporal[0],))
 
 
 class Mamba1AttentionBackend(AttentionBackend):
@@ -40,10 +39,8 @@ class Mamba1AttentionBackend(AttentionBackend):
 
     @classmethod
     def customize_mamba_spec(cls, spec: MambaSpec) -> MambaSpec:
-        # x leads the conv state only in the (dim, state_len) layout.
-        if not is_conv_state_dim_first():
-            return spec
-        return Mamba1Spec(**{f.name: getattr(spec, f.name) for f in fields(spec)})
+        conv_dim = 0 if is_conv_state_dim_first() else 1
+        return replace(spec, tp_parts=mamba1_tp_parts(spec.shapes, conv_dim))
 
 
 @dataclass

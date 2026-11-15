@@ -296,6 +296,147 @@ class KVCacheSpec:
         )
 
 
+@dataclass(frozen=True)
+class MultiComponentSpec(KVCacheSpec):
+    """A page made of named components, each with its own spec.
+
+    Planning and allocation see one page. `split` views its components, and
+    TP transfers slice each component with its own spec. Components are packed
+    one of two ways:
+
+    - back to back in the page, each its own `[H, N, C]` in the page's layout
+      (e.g. all of K, then all of V);
+    - with `components_per_state`, side by side in every state's `C`, sharing
+      the page's `[H, N]` (e.g. each token's K next to its V).
+    """
+
+    @property
+    def components(self) -> dict[str, KVCacheSpec]:
+        raise NotImplementedError
+
+    @property
+    def components_per_state(self) -> bool:
+        """Whether the components repeat in each state's `C` rather than
+        follow each other in the page."""
+        return False
+
+    @property
+    def component_alignment(self) -> int:
+        """Byte alignment of each back-to-back component within the page."""
+        return 1
+
+    def split(self, cache: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Byte `[B, H, N, C]` views of the components of `cache`, a byte
+        `[B, H, N, C]` page view of this spec, with the same physical order."""
+        assert cache.element_size() == 1, "split takes a byte page view"
+        views: dict[str, torch.Tensor] = {}
+        offset = 0
+        if self.components_per_state:
+            for name, spec in self.components.items():
+                size = spec.state_content_size_bytes
+                views[name] = cache[..., offset : offset + size]
+                offset += size
+            assert offset <= cache.shape[3], (
+                f"{type(self).__name__} components overrun the "
+                f"{tuple(cache.shape)} page"
+            )
+            return views
+        tokens = (
+            cache.shape[2] * self.tokens_per_state
+            if self.tokens_per_state > 0
+            else self.block_size
+        )
+        # A size-1 dim may share its neighbor's stride; keep H outside N then.
+        inner_to_outer = sorted((1, 2, 3), key=lambda dim: (cache.stride(dim), -dim))
+        page_bytes = prod(cache.shape[1:])
+        for name, spec in self.components.items():
+            shape = (
+                cache.shape[0],
+                spec.num_heads,
+                spec.get_num_kernel_states(tokens),
+                spec.state_content_size_bytes,
+            )
+            strides = [cache.stride(0), 0, 0, 0]
+            size = 1
+            for dim in inner_to_outer:
+                strides[dim] = size
+                size *= shape[dim]
+            assert offset + size <= page_bytes, (
+                f"{type(self).__name__} component {name!r} overruns the "
+                f"{tuple(cache.shape)} page"
+            )
+            views[name] = cache.as_strided(
+                shape, strides, cache.storage_offset() + offset
+            )
+            offset += round_up(size, self.component_alignment)
+        return views
+
+    def slice_for_tp_transfer(
+        self,
+        cache: torch.Tensor,
+        tp_size: int,
+        tp_rank: int,
+        other_spec: KVCacheSpec,
+        other_tp_size: int,
+        other_tp_rank: int,
+        *,
+        receiving: bool,
+    ) -> list[torch.Tensor]:
+        """Each component's views, sliced by its spec against the other rank's
+        same-named component."""
+        assert isinstance(other_spec, MultiComponentSpec)
+        other_components = other_spec.components
+        return [
+            sliced
+            for (name, spec), view in zip(
+                self.components.items(), self.split(cache).values(), strict=True
+            )
+            for sliced in spec.slice_for_tp_transfer(
+                view,
+                tp_size,
+                tp_rank,
+                other_components[name],
+                other_tp_size,
+                other_tp_rank,
+                receiving=receiving,
+            )
+        ]
+
+
+@dataclass(frozen=True, kw_only=True)
+class StateComponentsSpec(MultiComponentSpec):
+    """Named components side by side in each state's `C`."""
+
+    state_components: tuple[tuple[str, KVCacheSpec], ...]
+
+    @property
+    def components(self) -> dict[str, KVCacheSpec]:
+        return dict(self.state_components)
+
+    @property
+    def components_per_state(self) -> bool:
+        return True
+
+    @property
+    def num_heads(self) -> int:
+        return self.state_components[0][1].num_heads
+
+    def get_num_kernel_states(self, kernel_block_size: int) -> int:
+        return self.state_components[0][1].get_num_kernel_states(kernel_block_size)
+
+    @property
+    def state_content_size_bytes(self) -> int:
+        return sum(spec.state_content_size_bytes for _, spec in self.state_components)
+
+    @property
+    def page_size_bytes(self) -> int:
+        return (
+            self.num_heads
+            * self.get_num_kernel_states(self.block_size)
+            * self.state_content_size_bytes
+        )
+
+
 def get_block_table_width(
     max_num_blocks: int,
     block_size: int,
@@ -615,8 +756,80 @@ class HiddenStateCacheSpec(MLAAttentionSpec):
     pass
 
 
+@dataclass(frozen=True, kw_only=True)
+class MambaStateSpec(KVCacheSpec):
+    """`[1, N, C]` bytes of a Mamba state, or of a part of one that is sharded
+    evenly across TP: each state's `C` holds `tp_sharded_size` equal entries, and a TP
+    rank holds a contiguous run of the entries of all ranks."""
+
+    num_kernel_states: int = 1
+    state_content_bytes: int
+    tp_sharded_size: int | None = None
+    """None if how the state shards is unknown, so only same-TP transfers are
+    supported."""
+    tp_replicated: bool = False
+    num_heads: int = 1
+    tokens_per_state: int = -1
+
+    def get_num_kernel_states(self, kernel_block_size: int) -> int:
+        return self.num_kernel_states
+
+    @property
+    def state_content_size_bytes(self) -> int:
+        return self.state_content_bytes
+
+    @property
+    def page_size_bytes(self) -> int:
+        return self.num_kernel_states * self.state_content_bytes
+
+    def slice_for_tp_transfer(
+        self,
+        cache: torch.Tensor,
+        tp_size: int,
+        tp_rank: int,
+        other_spec: KVCacheSpec,
+        other_tp_size: int,
+        other_tp_rank: int,
+        *,
+        receiving: bool,
+    ) -> list[torch.Tensor]:
+        """Narrow `C` to the entries both ranks hold."""
+        assert isinstance(other_spec, MambaStateSpec)
+        if self.tp_replicated:
+            # Every rank holds the whole state; a receiver takes it from the
+            # sender at its position.
+            if receiving:
+                source = tp_rank * other_tp_size // tp_size
+                return [cache] if other_tp_rank == source else []
+            return (
+                [cache] if tp_rank == other_tp_rank * tp_size // other_tp_size else []
+            )
+        dim, other_dim = self.tp_sharded_size, other_spec.tp_sharded_size
+        if dim is None or other_dim is None:
+            return super().slice_for_tp_transfer(
+                cache,
+                tp_size,
+                tp_rank,
+                other_spec,
+                other_tp_size,
+                other_tp_rank,
+                receiving=receiving,
+            )
+        if dim * tp_size != other_dim * other_tp_size:
+            raise NotImplementedError(
+                f"Mamba state of {dim} entries at TP {tp_size} does not shard "
+                f"evenly with {other_dim} entries at TP {other_tp_size}."
+            )
+        start = max(tp_rank * dim, other_tp_rank * other_dim) - tp_rank * dim
+        stop = min((tp_rank + 1) * dim, (other_tp_rank + 1) * other_dim) - tp_rank * dim
+        if start >= stop:
+            return []
+        entry_bytes = self.state_content_bytes // dim
+        return [cache[..., start * entry_bytes : stop * entry_bytes]]
+
+
 @dataclass(frozen=True)
-class MambaSpec(KVCacheSpec):
+class MambaSpec(MultiComponentSpec):
     shapes: tuple[tuple[int, ...], ...]
     dtypes: tuple[torch.dtype, ...]
     state_alignment: int = 1
@@ -628,6 +841,11 @@ class MambaSpec(KVCacheSpec):
     # False: the state is sharded across TP ranks (e.g. GDN). True: every TP
     # rank holds the full state (e.g. the replicated PLE conv state).
     tp_replicated: bool = False
+    tp_parts: tuple[tuple[int, tuple[int, ...]], ...] | None = None
+    """Per state, the dim that is sharded across TP and the sizes along it of
+    the consecutive parts that are each sharded evenly (e.g. GDN's Q, K and V
+    in the conv state). None if unknown, so only same-TP transfers are
+    supported. Published by the backend."""
 
     def __post_init__(self):
         super().__post_init__()
@@ -655,74 +873,63 @@ class MambaSpec(KVCacheSpec):
             return self.page_size_padded
         return page_size
 
-    def _tp_segments(self) -> tuple[tuple[int, ...], ...] | None:
-        """Per state, the local sizes of the consecutive leading-dim segments
-        that are each sharded evenly across TP. None if unknown, so only
-        same-TP transfers are supported. Mamba backends override this."""
-        return None
+    @property
+    def component_alignment(self) -> int:
+        return self.state_alignment
 
-    def slice_for_tp_transfer(
-        self,
-        cache: torch.Tensor,
-        tp_size: int,
-        tp_rank: int,
-        other_spec: KVCacheSpec,
-        other_tp_size: int,
-        other_tp_rank: int,
-        *,
-        receiving: bool,
-    ) -> list[torch.Tensor]:
-        """Narrow each sharded segment of each state to the rows both ranks hold.
+    @property
+    def components(self) -> dict[str, KVCacheSpec]:
+        """Each state (e.g. conv, temporal) by index, back to back. A state of
+        several `tp_parts` holds them side by side in its sharded dim: the
+        dims before it are its `N` and the rest its `C`."""
+        states: dict[str, KVCacheSpec] = {}
+        for i, (shape, dtype) in enumerate(zip(self.shapes, self.dtypes)):
+            dim, parts = self.tp_parts[i] if self.tp_parts else (0, None)
+            entry_bytes = prod(shape[dim + 1 :]) * get_dtype_size(dtype)
+            part_specs = [
+                MambaStateSpec(
+                    block_size=self.block_size,
+                    num_kernel_states=prod(shape[:dim]),
+                    state_content_bytes=size * entry_bytes,
+                    tp_sharded_size=None if parts is None else size,
+                    tp_replicated=self.tp_replicated,
+                )
+                for size in parts or (shape[dim],)
+            ]
+            assert sum(part.state_content_bytes for part in part_specs) == (
+                shape[dim] * entry_bytes
+            ), f"TP parts {parts} do not fill dim {dim} of state {shape}"
+            states[str(i)] = (
+                part_specs[0]
+                if len(part_specs) == 1
+                else StateComponentsSpec(
+                    block_size=self.block_size,
+                    state_components=tuple(
+                        (str(j), part) for j, part in enumerate(part_specs)
+                    ),
+                )
+            )
+        return states
 
-        `cache` is the layer's `[B, 1, 1, C]` int8 page view (see
-        `MambaBase.bind_kv_cache`); one view is returned per shared segment.
-        """
-        assert isinstance(other_spec, MambaSpec)
-        if self.tp_replicated:
-            # Every rank holds the whole state; a receiver takes it from the
-            # sender at its position.
-            if receiving:
-                source = tp_rank * other_tp_size // tp_size
-                return [cache] if other_tp_rank == source else []
-            return (
-                [cache] if tp_rank == other_tp_rank * tp_size // other_tp_size else []
-            )
-        segments = self._tp_segments()
-        other_segments = other_spec._tp_segments()
-        if segments is None or other_segments is None:
-            return super().slice_for_tp_transfer(
-                cache,
-                tp_size,
-                tp_rank,
-                other_spec,
-                other_tp_size,
-                other_tp_rank,
-                receiving=receiving,
-            )
-        pages = cache.flatten(1)
-        views: list[torch.Tensor] = []
-        offset = 0
-        for shape, dtype, sizes, other_sizes in zip(
-            self.shapes, self.dtypes, segments, other_segments, strict=True
-        ):
-            row_bytes = prod(shape[1:]) * get_dtype_size(dtype)
-            state_bytes = prod(shape) * get_dtype_size(dtype)
-            seg_offset = offset
-            for size, other_size in zip(sizes, other_sizes, strict=True):
-                if size * tp_size != other_size * other_tp_size:
-                    raise NotImplementedError(
-                        f"{type(self).__name__} segment of {size} rows at TP "
-                        f"{tp_size} does not shard evenly with {other_size} "
-                        f"rows at TP {other_tp_size}."
-                    )
-                start = max(tp_rank * size, other_tp_rank * other_size)
-                stop = min((tp_rank + 1) * size, (other_tp_rank + 1) * other_size)
-                if start < stop:
-                    first = seg_offset + (start - tp_rank * size) * row_bytes
-                    views.append(pages[:, first : first + (stop - start) * row_bytes])
-                seg_offset += size * row_bytes
-            offset += round_up(state_bytes, self.state_alignment)
-        return views
+    def with_tp_size(self, tp_size: int, new_tp_size: int) -> Self:
+        """This spec at `tp_size`, as a rank at `new_tp_size` holds it."""
+        if self.tp_replicated or tp_size == new_tp_size:
+            return self
+        tp_parts = self.tp_parts or ((0, None),) * len(self.shapes)
+        shapes = tuple(
+            (*shape[:dim], shape[dim] * tp_size // new_tp_size, *shape[dim + 1 :])
+            for shape, (dim, _) in zip(self.shapes, tp_parts)
+        )
+        return replace(
+            self,
+            shapes=shapes,
+            page_size_padded=None,
+            tp_parts=self.tp_parts
+            and tuple(
+                (dim, tuple(size * tp_size // new_tp_size for size in parts))
+                for dim, parts in self.tp_parts
+            ),
+        )
 
 
 def get_mamba_prefill_checkpoint_position(

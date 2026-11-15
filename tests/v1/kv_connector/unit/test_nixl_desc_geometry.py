@@ -38,7 +38,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.push_worker import (
     NixlPushConnectorWorker,
 )
 from vllm.models.kimi_k3.common.dsa_cache import KimiK3IndexerBackend
-from vllm.v1.attention.backends.gdn_attn import GDNSpec
+from vllm.v1.attention.backends.gdn_attn import gdn_tp_parts
 from vllm.v1.attention.backends.mla.indexer import Glm5NextIndexerBackend
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.core.single_type_kv_cache_manager import (
@@ -608,11 +608,13 @@ def _make_mla_hybrid_worker(
         dtype=torch.float16,
     )
     unified_page = mla_spec.page_size_bytes
-    kda_spec = GDNSpec(
+    # Q|K|V = 8|8|8 conv rows and 8 heads (48 + 64 bytes), so the state
+    # shards evenly up to TP8.
+    kda_shapes = ((24, 1), (8, 1, 2))
+    kda_spec = MambaSpec(
         block_size=local_block_size,
-        # Q|K|V = 8|8|8 conv rows and 8 heads (48 + 64 bytes), so the state
-        # shards evenly up to TP8.
-        shapes=((24, 1), (8, 1, 2)),
+        shapes=kda_shapes,
+        tp_parts=gdn_tp_parts(kda_shapes, 0),
         dtypes=(torch.float16, torch.float32),
         page_size_padded=unified_page,
         mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
@@ -1444,9 +1446,10 @@ def _make_csa_linear_ple_worker(
         )
         for index in range(2)
     }
-    sharded_mamba_spec = GDNSpec(
+    sharded_mamba_spec = MambaSpec(
         block_size=1,
         shapes=((8, 3), (2, 2, 4)),
+        tp_parts=gdn_tp_parts(((8, 3), (2, 2, 4)), 0),
         dtypes=(torch.float16, torch.float32),
         page_size_padded=256,
         mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
