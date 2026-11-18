@@ -66,7 +66,7 @@ class StubStateLayer(MambaBase, nn.Module):
             block_size=vllm_config.model_config.max_model_len,
             mamba_type=self.mamba_type,
         )
-        return MambaManager.layer_config(spec)
+        return MambaManager.layer_config(spec, recomputable=False)
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Add each request's tokens to its sum, and return the token to emit
