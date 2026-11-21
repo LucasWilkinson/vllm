@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 220" width="760" height="220" role="img" aria-label="One scan over hash units finds the run that covers the window" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif" font-size="13">
+<defs><marker id="scan-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#b4b4ac"/></marker></defs>
+<text x="24" y="34" font-size="15" font-weight="600" fill="#1f2328">One scan over hash units finds the run that covers the window</text>
+<text x="716" y="56" font-size="11.5" text-anchor="end" fill="#59636e">scan right to left, one probe per hash</text>
+<path d="M716 66H560" fill="none" stroke="#b4b4ac" stroke-width="1.25" marker-end="url(#scan-arrow)"/>
+<rect x="24" y="98" width="28" height="32" fill="none" stroke="#d8d8d2" stroke-width="1"/>
+<rect x="52" y="98" width="28" height="32" fill="none" stroke="#d8d8d2" stroke-width="1"/>
+<rect x="80" y="98" width="28" height="32" fill="none" stroke="#d8d8d2" stroke-width="1"/>
+<rect x="108" y="98" width="28" height="32" fill="none" stroke="#d8d8d2" stroke-width="1"/>
+<rect x="140" y="98" width="28" height="32" fill="none" stroke="#d8d8d2" stroke-width="1"/>
+<rect x="168" y="98" width="28" height="32" fill="none" stroke="#d8d8d2" stroke-width="1"/>
+<rect x="196" y="98" width="28" height="32" fill="none" stroke="#d8d8d2" stroke-width="1"/>
+<rect x="224" y="98" width="28" height="32" fill="none" stroke="#d8d8d2" stroke-width="1"/>
+<rect x="256" y="98" width="28" height="32" fill="none" stroke="#d8d8d2" stroke-width="1"/>
+<rect x="284" y="98" width="28" height="32" fill="#2a78d6" fill-opacity="0.22" stroke="#d8d8d2" stroke-width="1"/>
+<rect x="312" y="98" width="28" height="32" fill="#2a78d6" fill-opacity="0.22" stroke="#d8d8d2" stroke-width="1"/>
+<rect x="340" y="98" width="28" height="32" fill="#2a78d6" fill-opacity="0.22" stroke="#d8d8d2" stroke-width="1"/>
+<rect x="372" y="98" width="28" height="32" fill="#2a78d6" fill-opacity="0.22" stroke="#d8d8d2" stroke-width="1"/>
+<rect x="400" y="98" width="28" height="32" fill="#2a78d6" fill-opacity="0.22" stroke="#d8d8d2" stroke-width="1"/>
+<rect x="428" y="98" width="28" height="32" fill="#2a78d6" fill-opacity="0.22" stroke="#d8d8d2" stroke-width="1"/>
+<rect x="456" y="98" width="28" height="32" fill="#2a78d6" fill-opacity="0.22" stroke="#d8d8d2" stroke-width="1"/>
+<rect x="488" y="98" width="28" height="32" fill="#2a78d6" fill-opacity="0.22" stroke="#d8d8d2" stroke-width="1"/>
+<rect x="516" y="98" width="28" height="32" fill="#2a78d6" fill-opacity="0.22" stroke="#d8d8d2" stroke-width="1"/>
+<rect x="544" y="98" width="28" height="32" fill="none" stroke="#d8d8d2" stroke-width="1"/>
+<rect x="572" y="98" width="28" height="32" fill="none" stroke="#d8d8d2" stroke-width="1"/>
+<rect x="604" y="98" width="28" height="32" fill="none" stroke="#d8d8d2" stroke-width="1"/>
+<rect x="632" y="98" width="28" height="32" fill="none" stroke="#d8d8d2" stroke-width="1"/>
+<rect x="660" y="98" width="28" height="32" fill="none" stroke="#d8d8d2" stroke-width="1"/>
+<rect x="688" y="98" width="28" height="32" fill="none" stroke="#d8d8d2" stroke-width="1"/>
+<rect x="24" y="98" width="112" height="32" rx="4" fill="none" stroke="#b4b4ac" stroke-width="1.25" stroke-dasharray="4 4"/>
+<text x="24" y="90" font-size="11.5" fill="#59636e">block 0</text>
+<rect x="140" y="98" width="112" height="32" rx="4" fill="none" stroke="#b4b4ac" stroke-width="1.25" stroke-dasharray="4 4"/>
+<text x="140" y="90" font-size="11.5" fill="#59636e">block 1</text>
+<rect x="256" y="98" width="112" height="32" rx="4" fill="none" stroke="#2a78d6" stroke-width="1.25"/>
+<text x="256" y="90" font-size="11.5" fill="#59636e">block 2</text>
+<rect x="372" y="98" width="112" height="32" rx="4" fill="none" stroke="#2a78d6" stroke-width="1.25"/>
+<text x="372" y="90" font-size="11.5" fill="#59636e">block 3</text>
+<rect x="488" y="98" width="112" height="32" rx="4" fill="none" stroke="#2a78d6" stroke-width="1.25"/>
+<text x="488" y="90" font-size="11.5" fill="#59636e">block 4</text>
+<rect x="604" y="98" width="112" height="32" rx="4" fill="none" stroke="#b4b4ac" stroke-width="1.25"/>
+<text x="604" y="90" font-size="11.5" fill="#59636e">block 5</text>
+<line x1="544" x2="544" y1="92" y2="136" stroke="#2a78d6" stroke-width="2"/>
+<text x="550" y="90" font-size="11.5" font-weight="600" fill="#1f2328">T</text>
+<path d="M24 138V144H280V138" fill="none" stroke="#b4b4ac" stroke-width="1.25"/>
+<path d="M288 138V144H540V138" fill="none" stroke="#2a78d6" stroke-width="1.25"/>
+<path d="M548 138V144H716V138" fill="none" stroke="#b4b4ac" stroke-width="1.25"/>
+<text x="152" y="162" font-size="11.5" text-anchor="middle" fill="#59636e">not probed</text>
+<text x="414" y="162" font-size="11.5" text-anchor="middle" fill="#1f2328">9 matching hashes cover the window</text>
+<text x="632" y="162" font-size="11.5" text-anchor="middle" fill="#59636e">miss</text>
+<text x="24" y="196" font-size="13" fill="#1f2328">Each hash maps straight to its block, so the hit uses blocks 2, 3 and 4.</text>
+</svg>
